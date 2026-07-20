@@ -1,0 +1,60 @@
+# Project TODO
+
+- [x] App branding - logo, theme colors, app name
+- [x] Database schema - all game tables
+- [x] Server API routes - tRPC procedures
+- [x] Navigation structure - tabs and stacks
+- [x] Home screen - game dashboard with timers, safe object, target
+- [x] Map screen - target location, power-ups, purge mode
+- [x] Shop screen - power-up store with categories
+- [x] Chat screen - real-time messaging
+- [x] Profile screen - stats, achievements, active power-ups
+- [x] Kill feed - elimination events, approvals, revivals
+- [x] Elimination upload - video evidence submission
+- [x] Admin dashboard - game overview and quick actions
+- [x] Admin game setup - game type, rules, entry fee, round config
+- [x] Admin rules manager - toggle standard rules, add custom
+- [x] Admin player management - mark paid, safe, revive, eliminate
+- [x] Admin power-up setup - configure shop items
+- [x] Admin elimination review - approve/deny video evidence
+- [x] Admin round control - start/end rounds, purge, target assignment
+- [x] Admin achievement setup - create badges and point values
+- [x] Game type options - LMS, Highest Points, Most Eliminations, Teams
+- [x] Power-up system - all power-ups from spec with categories
+- [x] Achievement badge system
+- [x] Auto/manual target assignment
+- [x] Game context provider with AsyncStorage persistence
+- [x] Auth integration with role support
+- [x] Bounty board - player name, bounty count, total bounty points
+- [x] Admin toggle: inherit target on elimination or not
+- [x] Admin notification when player disables location
+- [x] Power-up descriptions visible in shop
+- [x] Live location ping system
+- [x] Chat notification for shield/immunity power-ups with icon
+- [x] Admin-set starting points for all players
+- [x] Admin-set elimination points value
+- [x] Push notifications (new target, purge, elimination approved/denied)
+- [x] Leaderboard screen
+- [x] Game join codes for easy player onboarding
+- [x] Dev/demo mode for preview without login
+- [x] Pre-populate power-up shop with all 43 items from Powerups document with full descriptions
+- [x] Expandable description view in shop for each power-up
+- [x] Roulette configuration screen for admin to set up prizes/penalties
+- [x] Demo mode shows mock data for better previewing without login
+- [x] Super admin flag - isSuperAdmin field, always has admin access across all games
+- [x] Admin can mark players safe via super admin access
+- [x] Replace power-up seed with exact 44 items from spreadsheet (19 offensive, 15 defensive, 9 chaos + Raise the Stakes)
+- [x] Live location tracking - background 5min updates, foreground live GPS tracking
+- [x] Map web fallback - coordinate list view on web, react-native-maps on native
+- [x] Seed all 55 achievements from spreadsheet (25 combat, 15 survival, 12 chaos + 3 headers)
+- [x] Roulette wheel animation component with spin physics
+- [x] Player roulette spin screen with animated wheel
+- [x] Player invite flow - shareable link + QR code that deep-links to join game screen
+- [x] Achievement auto-detection - server-side triggers on eliminations, purchases, bounties, purges, revivals
+- [x] Push notification triggers - new target, purge start/end, elimination approved/denied, bounty placed on you, revival
+- [x] Admin map power-up placement UI - drop pins with visible/hidden toggle and clue text
+- [x] Player proximity alerts - warmer/colder system within 150yds of hidden power-up
+- [x] Location guess feature - player submits guess address, server validates proximity, reveals location if correct
+- [ ] Fix login error 10001 on game entry
+- [ ] Restore missing admin panel menu items (roulette, power-ups, achievements, targets, map power-ups)
+- [x] Game history / past games archive screen
