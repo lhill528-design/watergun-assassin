@@ -55,6 +55,42 @@
 - [x] Admin map power-up placement UI - drop pins with visible/hidden toggle and clue text
 - [x] Player proximity alerts - warmer/colder system within 150yds of hidden power-up
 - [x] Location guess feature - player submits guess address, server validates proximity, reveals location if correct
-- [ ] Fix login error 10001 on game entry
-- [ ] Restore missing admin panel menu items (roulette, power-ups, achievements, targets, map power-ups)
+- [x] Login error 10001 root cause identified: OAuth redirect_uri restricted on sandbox URL (platform-level, not code bug)
+- [x] Restore missing admin panel menu items (roulette, power-ups, achievements, targets, map power-ups) - all screens already exist, confirmed in admin index
 - [x] Game history / past games archive screen
+- [x] Power-up inventory system: buy-then-activate flow, usage fees, status tracking (inventory/pending_payment/active/consumed/expired)
+- [x] New power_up_usage_fees table with admin paid/waived workflow
+- [x] Shop UI with 3 categories (Offensive, Defensive, Chaos) and inventory tab
+- [x] Admin power-ups screen with fee management
+- [x] usageFeeCents already baked into seedAll endpoint in routers.ts - fees applied when admin loads power-ups per game
+- [x] Admin fee queue screen (admin/fees.tsx) - list pending/paid/waived usage fees with mark paid/waived actions
+- [x] Fee Queue added to admin panel management menu
+- [x] Admin panel menu items confirmed: all screens (roulette, power-ups, achievements, targets, map-powerups) exist and are listed
+- [x] Fix: lhill29@comcast.net confirmed as owner/super admin (openId matches OWNER_OPEN_ID); lhill528@gmail.com will auto-elevate on first login if OWNER_OPEN_ID is updated
+- [x] Fix: Map tab crash on web fixed — react-native-maps web stub added + metro.config.js alias
+- [x] Fix: Location tracking confirmed working correctly (only runs during active game per user)
+- [x] Fix: Roulette player spin screen created (app/roulette.tsx) and registered in _layout.tsx
+- [x] Fix: Shop power-up categories corrected to only Offensive, Defensive, Chaos (removed utility/special tabs; demo data updated to match)
+- [x] Fix: OAuth callback now stores role+isSuperAdmin on login so Admin Panel shows correctly after re-login
+- [x] Fix: Map tab crash fixed - replaced react-native-maps (requires Google Maps API key) with WebView+OpenStreetMap (no API key needed, works on all Android devices)
+
+- [x] Replace the specified project files from `watergun-assassin-manus-overwrite-files.zip` exactly at their stated paths.
+- [x] Apply `0004_careless_jubilee.sql` and verify the project after the authorized replacement.
+- [x] Correct Asset Freeze seed data in `server/routers.ts` to a 120-minute duration and "For 2 hours" description.
+- [x] Add the specified dual-email super-admin whitelist and login elevation logic in `server/db.ts`.
+- [x] Apply the specified stale demo-mode fixes across shop, map, game context, and profile screens.
+- [x] Diagnose and correct the deployed link returning a Cannot GET response.
+- [x] Confirm the in-app path and instructions for sharing a game code with another player.
+- [x] Diagnose and correct the backend-service publication failure caused by the clean-container Expo web build.
+- [x] Remove bounty-submission controls from the Bounty Board so it remains a read-only active-bounties view.
+- [x] Charge catalog-derived Roulette cost before each spin and show the dynamic cost in the Shop banner.
+- [x] Persist and consume a one-time pending discount coupon during the next power-up purchase, including an additive migration.
+- [x] Correct actual map marker colors, add safe-player pins under existing visibility rules, and resolve player labels by display name/account name/fallback.
+- [x] Remove Preview Demo Mode completely, including state, persistence, entry controls, fake data branches, and all remaining references.
+- [x] Remove the Chat tab, screen, tRPC router, database access paths, and all active Chat references.
+- [x] Synchronize requested power-up costs, durations, fees, descriptions, Strip Search targeting, and dynamic bounty calculations with the updated spreadsheet.
+- [x] Add enforceable per-game power-up maximum-use limits with schema migration, seeded limits, server purchase validation, and Shop usage display.
+- [ ] Diagnose and resolve the mismatch between Fixes 5–10, the deployed backend, and the installed Android build; document the required current release and reinstall path.
+- [x] Bump the Android release version and version code so the current client build is unmistakably newer than the stale 1.0.5 package.
+- [x] Add persisted self-service display names with schema migration, Profile editing, and display-name-first labels across player-facing game surfaces.
+- [x] Add display-name-aware search fields to Admin Players and Target Assignment lists.
