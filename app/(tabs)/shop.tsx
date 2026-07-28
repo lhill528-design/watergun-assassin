@@ -5,6 +5,7 @@ import { useGame } from "@/lib/game-context";
 import { trpc } from "@/lib/trpc";
 import { useAuth } from "@/hooks/use-auth";
 import { useState } from "react";
+import * as Location from "expo-location";
 
 const CATEGORIES = [
   { key: "all", label: "All" },
@@ -18,7 +19,7 @@ const CATEGORIES = [
 const TARGETED_POWER_UPS = new Set([
   "Bounty", "Raise the Stakes", "Killswitch", "Recon", "Blacklist", "Asset Freeze", "Sabotage",
   "Sniper's Duel", "Fall Guy", "Frame Job", "Strip Search", "Doppleganger", "Mirror, Mirror", "Bodyguard", "Pickpocket",
-  "Lifeline", "Care package", "Wildcard",
+  "Lifeline", "Care package", "Wildcard", "Vendetta", "Reassignment", "Boomerang",
 ]);
 
 export default function ShopScreen() {
@@ -30,6 +31,8 @@ export default function ShopScreen() {
   const [selectedTargets, setSelectedTargets] = useState<Record<number, number>>({});
   const [selectedGifts, setSelectedGifts] = useState<Record<number, number>>({});
   const [safeObjects, setSafeObjects] = useState<Record<number, string>>({});
+  const [sanctuaryAddresses, setSanctuaryAddresses] = useState<Record<number, string>>({});
+  const [geocodingSanctuary, setGeocodingSanctuary] = useState<number | null>(null);
 
   const powerUpsQuery = trpc.powerUp.list.useQuery(
     { gameId: activeGameId! },
@@ -81,6 +84,7 @@ export default function ShopScreen() {
     return counts;
   }, {});
   const players = (playersQuery.data || []).filter(p => p.id !== player?.id && p.status === "alive");
+  const eliminatedPlayers = (playersQuery.data || []).filter(p => p.id !== player?.id && p.status === "eliminated");
 
   const filteredPowerUps = selectedCategory === "all"
     ? powerUps.filter(p => p.isEnabled)
@@ -97,7 +101,11 @@ export default function ShopScreen() {
     );
   };
 
-  const handleActivate = (item: any) => {
+  const handleActivate = async (item: any) => {
+    if (item.powerUp?.name === "Roulette") {
+      router.push("/roulette" as any);
+      return;
+    }
     const targetPlayerId = selectedTargets[item.id];
     if (TARGETED_POWER_UPS.has(item.powerUp?.name) && !targetPlayerId) {
       Alert.alert("Choose a target", "Select a player before activating this power-up.");
@@ -113,11 +121,33 @@ export default function ShopScreen() {
       Alert.alert("Enter a safe object", "Choose the replacement safe object before activating.");
       return;
     }
+    let sanctuaryCoords: { zoneLatitude: string; zoneLongitude: string } | undefined;
+    if (item.powerUp?.name === "Sanctuary") {
+      const address = sanctuaryAddresses[item.id]?.trim();
+      if (address) {
+        setGeocodingSanctuary(item.id);
+        try {
+          const results = await Location.geocodeAsync(address);
+          if (!results.length) {
+            Alert.alert("Address not found", "Couldn't find that address. Try being more specific, or leave it blank to use your current location.");
+            return;
+          }
+          sanctuaryCoords = { zoneLatitude: results[0].latitude.toFixed(6), zoneLongitude: results[0].longitude.toFixed(6) };
+        } catch {
+          Alert.alert("Search failed", "Couldn't look up that address right now.");
+          return;
+        } finally {
+          setGeocodingSanctuary(null);
+        }
+      }
+    }
     const activationData = {
       ...(giftInventoryId ? { giftInventoryId } : {}),
       ...(safeObject ? { safeObject } : {}),
+      ...(sanctuaryCoords || {}),
     };
-    Alert.alert("Activate Power-Up", `Activate ${item.powerUp?.name} now? Its timer begins immediately.`, [
+    const activateLabel = item.powerUp?.name === "Sanctuary" ? "Send this Sanctuary to the admin for approval?" : `Activate ${item.powerUp?.name} now? Its timer begins immediately.`;
+    Alert.alert("Activate Power-Up", activateLabel, [
       { text: "Cancel", style: "cancel" },
       { text: "Activate", onPress: () => activateMutation.mutate({ gameId: activeGameId!, inventoryId: item.id, targetPlayerId, activationData: Object.keys(activationData).length ? activationData : undefined }) },
     ]);
@@ -223,10 +253,13 @@ export default function ShopScreen() {
                     </TouchableOpacity>
                   )}
                 </View>
+                {needsTarget && item.status !== "active" && item.powerUp?.name === "Lifeline" && eliminatedPlayers.length === 0 && (
+                  <Text className="text-muted text-xs mt-3">No eliminated players to revive right now.</Text>
+                )}
                 {needsTarget && item.status !== "active" && (
                   <ScrollView horizontal showsHorizontalScrollIndicator={false} className="mt-3">
                     <View className="flex-row gap-2">
-                      {players.map((candidate: any) => (
+                      {(item.powerUp?.name === "Lifeline" ? eliminatedPlayers : players).map((candidate: any) => (
                         <TouchableOpacity
                           key={candidate.id}
                           className={`px-3 py-2 rounded-lg ${selectedTargets[item.id] === candidate.id ? "bg-primary" : "bg-background border border-border"}`}
@@ -265,6 +298,18 @@ export default function ShopScreen() {
                     value={safeObjects[item.id] || ""}
                     onChangeText={value => setSafeObjects(current => ({ ...current, [item.id]: value }))}
                   />
+                )}
+                {item.powerUp?.name === "Sanctuary" && item.status !== "active" && (
+                  <View className="mt-3">
+                    <Text className="text-muted text-xs mb-1">Type an address for your sanctuary, or leave blank to use your current location. Admin must approve before it shows on the map.</Text>
+                    <TextInput
+                      className="bg-background border border-border rounded-lg px-3 py-2 text-foreground"
+                      placeholder="e.g. 123 Main St, Houston TX"
+                      placeholderTextColor="#8B8B9E"
+                      value={sanctuaryAddresses[item.id] || ""}
+                      onChangeText={value => setSanctuaryAddresses(current => ({ ...current, [item.id]: value }))}
+                    />
+                  </View>
                 )}
               </View>
             );

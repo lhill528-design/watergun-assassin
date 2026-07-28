@@ -320,11 +320,39 @@ export async function expirePlayerPowerUps(gameId: number) {
   if (!db) return;
   const now = new Date();
   const active = await db.select().from(playerPowerUps).where(and(eq(playerPowerUps.gameId, gameId), eq(playerPowerUps.isActive, true)));
+  if (!active.length) return;
+  const catalog = await db.select().from(powerUps).where(eq(powerUps.gameId, gameId));
+  const catalogById = Object.fromEntries(catalog.map(powerUp => [powerUp.id, powerUp]));
   for (const item of active) {
     if (item.expiresAt && item.expiresAt <= now) {
       await db.update(playerPowerUps).set({ status: "expired", isActive: false }).where(eq(playerPowerUps.id, item.id));
+      if (catalogById[item.powerUpId]?.name === "Witness Protection") {
+        const holder = await getPlayerById(item.gamePlayerId);
+        if (holder && holder.status === "safe") {
+          await db.update(gamePlayers).set({ status: "alive" }).where(eq(gamePlayers.id, holder.id));
+        }
+      }
     }
   }
+}
+
+export async function updatePlayerPowerUpActivationData(id: number, activationData: Record<string, unknown>) {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+  await db.update(playerPowerUps).set({ activationData }).where(eq(playerPowerUps.id, id));
+}
+
+export async function getPendingSanctuaryZones(gameId: number) {
+  const db = await getDb();
+  if (!db) return [];
+  const catalog = await db.select().from(powerUps).where(and(eq(powerUps.gameId, gameId), eq(powerUps.name, "Sanctuary")));
+  const sanctuaryIds = new Set(catalog.map(powerUp => powerUp.id));
+  if (!sanctuaryIds.size) return [];
+  const active = await db.select().from(playerPowerUps).where(and(eq(playerPowerUps.gameId, gameId), eq(playerPowerUps.isActive, true)));
+  const pending = active.filter(item => sanctuaryIds.has(item.powerUpId) && !(item.activationData as { approved?: boolean } | null)?.approved);
+  const players = await getGamePlayers(gameId);
+  const playerMap = Object.fromEntries(players.map(player => [player.id, player]));
+  return pending.map(item => ({ ...item, player: playerMap[item.gamePlayerId] }));
 }
 
 export async function getActivePowerUpByName(gamePlayerId: number, name: string) {

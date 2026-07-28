@@ -45,6 +45,7 @@ export const appRouter = router({
         inheritTarget: z.boolean().default(true),
         startingPoints: z.number().default(0),
         eliminationPoints: z.number().default(100),
+        purgeEliminationPoints: z.number().nullable().optional(),
         locationPingInterval: z.number().default(15),
       }))
       .mutation(async ({ ctx, input }) => {
@@ -84,6 +85,7 @@ export const appRouter = router({
         inheritTarget: z.boolean().optional(),
         startingPoints: z.number().optional(),
         eliminationPoints: z.number().optional(),
+        purgeEliminationPoints: z.number().nullable().optional(),
         locationPingInterval: z.number().optional(),
       }))
       .mutation(async ({ input }) => {
@@ -218,10 +220,12 @@ export const appRouter = router({
         if (blackout) return players.map(player => ({ ...player, latitude: null, longitude: null }));
         const hiddenIds = new Set<number>();
         const radar = await db.getActivePowerUpByName(viewer.id, "Radar");
+        const vendetta = await db.getActivePowerUpByName(viewer.id, "Vendetta");
+        const vendettaTargetId = vendetta?.targetPlayerId ?? null;
         const canSeeAll = Boolean(radar || (game?.purgeActive && game.showLocationsDuringPurge));
         for (const player of players) {
           if (player.id === viewer.id) continue;
-          if (!canSeeAll && player.id !== viewer.targetId) {
+          if (!canSeeAll && player.id !== viewer.targetId && player.id !== vendettaTargetId) {
             hiddenIds.add(player.id);
             continue;
           }
@@ -245,7 +249,7 @@ export const appRouter = router({
           target.latitude = ownerLocation.latitude;
           target.longitude = ownerLocation.longitude;
         }
-        const withZones: Array<(typeof visiblePlayers)[number] & { sanctuaryZone?: { latitude: string; longitude: string; radiusMeters: number } | null }> = visiblePlayers;
+        const withZones: Array<(typeof visiblePlayers)[number] & { sanctuaryZone?: { latitude: string; longitude: string; radiusMeters: number; approved: boolean } | null }> = visiblePlayers;
         for (const otherPlayer of withZones) {
           if (otherPlayer.id === viewer.id || hiddenIds.has(otherPlayer.id)) continue;
           const decoy = await db.getActivePowerUpByName(otherPlayer.id, "Decoy");
@@ -255,24 +259,26 @@ export const appRouter = router({
             otherPlayer.longitude = decoyData.decoyLongitude;
           }
           const sanctuary = await db.getActivePowerUpByName(otherPlayer.id, "Sanctuary");
-          const zoneData = sanctuary?.activationData as { zoneLatitude?: string; zoneLongitude?: string; zoneRadiusMeters?: number } | null | undefined;
-          if (zoneData?.zoneLatitude && zoneData?.zoneLongitude) {
+          const zoneData = sanctuary?.activationData as { zoneLatitude?: string; zoneLongitude?: string; zoneRadiusMeters?: number; approved?: boolean } | null | undefined;
+          if (zoneData?.zoneLatitude && zoneData?.zoneLongitude && zoneData.approved) {
             otherPlayer.sanctuaryZone = {
               latitude: zoneData.zoneLatitude,
               longitude: zoneData.zoneLongitude,
               radiusMeters: zoneData.zoneRadiusMeters || 30,
+              approved: true,
             };
           }
         }
         const selfEntry = withZones.find(p => p.id === viewer.id);
         if (selfEntry) {
           const ownSanctuary = await db.getActivePowerUpByName(viewer.id, "Sanctuary");
-          const ownZoneData = ownSanctuary?.activationData as { zoneLatitude?: string; zoneLongitude?: string; zoneRadiusMeters?: number } | null | undefined;
+          const ownZoneData = ownSanctuary?.activationData as { zoneLatitude?: string; zoneLongitude?: string; zoneRadiusMeters?: number; approved?: boolean } | null | undefined;
           if (ownZoneData?.zoneLatitude && ownZoneData?.zoneLongitude) {
             selfEntry.sanctuaryZone = {
               latitude: ownZoneData.zoneLatitude,
               longitude: ownZoneData.zoneLongitude,
               radiusMeters: ownZoneData.zoneRadiusMeters || 30,
+              approved: Boolean(ownZoneData.approved),
             };
           }
         }
@@ -291,7 +297,8 @@ export const appRouter = router({
         if (!isAdmin) {
           const radar = await db.getActivePowerUpByName(viewer.id, "Radar");
           const canSeeAll = Boolean(radar || (game?.purgeActive && game.showLocationsDuringPurge));
-          const isMyTarget = target.userId === viewer.targetId;
+          const vendetta = await db.getActivePowerUpByName(viewer.id, "Vendetta");
+          const isMyTarget = target.id === viewer.targetId || target.id === vendetta?.targetPlayerId;
           if (!canSeeAll && !isMyTarget) {
             throw new Error("You can only check your current target's location, or everyone's during a purge");
           }
@@ -330,7 +337,7 @@ export const appRouter = router({
         const recon = await db.getActivePowerUpByName(viewer.id, "Recon");
         if (!recon) return null;
         const players = await db.getGamePlayers(input.gameId);
-        const target = players.find(p => p.userId === viewer.targetId);
+        const target = players.find(p => p.id === viewer.targetId);
         if (!target) return null;
         const inventory = await db.getPlayerPowerUps(target.id);
         const active = inventory.filter(item => item.status === "active" && item.powerUp);
@@ -343,6 +350,25 @@ export const appRouter = router({
             expiresAt: item.expiresAt,
           })),
           expiresAt: recon.expiresAt,
+        };
+      }),
+
+    vendettaTarget: protectedProcedure
+      .input(z.object({ gameId: z.number() }))
+      .query(async ({ ctx, input }) => {
+        const viewer = await db.getPlayerInGame(input.gameId, ctx.user.id);
+        if (!viewer) return null;
+        const vendetta = await db.getActivePowerUpByName(viewer.id, "Vendetta");
+        if (!vendetta?.targetPlayerId) return null;
+        const target = await db.getPlayerById(vendetta.targetPlayerId);
+        if (!target || !target.latitude || !target.longitude) return null;
+        return {
+          id: target.id,
+          userId: target.userId,
+          latitude: target.latitude,
+          longitude: target.longitude,
+          status: target.status,
+          expiresAt: vendetta.expiresAt,
         };
       }),
 
@@ -480,42 +506,42 @@ export const appRouter = router({
           { name: "Blacklist", emoji: "\u{1F6AB}", effect: "Block a target from buying power-ups", cost: 250, duration: 120, category: "offensive", description: "For 2 hours, your target cannot purchase power-ups from the shop. They can still use power-ups they already own." },
           { name: "Asset Freeze", emoji: "🧊", effect: "Block a target from using power-ups", cost: 250, duration: 120, category: "offensive", description: "For 2 hours, your target cannot activate or use power-ups they already own. They may still purchase power-ups." },
           { name: "Sabotage", emoji: "🔧", effect: "Target's next power-up purchase costs double", cost: 150, duration: 360, category: "offensive", description: "The next power-up your target purchases within 6 hours costs them double the listed price. They are NOT notified of the sabotage until they make the purchase and see the inflated cost." },
-          { name: "Sniper's Duel", emoji: "🎯", effect: "Challenge any active player to a duel. Winner gets 100pts & can steal one power-up", cost: 50, duration: null, maxUsesPerGame: 1, category: "offensive", description: "Challenge any active player to a duel. Both players are notified. First to eliminate the other wins 100pts and can steal one of the loser's power-ups. Can only be used once per round." },
+          { name: "Sniper's Duel", emoji: "🎯", effect: "Challenge any active player to a duel. Winner gets 100pts & can steal one power-up", cost: 50, duration: null, maxUsesPerGame: 1, category: "offensive", description: "Challenge any active player to a duel. Your opponent is notified they've been challenged — tell the admin in person. Once the admin picks a winner, both duelists are notified. Winner gets 100pts and can steal one of the loser's power-ups." },
           { name: "Jackpot", emoji: "✨", effect: "Next kill earns double points (1x per game)", cost: 300, duration: 1440, maxUsesPerGame: 1, category: "offensive", description: "Your next confirmed elimination earns double the normal elimination points. Stacks with bounty points. One-time use per game, lasts up to 24hrs until triggered." },
           { name: "Bounty Hunter", emoji: "🎯", effect: "Bonus points for next bounty you collect (Earns 450pts for 1 kill)", cost: 250, duration: 1440, maxUsesPerGame: 3, category: "offensive", description: "The next time you eliminate a player who has a bounty on them, you receive 450pts instead of the normal 300. One-time use, lasts up to 24hrs." },
           { name: "Vampire", emoji: "🧛", effect: "Gain 1 extra life for every kill in the time period (Max 3 lives / 1x per game)", cost: 350, duration: 120, maxUsesPerGame: 1, category: "offensive", description: "For 2 hours, each confirmed elimination grants you an automatic Revive token (max 3). As long as you keep killing, you can't stay dead. One-time use per game." },
           { name: "Smoke Screen", emoji: "💨", effect: "Hide all map power-up pickups from every active player", cost: 150, duration: 120, category: "offensive", description: "For 2 hours, ALL hidden map power-ups become invisible to every player except you. You can collect them freely while others can't even see they exist." },
-          { name: "Vendetta", emoji: "⚔️", effect: "Go after a previously missed target from prior round", cost: 200, duration: 120, category: "offensive", description: "For 2 hours, you can eliminate any player who previously eliminated you OR any previous target you failed to get. You receive their location for the duration." },
+          { name: "Vendetta", emoji: "⚔️", effect: "Add a second target for the duration", cost: 200, duration: 120, category: "offensive", description: "Choose any player to add as a second target. For 2 hours, you have two active targets at once and can see the extra target's location. Reverts to your normal single target when it expires." },
           { name: "Blackout", emoji: "⚫", effect: "Remove all player locations from the map for certain time period", cost: 300, duration: 120, category: "offensive", description: "For 2 hours, NO player locations are visible on anyone's map. Even during purge, the map goes dark. Everyone is notified when Blackout starts and ends." },
           { name: "Fall Guy", emoji: "🪖", effect: "Force someone to be your bodyguard, if you're shot, they're eliminated (1x per game)", cost: 300, duration: 240, maxUsesPerGame: 1, category: "offensive", description: "Force any alive player to be your human shield for 4 hours. If someone eliminates you during this time, the conscripted player is eliminated INSTEAD. They are notified. 1x per game." },
           { name: "Hitman's Cut", emoji: "💎", effect: "Get half the points from any kills achieved while active", cost: 250, duration: 240, maxUsesPerGame: 2, category: "offensive", description: "For 4 hours, whenever ANY player eliminates someone, you receive 50% of their earned points (bonus points generated, not taken from them). Passive income." },
-          { name: "Frame Job", emoji: "🖼️", effect: "Transfer your bounty to someone else, if they're eliminated your bounty is fulfilled", cost: 250, duration: 240, maxUsesPerGame: 1, category: "offensive", description: "Transfer all bounties currently on you to another player. If that player is eliminated, the bounties are considered fulfilled. If they survive, bounties transfer back after 4hrs." },
+          { name: "Frame Job", emoji: "🖼️", effect: "Transfer your bounty to someone else, if they're eliminated your bounty is fulfilled", cost: 250, duration: null, maxUsesPerGame: 1, category: "offensive", description: "Transfer all bounties currently on you to another player. The bounty stays on them for as long as it would have stayed on you — it does not expire on its own or transfer back." },
           { name: "Strip Search", emoji: "🔓", effect: "Remove your target's immunity shield for 2hrs", cost: 200, duration: 120, category: "offensive", description: "Immediately removes your current target's active Immunity Shield or Shield power-up for 2 hours. They are notified their shield was stripped but not by whom." },
-          { name: "Boomerang", emoji: "🪃", effect: "If your hunter shoots you while active, it will boomerang back & eliminate them", cost: 350, duration: 180, maxUsesPerGame: 1, category: "offensive", description: "For 3 hours, if the player hunting you attempts to eliminate you, the elimination boomerangs back and eliminates THEM instead. They are not warned. Ultimate counter-play." },
+          { name: "Boomerang", emoji: "🪃", effect: "Choose a player — if you're eliminated while active, your elimination boomerangs onto them instead", cost: 350, duration: 180, maxUsesPerGame: 1, category: "offensive", description: "Choose any active player when you activate this. For 3 hours, if anyone eliminates you, the elimination boomerangs back — instead of you, your chosen player is eliminated. They are not warned." },
           // === DEFENSIVE (15) ===
           { name: "Immunity Shield", emoji: "🛡️", effect: "Immunity from elimination while active", cost: 200, duration: 240, category: "defensive", description: "Activates a protective barrier. While active, any elimination attempt against you automatically fails. The attacker is NOT notified. Lasts 4 hours." },
-          { name: "Dead Zone", emoji: "👻", effect: "Hide location from the map while active", cost: 150, duration: 120, category: "defensive", description: "Your location completely disappears from all maps for 2 hours. Other players see your last known location frozen in place. Great for ambushes or escaping hunters." },
+          { name: "Dead Zone", emoji: "👻", effect: "Hide location from the map while active", cost: 150, duration: 120, category: "defensive", description: "Your location completely disappears from all maps for 2 hours — nothing is shown, not even a last-known pin. Great for ambushes or escaping hunters." },
           { name: "Clean Slate", emoji: "🧹", effect: "Remove a bounty placed on you", cost: 400, duration: null, maxUsesPerGame: 1, category: "defensive", description: "Instantly removes ALL active bounties placed on you. The bounty points vanish. Use when your bounty is climbing and you want to reduce incentive for others to target you." },
           { name: "Radar Detector", emoji: "📟", effect: "Get notified when someone checks your location on the map", cost: 125, duration: 240, category: "defensive", description: "For 4 hours, you receive a push notification any time another player views your location on the map. You'll know their name and the exact time." },
           { name: "Revive", emoji: "❤️", effect: "Come back to life after an elimination within 2hrs. Must be used in the same round. (1x per game)", cost: 350, duration: null, maxUsesPerGame: 1, category: "defensive", description: "Come back to life after an elimination. Must be used in the round the elimination occurred and within 2 hours of the elimination. One-time use per game." },
           { name: "Untouchable", emoji: "🔒", effect: "24hr Immunity (Only 1x per game; not usable during a purge)", cost: 500, duration: 1440, maxUsesPerGame: 1, category: "defensive", description: "Grants 24-hour immunity. May only be used once per game and may not be used during a purge." },
-          { name: "Lucky Charm", emoji: "🍀", effect: "Auto-survive your next elimination without a re-entry fee", cost: 400, duration: null, maxUsesPerGame: 3, category: "defensive", description: "Works like a passive shield — when triggered, your attacker's elimination attempt simply fails. Unlike Revive, you were never eliminated. One-time use, no expiration." },
+          { name: "Lucky Charm", emoji: "🍀", effect: "Auto-revive if you're eliminated while active", cost: 400, duration: 10080, maxUsesPerGame: 3, category: "defensive", description: "Stays active until used. If you're eliminated while it's active, the elimination still counts for your attacker, but you're instantly revived — no re-entry fee. Up to 3 per game." },
           { name: "Decoy", emoji: "🎭", effect: "Drop a fake location marker that others think is you", cost: 100, duration: 120, category: "defensive", description: "Places a fake GPS marker at a location you choose. For 2 hours, anyone tracking you sees the decoy location instead of your real one. Set it and move." },
           { name: "Doppleganger", emoji: "📌", effect: "Swap map location with any active player", cost: 100, duration: 120, category: "defensive", description: "For 2 hours, swap your displayed map location with any active player." },
           { name: "Mirror, Mirror", emoji: "🪞", effect: "Steal power of someone else's active power-up and get effects applied to you", cost: 250, duration: 120, category: "defensive", description: "Copy the effects of another player's active power-up onto yourself for 2 hours. The original player keeps their power-up. You get the same benefits." },
           { name: "Bodyguard", emoji: "💪", effect: "Give another player protection. If they get shot you lose 150pts. (1x per game)", cost: 50, duration: 180, maxUsesPerGame: 1, category: "defensive", description: "Assign protection to any player for 3 hours. While protected, elimination attempts against them fail. If they are eliminated, you lose 150pts. One-time use per game and not usable during a purge." },
-          { name: "Respawn", emoji: "🔄", effect: "Undo your elimination, must pay half revival fee. Within 1hr of approval", cost: 350, duration: null, maxUsesPerGame: 1, category: "defensive", description: "If eliminated, activate within 1 hour of elimination approval to undo it. You must pay half the revival fee. You return to alive status and the elimination is erased." },
+          { name: "Respawn", emoji: "🔄", effect: "Undo your elimination, must pay half revival fee. Within 1hr of approval", cost: 350, duration: null, maxUsesPerGame: 1, category: "defensive", description: "If eliminated, activate within 1 hour of elimination approval. You return to alive status immediately. A half revival fee is added to the admin's fee queue for you to pay." },
           { name: "Witness Protection", emoji: "🕶️", effect: "Temporary safety from elimination and location removed from map", cost: 250, duration: 240, category: "defensive", description: "For 4 hours, you cannot be eliminated and your location is removed from the map. You cannot attack during this time." },
-          { name: "Sanctuary", emoji: "⛪", effect: "Safe location for 6hrs. Can be eliminated but hunters may not enter the location. (1x per game)", cost: 200, duration: 360, maxUsesPerGame: 1, category: "defensive", description: "Designate your current location as a sanctuary zone for 6hrs. Players may not enter it to eliminate you. If you leave, protection ends. One-time use per game and not usable during a purge." },
-          { name: "Burner Phone", emoji: "📱", effect: "Location power-ups used against you will not work (Trace, Radar, Smoke Screen)", cost: 150, duration: 240, category: "defensive", description: "For 4 hours, location power-ups used against you do not work. Your real location stays hidden from power-up tracking." },
+          { name: "Sanctuary", emoji: "⛪", effect: "Mark a safe zone for admin approval. Once approved, it shows on the map for 6hrs. (1x per game)", cost: 200, duration: 360, maxUsesPerGame: 1, category: "defensive", description: "Mark your current location or type an address for your sanctuary. The admin must approve it before it becomes a safe zone shown on everyone's map. Once approved it lasts 6hrs. One-time use per game and not usable during a purge." },
+          { name: "Burner Phone", emoji: "📱", effect: "Blocks Radar from finding you (your own hunter can still see you)", cost: 150, duration: 240, category: "defensive", description: "For 4 hours, players using Radar cannot locate you. Your own hunter can still see you normally, and you can still see map power-ups." },
           // === CHAOS (9) ===
           { name: "Monkey Wrench", emoji: "🔀", effect: "Swap safe object for all players", cost: 100, duration: 1440, category: "chaos", description: "Changes the safe object for all players for 24 hours." },
-          { name: "Reassignment", emoji: "🔄", effect: "Swap for a random new target", cost: 300, duration: null, maxUsesPerGame: 2, category: "chaos", description: "Instantly reassigns you a new random target from the pool of alive players. Your old target gets reassigned to someone else. Use when your current target is too difficult." },
+          { name: "Reassignment", emoji: "🔄", effect: "Swap targets with another player's hunter", cost: 300, duration: null, maxUsesPerGame: 2, category: "chaos", description: "Choose any alive player to become your new target. Whoever currently hunts that player receives your old target in exchange. Use when your current target is too difficult." },
           { name: "Pickpocket", emoji: "🪙", effect: "Drain half the current points from a target & add to your score (Max 400)", cost: 250, duration: null, maxUsesPerGame: 3, category: "chaos", description: "Steals half the points from your current target (max 400pts) and adds them to your balance. They receive a notification they were robbed but not by whom." },
           { name: "Freaky Friday", emoji: "🎭", effect: "Swap ALL players' targets at once for remainder of the round", cost: 600, duration: null, maxUsesPerGame: 2, category: "chaos", description: "The ultimate chaos power-up. EVERY player in the game gets randomly reassigned a new target simultaneously. Everyone is notified. Creates total confusion and resets all strategies." },
-          { name: "Lifeline", emoji: "🚑", effect: "Revive one eliminated player, must be used in same round (2x max per game)", cost: 400, duration: null, maxUsesPerGame: 2, category: "chaos", description: "Bring back one eliminated player of your choice from the current round. They return with 50% of their points. Can be used 2x max per game. The revived player owes you nothing." },
+          { name: "Lifeline", emoji: "🚑", effect: "Revive one eliminated player, must be used in same round (2x max per game)", cost: 400, duration: null, maxUsesPerGame: 2, category: "chaos", description: "Bring back one eliminated player of your choice from the current round. Can be used 2x max per game. The revived player owes you nothing." },
           { name: "Care package", emoji: "🎁", effect: "Gift any power-up you own to any other player", cost: 50, duration: null, category: "chaos", description: "Transfer any unused power-up from your inventory to another player. The recipient is notified who sent it. Useful for alliances or generosity." },
-          { name: "Open Season", emoji: "🔫", effect: "Eliminate any player, no safe objects. 50pts for each elimination", cost: 600, duration: 30, category: "chaos", description: "For 30 minutes, you can eliminate ANY alive player regardless of safe objects or target assignment. Earn 50pts per elimination. All players are notified someone activated Open Season." },
+          { name: "Open Season", emoji: "🔫", effect: "Eliminate any player, no safe objects. +50pts for every elimination in the game while active", cost: 600, duration: 30, category: "chaos", description: "All players are notified immediately. After a 5-minute warning, Open Season is active for 30 minutes — anyone can eliminate anyone. You earn +50pts for every elimination that happens in the game while it's active, plus your normal kill points if you get one yourself." },
           { name: "Roulette", emoji: "🎰", effect: "Spin for random power-ups, discounts and points", cost: 50, duration: null, category: "chaos", description: "Spin the wheel! Possible outcomes set by admin: free power-up, point bonus, point penalty, discount coupon, or nothing. Cheap gamble that could pay off big or cost you." },
           { name: "Wildcard", emoji: "🃏", effect: "Choose your target for the next round", cost: 300, duration: null, maxUsesPerGame: 3, category: "chaos", description: "Choose which active player will be your target for the next round." },
         ];
@@ -630,7 +656,7 @@ export const appRouter = router({
         const assetFreeze = await db.getActiveTargetedPowerUp(input.gameId, player.id, "Asset Freeze");
         if (assetFreeze) throw new Error("Your power-up inventory is currently frozen");
 
-        const requiresFinalRuleDesign = new Set(["Vendetta", "Roulette"]);
+        const requiresFinalRuleDesign = new Set(["Roulette"]);
         if (requiresFinalRuleDesign.has(item.powerUp.name)) {
           throw new Error(`${item.powerUp.name} is in your inventory, but its final game rule must be configured before activation`);
         }
@@ -654,7 +680,7 @@ export const appRouter = router({
         const targetRequired = new Set([
           "Bounty", "Raise the Stakes", "Killswitch", "Recon", "Blacklist", "Asset Freeze", "Sabotage",
           "Sniper's Duel", "Fall Guy", "Frame Job", "Strip Search", "Doppleganger", "Mirror, Mirror", "Bodyguard", "Pickpocket",
-          "Lifeline", "Care package", "Wildcard"
+          "Lifeline", "Care package", "Wildcard", "Vendetta", "Reassignment", "Boomerang"
         ]);
         if (targetRequired.has(item.powerUp.name) && !input.targetPlayerId) throw new Error("Choose a target before activating this power-up");
         if (input.targetPlayerId) {
@@ -669,39 +695,61 @@ export const appRouter = router({
 
         let consumeImmediately = item.powerUp.duration == null;
         let finalActivationData: Record<string, unknown> | undefined = input.activationData;
+        let effectiveDurationMinutes: number | null = item.powerUp.duration;
         switch (item.powerUp.name) {
+          case "Open Season": {
+            const effectStartsAt = new Date(Date.now() + 5 * 60000);
+            finalActivationData = { ...(input.activationData || {}), effectStartsAt: effectStartsAt.toISOString() };
+            effectiveDurationMinutes = (item.powerUp.duration || 30) + 5;
+            const allPlayers = await db.getGamePlayers(input.gameId);
+            for (const gamePlayer of allPlayers) {
+              await db.createNotification({
+                userId: gamePlayer.userId,
+                gameId: input.gameId,
+                type: "power_up_used",
+                title: "🔫 Open Season Incoming!",
+                body: "Open Season activates in 5 minutes. No safe objects will protect anyone once it starts.",
+              });
+            }
+            break;
+          }
           case "Sniper's Duel": {
             if (!input.targetPlayerId) throw new Error("Choose an opponent before activating this power-up");
             const duelId = await db.createDuel({ gameId: input.gameId, challengerId: player.id, opponentId: input.targetPlayerId });
-            if (game?.adminId) {
+            const opponent = await db.getPlayerById(input.targetPlayerId);
+            if (opponent) {
               await db.createNotification({
-                userId: game.adminId,
+                userId: opponent.userId,
                 gameId: input.gameId,
                 type: "power_up_used",
-                title: "🎯 Sniper's Duel Challenge",
-                body: "A duel has been declared. Review it in Admin > Eliminations and pick the winner.",
+                title: "🎯 You've Been Challenged!",
+                body: "A player has challenged you to a Sniper's Duel. Let the admin know so they can pick a winner.",
               });
             }
             finalActivationData = { ...(input.activationData || {}), duelId };
             break;
           }
           case "Sanctuary": {
-            if (!player.latitude || !player.longitude) {
-              throw new Error("Enable your location before declaring a Sanctuary");
+            const requestedLat = typeof input.activationData?.zoneLatitude === "string" ? input.activationData.zoneLatitude : undefined;
+            const requestedLng = typeof input.activationData?.zoneLongitude === "string" ? input.activationData.zoneLongitude : undefined;
+            const zoneLatitude = requestedLat || player.latitude;
+            const zoneLongitude = requestedLng || player.longitude;
+            if (!zoneLatitude || !zoneLongitude) {
+              throw new Error("Enable your location, mark a spot on the map, or enter an address before declaring a Sanctuary");
             }
             finalActivationData = {
-              ...(input.activationData || {}),
-              zoneLatitude: player.latitude,
-              zoneLongitude: player.longitude,
+              zoneLatitude,
+              zoneLongitude,
               zoneRadiusMeters: 30,
+              approved: false,
             };
             if (game?.adminId) {
               await db.createNotification({
                 userId: game.adminId,
                 gameId: input.gameId,
                 type: "power_up_used",
-                title: "⛪ Sanctuary Activated",
-                body: `A player declared a Sanctuary at ${player.latitude}, ${player.longitude}. It's now shown as a safe zone on the map for 6hrs.`,
+                title: "⛪ Sanctuary Approval Needed",
+                body: `A player requested a Sanctuary at ${zoneLatitude}, ${zoneLongitude}. Approve it in Admin > Eliminations to show it on the map.`,
               });
             }
             break;
@@ -737,6 +785,9 @@ export const appRouter = router({
           case "Clean Slate":
             await db.clearPlayerBounties(input.gameId, player.id);
             break;
+          case "Witness Protection":
+            await db.updatePlayer(player.id, { status: "safe" });
+            break;
           case "Strip Search": {
             if (input.targetPlayerId !== player.targetId) {
               throw new Error("Strip Search can only be used on your current target");
@@ -755,7 +806,7 @@ export const appRouter = router({
             if (!copied?.powerUp) throw new Error("The selected player has no active power-up to copy");
             const copiedInventoryId = await db.purchasePowerUp(player.id, copied.powerUp.id, input.gameId);
             await db.activatePlayerPowerUp(copiedInventoryId, {
-              expiresAt: new Date(Date.now() + 120 * 60000),
+              expiresAt: copied.expiresAt,
               targetPlayerId: copied.targetPlayerId,
               activationData: { copiedBy: item.id },
             });
@@ -786,10 +837,18 @@ export const appRouter = router({
             break;
           }
           case "Reassignment": {
-            const candidates = (await db.getGamePlayers(input.gameId)).filter(p => p.status === "alive" && p.id !== player.id && p.id !== player.targetId);
-            if (!candidates.length) throw new Error("No alternate target is available");
-            const next = candidates[Math.floor(Math.random() * candidates.length)];
-            await db.updatePlayer(player.id, { targetId: next.id });
+            const newTarget = await db.getPlayerById(input.targetPlayerId!);
+            if (!newTarget || newTarget.gameId !== input.gameId || newTarget.status !== "alive") {
+              throw new Error("Choose an alive player as your new target");
+            }
+            if (newTarget.id === player.id) throw new Error("You can't target yourself");
+            const allPlayers = await db.getGamePlayers(input.gameId);
+            const newTargetHunter = allPlayers.find(p => p.targetId === newTarget.id && p.id !== player.id);
+            const oldTargetId = player.targetId;
+            await db.updatePlayer(player.id, { targetId: newTarget.id });
+            if (newTargetHunter && oldTargetId) {
+              await db.updatePlayer(newTargetHunter.id, { targetId: oldTargetId });
+            }
             break;
           }
           case "Freaky Friday": {
@@ -829,7 +888,7 @@ export const appRouter = router({
         if (consumeImmediately) {
           await db.consumePlayerPowerUp(item.id);
         } else {
-          const expiresAt = new Date(Date.now() + item.powerUp.duration! * 60000);
+          const expiresAt = new Date(Date.now() + effectiveDurationMinutes! * 60000);
           await db.activatePlayerPowerUp(item.id, { expiresAt, targetPlayerId: input.targetPlayerId, activationData: finalActivationData });
         }
         await db.createKillFeedEvent({ gameId: input.gameId, eventType: "power_up_used", actorId: player.id, targetId: input.targetPlayerId, message: `${item.powerUp.emoji} ${item.powerUp.name} activated!` });
@@ -851,6 +910,30 @@ export const appRouter = router({
         const game = await db.getGame(input.gameId);
         if (!game || (game.adminId !== ctx.user.id && !ctx.user.isSuperAdmin)) throw new Error("Admin access required");
         await db.resolvePowerUpUsageFee(input.feeId, input.status, ctx.user.id, input.note);
+        return { success: true };
+      }),
+
+    pendingSanctuaries: protectedProcedure
+      .input(z.object({ gameId: z.number() }))
+      .query(async ({ ctx, input }) => {
+        const game = await db.getGame(input.gameId);
+        if (!game || (game.adminId !== ctx.user.id && !ctx.user.isSuperAdmin)) throw new Error("Admin access required");
+        return db.getPendingSanctuaryZones(input.gameId);
+      }),
+
+    approveSanctuary: protectedProcedure
+      .input(z.object({ gameId: z.number(), inventoryId: z.number() }))
+      .mutation(async ({ ctx, input }) => {
+        const game = await db.getGame(input.gameId);
+        if (!game || (game.adminId !== ctx.user.id && !ctx.user.isSuperAdmin)) throw new Error("Admin access required");
+        const item = await db.getPlayerPowerUpById(input.inventoryId);
+        if (!item || item.gameId !== input.gameId) throw new Error("Sanctuary request not found");
+        const activationData = (item.activationData as Record<string, unknown> | null) || {};
+        await db.updatePlayerPowerUpActivationData(item.id, { ...activationData, approved: true });
+        const holder = await db.getPlayerById(item.gamePlayerId);
+        if (holder) {
+          await db.createNotification({ userId: holder.userId, gameId: input.gameId, type: "power_up_used", title: "⛪ Sanctuary Approved", body: "Your Sanctuary was approved and now shows as a safe zone on the map." });
+        }
         return { success: true };
       }),
   }),
@@ -901,9 +984,9 @@ export const appRouter = router({
           }
           if (submittedElimination) {
             const boomerang = await db.getActivePowerUpByName(submittedElimination.eliminatedId, "Boomerang");
-            if (boomerang) {
-              const originalEliminatorId = submittedElimination.eliminatorId;
-              await db.updateElimination(input.eliminationId, { eliminatorId: submittedElimination.eliminatedId, eliminatedId: originalEliminatorId });
+            if (boomerang && boomerang.targetPlayerId) {
+              const boomerangHolderId = submittedElimination.eliminatedId;
+              await db.updateElimination(input.eliminationId, { eliminatorId: boomerangHolderId, eliminatedId: boomerang.targetPlayerId });
               await db.consumePlayerPowerUp(boomerang.id);
               submittedElimination = await db.getElimination(input.eliminationId);
             }
@@ -928,19 +1011,11 @@ export const appRouter = router({
                 break;
               }
             }
-            if (approved) {
-              const luckyCharm = await db.getActivePowerUpByName(defendedPlayerId, "Lucky Charm");
-              if (luckyCharm) {
-                approved = false;
-                await db.consumePlayerPowerUp(luckyCharm.id);
-                await db.createKillFeedEvent({ gameId: input.gameId, eventType: "power_up_used", actorId: defendedPlayerId, message: "Lucky Charm blocked an elimination!" });
-              }
-            }
           }
         }
         const status = approved ? "approved" : "denied";
         const game = await db.getGame(input.gameId);
-        const eliminationPoints = game?.eliminationPoints || 100;
+        const eliminationPoints = (game?.purgeActive ? game?.purgeEliminationPoints : null) ?? game?.eliminationPoints ?? 100;
         await db.updateElimination(input.eliminationId, { status, reviewedBy: ctx.user.id, reviewedAt: new Date(), pointsAwarded: approved ? eliminationPoints : 0 });
         
         if (approved) {
@@ -957,8 +1032,6 @@ export const appRouter = router({
                 killPoints *= 2;
                 await db.consumePlayerPowerUp(jackpot.id);
               }
-              const openSeason = await db.getActivePowerUpByName(eliminator.id, "Open Season");
-              if (openSeason) killPoints += 50;
               let totalAward = killPoints;
               // Claim any bounties on the eliminated player
               if (eliminated) {
@@ -990,6 +1063,14 @@ export const appRouter = router({
                 const beneficiary = players.find(p => p.id === cut.gamePlayerId);
                 if (beneficiary) await db.updatePlayer(beneficiary.id, { points: (beneficiary.points || 0) + Math.floor(totalAward / 2) });
               }
+              const openSeasonHolders = await db.getActiveGamePowerUpsByName(input.gameId, "Open Season");
+              for (const holder of openSeasonHolders) {
+                const holderData = holder.activationData as { effectStartsAt?: string } | null;
+                const effectStartsAt = holderData?.effectStartsAt ? new Date(holderData.effectStartsAt).getTime() : 0;
+                if (Date.now() < effectStartsAt) continue;
+                const holderPlayer = await db.getPlayerById(holder.gamePlayerId);
+                if (holderPlayer) await db.updatePlayer(holderPlayer.id, { points: (holderPlayer.points || 0) + 50 });
+              }
               // Inherit target if enabled
               if (game?.inheritTarget && eliminated) {
                 const inheritedTarget = eliminated.targetId;
@@ -1008,6 +1089,7 @@ export const appRouter = router({
             }
             if (eliminated) {
               const reviveCredits = (eliminated as any).reviveCredits || 0;
+              const luckyCharm = await db.getActivePowerUpByName(eliminated.id, "Lucky Charm");
               if (reviveCredits > 0) {
                 await db.updatePlayer(eliminated.id, { status: "alive", deaths: (eliminated.deaths || 0) + 1, reviveCredits: reviveCredits - 1 } as any);
                 await db.createNotification({ userId: eliminated.userId, gameId: input.gameId, type: "elimination_result", title: "🧛 Vampire Saved You!", body: "You were eliminated, but an extra life brought you back instantly." });
@@ -1015,6 +1097,15 @@ export const appRouter = router({
                   title: "🧛 Extra Life Used!",
                   body: "You were eliminated but a banked Vampire life revived you instantly.",
                   data: { type: "vampire_revive", gameId: input.gameId },
+                });
+              } else if (luckyCharm) {
+                await db.consumePlayerPowerUp(luckyCharm.id);
+                await db.updatePlayer(eliminated.id, { status: "alive", deaths: (eliminated.deaths || 0) + 1 });
+                await db.createNotification({ userId: eliminated.userId, gameId: input.gameId, type: "elimination_result", title: "🍀 Lucky Charm Saved You!", body: "You were eliminated, but your Lucky Charm revived you instantly." });
+                await sendPushToUser(eliminated.userId, {
+                  title: "🍀 Lucky Charm Saved You!",
+                  body: "You were eliminated but your Lucky Charm brought you back instantly.",
+                  data: { type: "lucky_charm_revive", gameId: input.gameId },
                 });
               } else {
                 await db.updatePlayer(eliminated.id, { status: "eliminated", deaths: (eliminated.deaths || 0) + 1 });

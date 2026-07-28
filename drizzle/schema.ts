@@ -36,6 +36,7 @@ export const games = mysqlTable("games", {
   inheritTarget: boolean("inheritTarget").default(true), // killer inherits victim's target
   startingPoints: int("startingPoints").default(0), // points all players start with
   eliminationPoints: int("eliminationPoints").default(100), // points awarded per kill
+  purgeEliminationPoints: int("purgeEliminationPoints"), // admin-set points per kill during a purge; null = use eliminationPoints
   locationPingInterval: int("locationPingInterval").default(15), // minutes between required pings
   createdAt: timestamp("createdAt").defaultNow().notNull(),
   updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),

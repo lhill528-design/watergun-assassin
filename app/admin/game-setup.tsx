@@ -25,6 +25,7 @@ export default function AdminGameSetupScreen() {
   const [inheritTarget, setInheritTarget] = useState(true);
   const [startingPoints, setStartingPoints] = useState("0");
   const [eliminationPoints, setEliminationPoints] = useState("100");
+  const [purgeEliminationPoints, setPurgeEliminationPoints] = useState("");
   const [locationPingInterval, setLocationPingInterval] = useState("15");
 
   useEffect(() => {
@@ -37,6 +38,7 @@ export default function AdminGameSetupScreen() {
       setInheritTarget((game as any).inheritTarget ?? true);
       setStartingPoints(String((game as any).startingPoints || 0));
       setEliminationPoints(String((game as any).eliminationPoints || 100));
+      setPurgeEliminationPoints((game as any).purgeEliminationPoints != null ? String((game as any).purgeEliminationPoints) : "");
       setLocationPingInterval(String((game as any).locationPingInterval || 15));
     }
   }, [game]);
@@ -53,6 +55,7 @@ export default function AdminGameSetupScreen() {
       inheritTarget,
       startingPoints: parseInt(startingPoints) || 0,
       eliminationPoints: parseInt(eliminationPoints) || 100,
+      purgeEliminationPoints: purgeEliminationPoints.trim() === "" ? null : (parseInt(purgeEliminationPoints) || 0),
       locationPingInterval: parseInt(locationPingInterval) || 15,
     });
   };
@@ -150,6 +153,19 @@ export default function AdminGameSetupScreen() {
               value={eliminationPoints}
               onChangeText={setEliminationPoints}
               keyboardType="numeric"
+            />
+          </View>
+
+          <View>
+            <Text className="text-sm font-bold text-foreground mb-2">Purge Elimination Points</Text>
+            <Text className="text-muted text-xs mb-1">Leave blank to use normal Elimination Points during a purge</Text>
+            <TextInput
+              className="bg-surface border border-border rounded-xl px-4 py-3 text-foreground"
+              value={purgeEliminationPoints}
+              onChangeText={setPurgeEliminationPoints}
+              keyboardType="numeric"
+              placeholder="Same as Elimination Points"
+              placeholderTextColor="#8B8B9E"
             />
           </View>
 

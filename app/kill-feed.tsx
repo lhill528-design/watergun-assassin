@@ -48,6 +48,15 @@ export default function KillFeedScreen() {
     if (event.eventType === "elimination_approved" && event.actorName && event.targetName) {
       return `💀 ${event.actorName} eliminated ${event.targetName}!`;
     }
+    if (event.message.includes("Pickpocket activated") && event.actorName && event.targetName) {
+      return `🪙 ${event.actorName} stole points from ${event.targetName}!`;
+    }
+    if (event.message.includes("Care package activated") && event.actorName && event.targetName) {
+      return `🎁 ${event.actorName} sent a power-up to ${event.targetName}!`;
+    }
+    if (event.message === "🎯 Sniper's Duel resolved!" && event.actorName && event.targetName) {
+      return `🎯 ${event.actorName} won the Sniper's Duel against ${event.targetName}!`;
+    }
     return event.message;
   };
 

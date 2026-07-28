@@ -85,6 +85,10 @@ export default function MapScreen() {
     { gameId },
     { enabled: gameId > 0 && isAuthenticated }
   );
+  const vendettaTargetQuery = trpc.player.vendettaTarget.useQuery(
+    { gameId },
+    { enabled: gameId > 0 && isAuthenticated }
+  );
 
   // Proximity check — only runs when we have a location
   const proximityQuery = trpc.mapPowerUp.checkProximity.useQuery(
@@ -104,6 +108,7 @@ export default function MapScreen() {
   const myPlayer = playerMeQuery.data;
   const mapPowerUps = mapPowerUpsQuery.data || [];
   const proximityData = proximityQuery.data || [];
+  const vendettaTarget = vendettaTargetQuery.data || null;
 
   const updateLocationMutation = trpc.player.updateLocation.useMutation();
   const disableLocationMutation = trpc.player.disableLocation.useMutation({
@@ -228,8 +233,8 @@ export default function MapScreen() {
 
   const visibleUnclaimedPowerUps = mapPowerUps.filter(mp => mp.isVisible && !mp.claimedBy && mp.latitude && mp.longitude);
   const safeZones = players
-    .map(p => (p as any).sanctuaryZone as { latitude: string; longitude: string; radiusMeters: number } | null | undefined)
-    .filter((zone): zone is { latitude: string; longitude: string; radiusMeters: number } => !!zone)
+    .map(p => (p as any).sanctuaryZone as { latitude: string; longitude: string; radiusMeters: number; approved?: boolean } | null | undefined)
+    .filter((zone): zone is { latitude: string; longitude: string; radiusMeters: number; approved?: boolean } => !!zone && zone.approved !== false)
     .map(zone => ({ latitude: parseFloat(zone.latitude), longitude: parseFloat(zone.longitude), radiusMeters: zone.radiusMeters, label: "Sanctuary Safe Zone" }));
   const COLLECT_RADIUS_METERS = 50;
 
@@ -264,7 +269,7 @@ export default function MapScreen() {
         .forEach(p => {
           const type: PlayerPin["type"] = p.status === "safe"
             ? "safe"
-            : p.userId === myPlayer?.targetId
+            : p.id === myPlayer?.targetId || p.id === vendettaTarget?.id
               ? "target"
               : "purge_player";
           pins.push({
@@ -275,16 +280,28 @@ export default function MapScreen() {
             type,
           });
         });
-    } else if (myPlayer?.targetId) {
-      const target = players.find(p => p.userId === myPlayer.targetId);
-      if (target?.latitude && target?.longitude) {
-        const type: PlayerPin["type"] = target.status === "safe" ? "safe" : "target";
+    } else {
+      if (myPlayer?.targetId) {
+        const target = players.find(p => p.id === myPlayer.targetId);
+        if (target?.latitude && target?.longitude) {
+          const type: PlayerPin["type"] = target.status === "safe" ? "safe" : "target";
+          pins.push({
+            id: target.id,
+            label: resolvePlayerLabel(target),
+            latitude: parseFloat(target.latitude),
+            longitude: parseFloat(target.longitude),
+            type,
+          });
+        }
+      }
+      if (vendettaTarget && vendettaTarget.id !== myPlayer?.targetId) {
+        const target = players.find(p => p.id === vendettaTarget.id);
         pins.push({
-          id: target.id,
-          label: resolvePlayerLabel(target),
-          latitude: parseFloat(target.latitude),
-          longitude: parseFloat(target.longitude),
-          type,
+          id: vendettaTarget.id,
+          label: target ? resolvePlayerLabel(target) : `Player #${vendettaTarget.userId}`,
+          latitude: parseFloat(vendettaTarget.latitude),
+          longitude: parseFloat(vendettaTarget.longitude),
+          type: vendettaTarget.status === "safe" ? "safe" : "target",
         });
       }
     }
@@ -500,7 +517,7 @@ export default function MapScreen() {
         <View style={styles.legend}>
           <Text style={styles.legendTitle}>👥 Players in Game</Text>
           {players.filter(p => p.id !== myPlayer?.id && p.status !== "eliminated").map((p) => {
-            const isMyTarget = p.userId === myPlayer?.targetId;
+            const isMyTarget = p.id === myPlayer?.targetId || p.id === vendettaTarget?.id;
             const canCheck = isMyTarget || purgeActive;
             return (
               <TouchableOpacity

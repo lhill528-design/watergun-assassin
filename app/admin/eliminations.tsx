@@ -20,8 +20,15 @@ export default function AdminEliminationsScreen() {
     onError: (err) => Alert.alert("Error", err.message),
   });
 
+  const sanctuariesQuery = trpc.powerUp.pendingSanctuaries.useQuery({ gameId: activeGameId! }, { enabled: !!activeGameId });
+  const approveSanctuaryMutation = trpc.powerUp.approveSanctuary.useMutation({
+    onSuccess: () => { sanctuariesQuery.refetch(); Alert.alert("Sanctuary Approved!"); },
+    onError: (err) => Alert.alert("Error", err.message),
+  });
+
   const pending = pendingQuery.data || [];
   const pendingDuels = duelsQuery.data || [];
+  const pendingSanctuaries = sanctuariesQuery.data || [];
 
   const playerLabel = (p: any) => p?.displayName?.trim() || p?.user?.displayName?.trim() || p?.user?.name?.trim() || `Player #${p?.userId ?? "?"}`;
 
@@ -29,6 +36,13 @@ export default function AdminEliminationsScreen() {
     Alert.alert("Confirm Winner", `Declare ${winnerName} the winner of this duel?`, [
       { text: "Cancel", style: "cancel" },
       { text: "Confirm", onPress: () => resolveDuelMutation.mutate({ gameId: activeGameId!, duelId, winnerId }) },
+    ]);
+  };
+
+  const handleApproveSanctuary = (inventoryId: number, playerName: string) => {
+    Alert.alert("Approve Sanctuary", `Approve ${playerName}'s sanctuary and show it on the map?`, [
+      { text: "Cancel", style: "cancel" },
+      { text: "Approve", onPress: () => approveSanctuaryMutation.mutate({ gameId: activeGameId!, inventoryId }) },
     ]);
   };
 
@@ -77,6 +91,28 @@ export default function AdminEliminationsScreen() {
               </View>
             </View>
           ))}
+        </View>
+      )}
+
+      {pendingSanctuaries.length > 0 && (
+        <View className="px-4 pt-4">
+          <Text className="text-foreground font-bold mb-2">⛪ Pending Sanctuary Requests ({pendingSanctuaries.length})</Text>
+          {pendingSanctuaries.map((item: any) => {
+            const zone = item.activationData as { zoneLatitude?: string; zoneLongitude?: string } | null;
+            const name = playerLabel(item.player);
+            return (
+              <View key={item.id} className="bg-surface rounded-xl p-4 mb-3 border border-warning">
+                <Text className="text-foreground font-semibold mb-1">{name}</Text>
+                <Text className="text-muted text-xs mb-3">📍 {zone?.zoneLatitude}, {zone?.zoneLongitude}</Text>
+                <TouchableOpacity
+                  className="bg-primary/20 border border-primary rounded-xl py-3 items-center"
+                  onPress={() => handleApproveSanctuary(item.id, name)}
+                >
+                  <Text className="text-primary font-bold">✅ Approve Sanctuary</Text>
+                </TouchableOpacity>
+              </View>
+            );
+          })}
         </View>
       )}
 
