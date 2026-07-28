@@ -35,6 +35,10 @@ export default function ShopScreen() {
     { gameId: activeGameId! },
     { enabled: !!activeGameId && isAuthenticated }
   );
+  const reconQuery = trpc.player.reconTarget.useQuery(
+    { gameId: activeGameId! },
+    { enabled: !!activeGameId && isAuthenticated }
+  );
   const playerQuery = trpc.player.me.useQuery(
     { gameId: activeGameId! },
     { enabled: !!activeGameId && isAuthenticated }
@@ -174,6 +178,21 @@ export default function ShopScreen() {
             <Text className="text-warning font-semibold text-sm flex-1">
               You have a {pendingDiscountPercent}% discount coupon — it'll auto-apply to your next purchase below.
             </Text>
+          </View>
+        )}
+
+        {/* Recon intel on your target, while active */}
+        {reconQuery.data && (
+          <View className="bg-primary/10 border border-primary rounded-xl p-3 mb-4">
+            <Text className="text-primary font-bold text-sm mb-1">🔍 Recon: {reconQuery.data.targetName}</Text>
+            <Text className="text-foreground text-sm">Balance: {reconQuery.data.points} pts</Text>
+            {reconQuery.data.activePowerUps.length > 0 ? (
+              <Text className="text-muted text-xs mt-1">
+                Active: {reconQuery.data.activePowerUps.map(p => `${p.emoji} ${p.name}`).join(", ")}
+              </Text>
+            ) : (
+              <Text className="text-muted text-xs mt-1">No active power-ups.</Text>
+            )}
           </View>
         )}
 

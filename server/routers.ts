@@ -291,7 +291,7 @@ export const appRouter = router({
         if (!isAdmin) {
           const radar = await db.getActivePowerUpByName(viewer.id, "Radar");
           const canSeeAll = Boolean(radar || (game?.purgeActive && game.showLocationsDuringPurge));
-          const isMyTarget = target.id === viewer.targetId;
+          const isMyTarget = target.userId === viewer.targetId;
           if (!canSeeAll && !isMyTarget) {
             throw new Error("You can only check your current target's location, or everyone's during a purge");
           }
@@ -320,6 +320,30 @@ export const appRouter = router({
       .input(z.object({ gameId: z.number() }))
       .query(async ({ ctx, input }) => {
         return db.getPlayerInGame(input.gameId, ctx.user.id);
+      }),
+
+    reconTarget: protectedProcedure
+      .input(z.object({ gameId: z.number() }))
+      .query(async ({ ctx, input }) => {
+        const viewer = await db.getPlayerInGame(input.gameId, ctx.user.id);
+        if (!viewer || !viewer.targetId) return null;
+        const recon = await db.getActivePowerUpByName(viewer.id, "Recon");
+        if (!recon) return null;
+        const players = await db.getGamePlayers(input.gameId);
+        const target = players.find(p => p.userId === viewer.targetId);
+        if (!target) return null;
+        const inventory = await db.getPlayerPowerUps(target.id);
+        const active = inventory.filter(item => item.status === "active" && item.powerUp);
+        return {
+          targetName: target.user?.displayName || target.user?.name || `Player #${target.userId}`,
+          points: target.points || 0,
+          activePowerUps: active.map(item => ({
+            name: item.powerUp!.name,
+            emoji: item.powerUp!.emoji,
+            expiresAt: item.expiresAt,
+          })),
+          expiresAt: recon.expiresAt,
+        };
       }),
 
     update: protectedProcedure
