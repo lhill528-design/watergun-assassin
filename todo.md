@@ -104,4 +104,4 @@
 - [x] Merge only the two paths in `Watergun-target-name-followup-for-Manus.zip` so the player home screen displays the assigned target’s name instead of numeric ID, without database changes.
 - [x] Validate the target-name follow-up with `pnpm check` and the five existing power-up rule tests while preserving the V2 update.
 - [ ] Diagnose why the standard publish action requests an Expo token and identify the correct path for Safari-accessible web deployment.
-- [ ] Verify the complete V2 and target-name follow-up state, validate it, and push all safe project changes—including migrations 0009 and 0010—to the current connected GitHub branch.
+- [x] Verify the complete V2 and target-name follow-up state, validate it, and push all safe project changes—including migrations 0009 and 0010—to the current connected GitHub branch.
