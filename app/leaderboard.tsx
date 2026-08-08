@@ -83,6 +83,7 @@ export default function LeaderboardScreen() {
                   <Text className="text-muted text-xs">
                     {item.status === "alive" ? "🟢 Alive" : item.status === "safe" ? "🛡️ Safe" : "💀 Eliminated"}
                   </Text>
+                  {(item as any).protectionBadge && <Text className="text-primary text-xs font-bold">🛡️ {(item as any).protectionBadge.label}</Text>}
                 </View>
               </View>
               <View className="items-end">

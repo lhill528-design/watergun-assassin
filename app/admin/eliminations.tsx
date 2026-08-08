@@ -1,4 +1,4 @@
-import { Text, View, FlatList, TouchableOpacity, Alert, ScrollView } from "react-native";
+import { Text, View, FlatList, TouchableOpacity, Alert, ScrollView, Linking } from "react-native";
 import { useRouter } from "expo-router";
 import { ScreenContainer } from "@/components/screen-container";
 import { useGame } from "@/lib/game-context";
@@ -25,6 +25,10 @@ export default function AdminEliminationsScreen() {
     onSuccess: () => { sanctuariesQuery.refetch(); Alert.alert("Sanctuary Approved!"); },
     onError: (err) => Alert.alert("Error", err.message),
   });
+  const rejectSanctuaryMutation = trpc.powerUp.rejectSanctuary.useMutation({
+    onSuccess: () => { sanctuariesQuery.refetch(); Alert.alert("Sanctuary Returned", "The player can submit a different address."); },
+    onError: (err) => Alert.alert("Error", err.message),
+  });
 
   const pending = pendingQuery.data || [];
   const pendingDuels = duelsQuery.data || [];
@@ -32,10 +36,10 @@ export default function AdminEliminationsScreen() {
 
   const playerLabel = (p: any) => p?.displayName?.trim() || p?.user?.displayName?.trim() || p?.user?.name?.trim() || `Player #${p?.userId ?? "?"}`;
 
-  const handlePickWinner = (duelId: number, winnerId: number, winnerName: string) => {
-    Alert.alert("Confirm Winner", `Declare ${winnerName} the winner of this duel?`, [
+  const handleDuelReview = (duelId: number, approved: boolean, winnerName: string) => {
+    Alert.alert(approved ? "Approve Duel Result" : "Reject Duel Result", approved ? `Approve ${winnerName} as the submitted winner for 350 points and the loser's stake?` : "Reject this result and unlock both stakes?", [
       { text: "Cancel", style: "cancel" },
-      { text: "Confirm", onPress: () => resolveDuelMutation.mutate({ gameId: activeGameId!, duelId, winnerId }) },
+      { text: "Confirm", onPress: () => resolveDuelMutation.mutate({ gameId: activeGameId!, duelId, approved }) },
     ]);
   };
 
@@ -75,18 +79,21 @@ export default function AdminEliminationsScreen() {
               <Text className="text-foreground font-semibold mb-3">
                 {playerLabel(duel.challenger)} vs {playerLabel(duel.opponent)}
               </Text>
+              <Text className="text-muted text-xs mb-2">Submitted winner: {duel.proposedWinnerId === duel.challengerId ? playerLabel(duel.challenger) : playerLabel(duel.opponent)}</Text>
+              {duel.witnessName ? <Text className="text-muted text-xs mb-2">Witness: {duel.witnessName}</Text> : null}
+              {duel.evidenceUrl ? <TouchableOpacity className="mb-3" onPress={() => Linking.openURL(duel.evidenceUrl)}><Text className="text-primary font-bold">▶ View duel video</Text></TouchableOpacity> : null}
               <View className="flex-row gap-3">
                 <TouchableOpacity
                   className="flex-1 bg-primary/20 border border-primary rounded-xl py-3 items-center"
-                  onPress={() => handlePickWinner(duel.id, duel.challengerId, playerLabel(duel.challenger))}
+                  onPress={() => handleDuelReview(duel.id, true, duel.proposedWinnerId === duel.challengerId ? playerLabel(duel.challenger) : playerLabel(duel.opponent))}
                 >
-                  <Text className="text-primary font-bold" numberOfLines={1}>{playerLabel(duel.challenger)} Wins</Text>
+                  <Text className="text-primary font-bold">Approve Result</Text>
                 </TouchableOpacity>
                 <TouchableOpacity
                   className="flex-1 bg-primary/20 border border-primary rounded-xl py-3 items-center"
-                  onPress={() => handlePickWinner(duel.id, duel.opponentId, playerLabel(duel.opponent))}
+                  onPress={() => handleDuelReview(duel.id, false, "")}
                 >
-                  <Text className="text-primary font-bold" numberOfLines={1}>{playerLabel(duel.opponent)} Wins</Text>
+                  <Text className="text-error font-bold">Reject Result</Text>
                 </TouchableOpacity>
               </View>
             </View>
@@ -104,12 +111,7 @@ export default function AdminEliminationsScreen() {
               <View key={item.id} className="bg-surface rounded-xl p-4 mb-3 border border-warning">
                 <Text className="text-foreground font-semibold mb-1">{name}</Text>
                 <Text className="text-muted text-xs mb-3">📍 {zone?.zoneLatitude}, {zone?.zoneLongitude}</Text>
-                <TouchableOpacity
-                  className="bg-primary/20 border border-primary rounded-xl py-3 items-center"
-                  onPress={() => handleApproveSanctuary(item.id, name)}
-                >
-                  <Text className="text-primary font-bold">✅ Approve Sanctuary</Text>
-                </TouchableOpacity>
+                <View className="flex-row gap-3"><TouchableOpacity className="flex-1 bg-primary/20 border border-primary rounded-xl py-3 items-center" onPress={() => handleApproveSanctuary(item.id, name)}><Text className="text-primary font-bold">✅ Approve</Text></TouchableOpacity><TouchableOpacity className="flex-1 bg-error/20 border border-error rounded-xl py-3 items-center" onPress={() => rejectSanctuaryMutation.mutate({ gameId: activeGameId!, inventoryId: item.id })}><Text className="text-error font-bold">Return</Text></TouchableOpacity></View>
               </View>
             );
           })}
@@ -133,9 +135,10 @@ export default function AdminEliminationsScreen() {
                 <View>
                   <Text className="text-foreground font-bold">Elimination Claim</Text>
                   <Text className="text-muted text-xs">
-                    Player #{item.eliminatorId} → Player #{item.eliminatedId}
+                    {playerLabel((item as any).eliminator)} → {playerLabel((item as any).eliminated)}
                   </Text>
                   <Text className="text-muted text-xs">Round {item.round} • {new Date(item.createdAt).toLocaleDateString()}</Text>
+                  {(item as any).activeProtection && <Text className="text-primary text-xs font-bold">🛡️ Active: {(item as any).activeProtection}</Text>}
                 </View>
                 <View className="bg-warning/20 px-2 py-1 rounded">
                   <Text className="text-warning text-xs font-bold">PENDING</Text>
@@ -144,9 +147,7 @@ export default function AdminEliminationsScreen() {
 
               {/* Video Evidence */}
               {item.videoUrl && item.videoUrl !== "pending-upload" && (
-                <View className="bg-background rounded-lg p-3 mb-3 border border-border">
-                  <Text className="text-muted text-xs">📹 Video evidence attached</Text>
-                </View>
+                <TouchableOpacity className="bg-background rounded-lg p-3 mb-3 border border-primary" onPress={() => Linking.openURL(item.videoUrl!)}><Text className="text-primary font-bold">▶ Play video evidence</Text></TouchableOpacity>
               )}
 
               {/* Action Buttons */}

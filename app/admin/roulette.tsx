@@ -101,7 +101,7 @@ export default function AdminRouletteScreen() {
         <View className="bg-surface rounded-xl p-4 mb-4 border border-border">
           <Text className="text-foreground font-bold text-sm mb-1">How Roulette Works</Text>
           <Text className="text-muted text-xs leading-relaxed">
-            Players spend 75 points to spin the wheel. Each outcome has a weight that determines its probability. Higher weight = more likely to land. Configure prizes, penalties, and custom effects below.
+            Players spend 50 points to spin directly from the Shop banner. Roulette is not purchased or stored in inventory. Each outcome's weight determines its probability. Configure prizes, penalties, and custom effects below.
           </Text>
           {totalWeight > 0 && (
             <View className="mt-2 bg-background rounded-lg p-2">

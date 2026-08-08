@@ -143,6 +143,7 @@ export default function AdminDashboard() {
                 { title: "Achievements", icon: "🏅", route: "/admin/achievements" },
                 { title: "Target Assignment", icon: "🎯", route: "/admin/targets" },
                 { title: "Create New Game", icon: "➕", route: "/admin/create-game" },
+                { title: "Delete This Game", icon: "🗑️", route: "/admin/delete-game" },
               ].map((item) => (
                 <TouchableOpacity
                   key={item.route}

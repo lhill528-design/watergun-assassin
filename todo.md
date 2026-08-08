@@ -94,3 +94,14 @@
 - [x] Bump the Android release version and version code so the current client build is unmistakably newer than the stale 1.0.5 package.
 - [x] Add persisted self-service display names with schema migration, Profile editing, and display-name-first labels across player-facing game surfaces.
 - [x] Add display-name-aware search fields to Admin Players and Target Assignment lists.
+- [x] Synchronize GitHub commit d6fe0c7, reconcile the live schema including purgeEliminationPoints, and validate the release source.
+- [ ] Publish the verified d6fe0c7 release through the project UI to deploy the backend and generate the Android APK.
+- [x] Repair the remote Safari OAuth callback and post-login redirect so a published app uses its own HTTPS origin rather than localhost.
+- [x] Merge every included path from `Watergun-complete-update-v2-for-Manus.zip` at its matching project-relative location without deleting unrelated files.
+- [x] Reconcile the already-applied `0009_powerup_rules_and_game_lifecycle.sql` migration and apply `0010_roulette_banner_only.sql` exactly once through the live Drizzle migration process.
+- [x] Validate the complete ZIP update with the locked dependency installation, type check, and automated tests before any publish decision.
+- [ ] Run the focused in-app staging checklist in a test game, including a 50-point Roulette banner spin and a power-up prize result, before publishing.
+- [x] Merge only the two paths in `Watergun-target-name-followup-for-Manus.zip` so the player home screen displays the assigned target’s name instead of numeric ID, without database changes.
+- [x] Validate the target-name follow-up with `pnpm check` and the five existing power-up rule tests while preserving the V2 update.
+- [ ] Diagnose why the standard publish action requests an Expo token and identify the correct path for Safari-accessible web deployment.
+- [ ] Verify the complete V2 and target-name follow-up state, validate it, and push all safe project changes—including migrations 0009 and 0010—to the current connected GitHub branch.

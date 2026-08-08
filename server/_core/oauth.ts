@@ -9,6 +9,23 @@ function getQueryParam(req: Request, key: string): string | undefined {
   return typeof value === "string" ? value : undefined;
 }
 
+function getRequestOrigin(req: Request): string | undefined {
+  const forwardedHost = req.headers["x-forwarded-host"];
+  const hostValue = Array.isArray(forwardedHost)
+    ? forwardedHost[0]
+    : forwardedHost ?? req.headers.host;
+  const host = hostValue?.split(",")[0]?.trim();
+  if (!host) return undefined;
+
+  const forwardedProto = req.headers["x-forwarded-proto"];
+  const protocolValue = Array.isArray(forwardedProto)
+    ? forwardedProto[0]
+    : forwardedProto;
+  const protocol = protocolValue?.split(",")[0]?.trim() || req.protocol || "https";
+
+  return `${protocol}://${host}`;
+}
+
 async function syncUser(userInfo: {
   openId?: string | null;
   name?: string | null;
@@ -86,11 +103,16 @@ export function registerOAuthRoutes(app: Express) {
       const cookieOptions = getSessionCookieOptions(req);
       res.cookie(COOKIE_NAME, sessionToken, { ...cookieOptions, maxAge: ONE_YEAR_MS });
 
-      // Redirect to the frontend URL (Expo web on port 8081)
-      // Cookie is set with parent domain so it works across both 3000 and 8081 subdomains
+      // A published Manus Space app serves both client and API on its own origin.
+      // Redirect there first so OAuth never returns an iPhone browser to localhost.
+      // The managed preview still uses its configured Expo URL as before.
+      const requestOrigin = getRequestOrigin(req);
+      const isPublishedSpace = requestOrigin?.includes(".manus.space");
       const frontendUrl =
+        (isPublishedSpace ? requestOrigin : undefined) ||
         process.env.EXPO_WEB_PREVIEW_URL ||
         process.env.EXPO_PACKAGER_PROXY_URL ||
+        requestOrigin ||
         "http://localhost:8081";
       res.redirect(302, frontendUrl);
     } catch (error) {

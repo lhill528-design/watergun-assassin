@@ -57,6 +57,10 @@ export default function ProfileScreen() {
   const activePowerUps = activePowerUpsQuery.data || [];
   const achievements = achievementsQuery.data || [];
 
+  useEffect(() => {
+    if (!myGamesQuery.isLoading && activeGameId && !myGames.some(game => game.id === activeGameId)) setActiveGameId(null);
+  }, [activeGameId, myGames, myGamesQuery.isLoading, setActiveGameId]);
+
   if (!isAuthenticated) {
     return (
       <ScreenContainer className="p-6">
@@ -150,10 +154,10 @@ export default function ProfileScreen() {
           <View className="bg-surface rounded-xl p-4 mb-4 border border-border">
             <Text className="text-sm font-bold text-foreground mb-3">⚡ Active Power-Ups</Text>
             {activePowerUps.map((pp) => (
-              <View key={pp.id} className="flex-row items-center justify-between py-2 border-b border-border">
-                <Text className="text-foreground text-sm">Power-Up #{pp.powerUpId}</Text>
+              <View key={pp.id} className={`flex-row items-center justify-between py-3 px-2 mb-2 rounded-lg border ${(pp.powerUp?.name === "Immunity Shield" || pp.powerUp?.name === "Untouchable") ? "border-primary bg-primary/10" : "border-border"}`}>
+                <View><Text className="text-foreground text-sm font-bold">{pp.powerUp?.emoji} {pp.powerUp?.name || `Power-Up #${pp.powerUpId}`}</Text>{(pp.powerUp?.name === "Immunity Shield" || pp.powerUp?.name === "Untouchable") && <Text className="text-primary text-xs font-bold mt-1">🛡️ ACTIVE PROTECTION — show this screen as proof</Text>}</View>
                 <Text className="text-muted text-xs">
-                  {pp.expiresAt ? `Expires: ${new Date(pp.expiresAt).toLocaleTimeString()}` : "Permanent"}
+                  {pp.pausedAt ? "Paused for Purge" : pp.expiresAt ? `Expires: ${new Date(pp.expiresAt).toLocaleString()}` : "Active until triggered"}
                 </Text>
               </View>
             ))}

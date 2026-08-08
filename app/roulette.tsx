@@ -10,6 +10,7 @@ import * as Haptics from "expo-haptics";
 
 export default function RouletteScreen() {
   const router = useRouter();
+  const utils = trpc.useUtils();
   const { activeGameId } = useGame();
   const { isAuthenticated } = useAuth();
   const [lastResult, setLastResult] = useState<{ outcome: { name: string; emoji: string; type: string; value: number | null; description: string | null }; message: string } | null>(null);
@@ -32,9 +33,7 @@ export default function RouletteScreen() {
   );
 
   const roulettePowerUp = (powerUpsQuery.data || []).find(p => p.name === "Roulette" && p.isEnabled);
-  const rouletteCost = roulettePowerUp
-    ? (roulettePowerUp.discount ? Math.floor(roulettePowerUp.cost * (1 - roulettePowerUp.discount / 100)) : roulettePowerUp.cost)
-    : null;
+  const rouletteCost = roulettePowerUp ? 50 : null;
   const player = playerQuery.data;
 
   const spinMutation = trpc.roulette.spin.useMutation({
@@ -43,6 +42,7 @@ export default function RouletteScreen() {
       setSpinning(false);
       playerQuery.refetch();
       powerUpsQuery.refetch();
+      utils.powerUp.inventory.invalidate({ gameId });
       if (Platform.OS !== "web") {
         Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
       }

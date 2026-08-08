@@ -27,6 +27,7 @@ export const games = mysqlTable("games", {
   safeObject: varchar("safeObject", { length: 255 }),
   targetAssignment: mysqlEnum("targetAssignment", ["auto", "manual"]).default("auto").notNull(),
   purgeActive: boolean("purgeActive").default(false),
+  purgeScheduledAt: timestamp("purgeScheduledAt"),
   purgeEndTime: timestamp("purgeEndTime"),
   roundEndTime: timestamp("roundEndTime"),
   endCondition: varchar("endCondition", { length: 255 }),
@@ -38,6 +39,9 @@ export const games = mysqlTable("games", {
   eliminationPoints: int("eliminationPoints").default(100), // points awarded per kill
   purgeEliminationPoints: int("purgeEliminationPoints"), // admin-set points per kill during a purge; null = use eliminationPoints
   locationPingInterval: int("locationPingInterval").default(15), // minutes between required pings
+  temporarySafeObject: varchar("temporarySafeObject", { length: 255 }),
+  temporarySafeObjectExpiresAt: timestamp("temporarySafeObjectExpiresAt"),
+  deletedAt: timestamp("deletedAt"),
   createdAt: timestamp("createdAt").defaultNow().notNull(),
   updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
 });
@@ -51,6 +55,7 @@ export const gamePlayers = mysqlTable("game_players", {
   points: int("points").default(0),
   pendingDiscountPercent: int("pendingDiscountPercent"), // one-time roulette coupon for the next power-up purchase
   reviveCredits: int("reviveCredits").default(0), // banked extra lives from Vampire, max 3
+  reservedPoints: int("reservedPoints").default(0), // points reserved by active Bodyguard protection
   kills: int("kills").default(0),
   deaths: int("deaths").default(0),
   targetId: int("targetId"),
@@ -75,6 +80,7 @@ export const bounties = mysqlTable("bounties", {
   amount: int("amount").notNull(), // points value
   isActive: boolean("isActive").default(true),
   claimedByPlayerId: int("claimedByPlayerId"),
+  expiresAt: timestamp("expiresAt"),
   createdAt: timestamp("createdAt").defaultNow().notNull(),
 });
 
@@ -116,6 +122,10 @@ export const playerPowerUps = mysqlTable("player_power_ups", {
   expiresAt: timestamp("expiresAt"),
   targetPlayerId: int("targetPlayerId"),
   activationData: json("activationData"),
+  activatedRound: int("activatedRound"),
+  pausedAt: timestamp("pausedAt"),
+  remainingDurationSeconds: int("remainingDurationSeconds"),
+  lockedForDuelId: int("lockedForDuelId"),
   usesRemaining: int("usesRemaining").default(1).notNull(),
 });
 
@@ -142,6 +152,8 @@ export const eliminations = mysqlTable("eliminations", {
   reviewedBy: int("reviewedBy"),
   round: int("round").default(1),
   pointsAwarded: int("pointsAwarded").default(0),
+  basePointsAtSubmission: int("basePointsAtSubmission"),
+  bountyPointsAtSubmission: int("bountyPointsAtSubmission").default(0),
   createdAt: timestamp("createdAt").defaultNow().notNull(),
   reviewedAt: timestamp("reviewedAt"),
 });
@@ -193,8 +205,17 @@ export const duels = mysqlTable("duels", {
   gameId: int("gameId").notNull(),
   challengerId: int("challengerId").notNull(), // gamePlayers.id
   opponentId: int("opponentId").notNull(), // gamePlayers.id
-  status: mysqlEnum("status", ["pending", "resolved"]).default("pending").notNull(),
+  status: mysqlEnum("status", ["awaiting_opponent_stake", "awaiting_result", "pending_review", "resolved", "rejected"]).default("awaiting_opponent_stake").notNull(),
   winnerId: int("winnerId"), // gamePlayers.id
+  proposedWinnerId: int("proposedWinnerId"),
+  challengerStakeId: int("challengerStakeId"),
+  opponentStakeId: int("opponentStakeId"),
+  stakeDeadline: timestamp("stakeDeadline"),
+  evidenceUrl: text("evidenceUrl"),
+  witnessName: varchar("witnessName", { length: 255 }),
+  submissionNotes: text("submissionNotes"),
+  submittedAt: timestamp("submittedAt"),
+  reviewedBy: int("reviewedBy"),
   createdAt: timestamp("createdAt").defaultNow().notNull(),
   resolvedAt: timestamp("resolvedAt"),
 });

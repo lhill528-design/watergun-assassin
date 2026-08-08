@@ -1,6 +1,6 @@
-import { eq, and, desc, asc, sql } from "drizzle-orm";
+import { eq, and, desc, asc, sql, isNull } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/mysql2";
-import { InsertUser, users, games, gamePlayers, powerUps, eliminations, achievements, playerAchievements, playerPowerUps, powerUpUsageFees, gameRules, killFeed, mapPowerUps, mapPowerUpGuesses, teams, bounties, notifications, rouletteOutcomes, duels } from "../drizzle/schema";
+import { InsertUser, users, games, gamePlayers, powerUps, eliminations, achievements, playerAchievements, playerPowerUps, powerUpUsageFees, gameRules, killFeed, mapPowerUps, mapPowerUpGuesses, teams, bounties, notifications, rouletteOutcomes, duels, chatMessages } from "../drizzle/schema";
 import { ENV } from "./_core/env";
 
 const SUPER_ADMIN_EMAILS = ["lhill528@gmail.com", "lhill29@comcast.net"];
@@ -108,13 +108,43 @@ export async function getUserGames(userId: number) {
   if (playerGames.length === 0) return [];
   const gameIds = playerGames.map(p => p.gameId);
   const allGames = await db.select().from(games);
-  return allGames.filter(g => gameIds.includes(g.id));
+  return allGames.filter(g => gameIds.includes(g.id) && g.status !== "completed" && !g.deletedAt);
 }
 
 export async function getAdminGames(adminId: number) {
   const db = await getDb();
   if (!db) return [];
-  return db.select().from(games).where(eq(games.adminId, adminId));
+  return db.select().from(games).where(and(eq(games.adminId, adminId), isNull(games.deletedAt)));
+}
+
+export async function deleteGamePermanently(gameId: number) {
+  const database = await getDb();
+  if (!database) throw new Error("Database not available");
+  const players = await database.select({ id: gamePlayers.id }).from(gamePlayers).where(eq(gamePlayers.gameId, gameId));
+  const playerIds = players.map(player => player.id);
+  const inventory = await database.select({ id: playerPowerUps.id }).from(playerPowerUps).where(eq(playerPowerUps.gameId, gameId));
+  const inventoryIds = inventory.map(item => item.id);
+  const placed = await database.select({ id: mapPowerUps.id }).from(mapPowerUps).where(eq(mapPowerUps.gameId, gameId));
+  const mapIds = placed.map(item => item.id);
+  for (const mapId of mapIds) await database.delete(mapPowerUpGuesses).where(eq(mapPowerUpGuesses.mapPowerUpId, mapId));
+  for (const inventoryId of inventoryIds) await database.delete(powerUpUsageFees).where(eq(powerUpUsageFees.playerPowerUpId, inventoryId));
+  for (const playerId of playerIds) await database.delete(playerAchievements).where(eq(playerAchievements.gamePlayerId, playerId));
+  await database.delete(playerPowerUps).where(eq(playerPowerUps.gameId, gameId));
+  await database.delete(powerUpUsageFees).where(eq(powerUpUsageFees.gameId, gameId));
+  await database.delete(eliminations).where(eq(eliminations.gameId, gameId));
+  await database.delete(bounties).where(eq(bounties.gameId, gameId));
+  await database.delete(duels).where(eq(duels.gameId, gameId));
+  await database.delete(mapPowerUps).where(eq(mapPowerUps.gameId, gameId));
+  await database.delete(killFeed).where(eq(killFeed.gameId, gameId));
+  await database.delete(chatMessages).where(eq(chatMessages.gameId, gameId));
+  await database.delete(notifications).where(eq(notifications.gameId, gameId));
+  await database.delete(rouletteOutcomes).where(eq(rouletteOutcomes.gameId, gameId));
+  await database.delete(gameRules).where(eq(gameRules.gameId, gameId));
+  await database.delete(achievements).where(eq(achievements.gameId, gameId));
+  await database.delete(teams).where(eq(teams.gameId, gameId));
+  await database.delete(powerUps).where(eq(powerUps.gameId, gameId));
+  await database.delete(gamePlayers).where(eq(gamePlayers.gameId, gameId));
+  await database.delete(games).where(eq(games.id, gameId));
 }
 
 export async function updateGame(gameId: number, data: Partial<typeof games.$inferInsert>) {
@@ -165,6 +195,14 @@ export async function updatePlayer(playerId: number, data: Partial<typeof gamePl
   await db.update(gamePlayers).set(data).where(eq(gamePlayers.id, playerId));
 }
 
+export async function repairTargetChainAfterRevive(gameId: number, revivedPlayerId: number) {
+  const revived = await getPlayerById(revivedPlayerId);
+  if (!revived?.targetId) return;
+  const players = await getGamePlayers(gameId);
+  const currentHunter = players.find(player => player.id !== revivedPlayerId && player.targetId === revived.targetId && player.status === "alive");
+  if (currentHunter) await updatePlayer(currentHunter.id, { targetId: revivedPlayerId });
+}
+
 export async function getLeaderboard(gameId: number) {
   const db = await getDb();
   if (!db) return [];
@@ -180,7 +218,7 @@ export async function getLeaderboard(gameId: number) {
 export async function createBounty(data: typeof bounties.$inferInsert) {
   const db = await getDb();
   if (!db) throw new Error("Database not available");
-  const result = await db.insert(bounties).values(data);
+  const result = await db.insert(bounties).values({ ...data, expiresAt: data.expiresAt || new Date(Date.now() + 6 * 60 * 60 * 1000) });
   // Update player bounty totals
   const allBounties = await db.select().from(bounties).where(and(eq(bounties.targetPlayerId, data.targetPlayerId), eq(bounties.isActive, true)));
   const totalPoints = allBounties.reduce((sum, b) => sum + b.amount, 0);
@@ -191,12 +229,38 @@ export async function createBounty(data: typeof bounties.$inferInsert) {
 export async function getGameBounties(gameId: number) {
   const db = await getDb();
   if (!db) return [];
+  await expireBounties(gameId);
   return db.select().from(bounties).where(and(eq(bounties.gameId, gameId), eq(bounties.isActive, true)));
+}
+
+export async function expireBounties(gameId: number) {
+  const database = await getDb();
+  if (!database) return;
+  const active = await database.select().from(bounties).where(and(eq(bounties.gameId, gameId), eq(bounties.isActive, true)));
+  const affected = new Set<number>();
+  for (const bounty of active) {
+    if (bounty.expiresAt && bounty.expiresAt.getTime() <= Date.now()) {
+      await database.update(bounties).set({ isActive: false }).where(eq(bounties.id, bounty.id));
+      affected.add(bounty.targetPlayerId);
+    }
+  }
+  for (const playerId of affected) await refreshPlayerBountyTotals(playerId);
+}
+
+export async function refreshPlayerBountyTotals(playerId: number) {
+  const database = await getDb();
+  if (!database) return;
+  const active = await database.select().from(bounties).where(and(eq(bounties.targetPlayerId, playerId), eq(bounties.isActive, true)));
+  await database.update(gamePlayers).set({
+    bountyPoints: active.reduce((sum, bounty) => sum + bounty.amount, 0),
+    bountyCount: active.length,
+  }).where(eq(gamePlayers.id, playerId));
 }
 
 export async function getBountyBoard(gameId: number) {
   const db = await getDb();
   if (!db) return [];
+  await expireBounties(gameId);
   const players = await db.select().from(gamePlayers).where(eq(gamePlayers.gameId, gameId));
   const withBounties = players.filter(p => (p.bountyPoints || 0) > 0);
   const userIds = withBounties.map(p => p.userId);
@@ -289,7 +353,7 @@ export async function getPlayerPowerUpById(id: number) {
 
 export async function activatePlayerPowerUp(
   id: number,
-  data: { expiresAt: Date | null; targetPlayerId?: number | null; activationData?: Record<string, unknown> | null }
+  data: { expiresAt: Date | null; targetPlayerId?: number | null; activationData?: Record<string, unknown> | null; activatedRound?: number | null }
 ) {
   const db = await getDb();
   if (!db) throw new Error("Database not available");
@@ -300,6 +364,7 @@ export async function activatePlayerPowerUp(
     expiresAt: data.expiresAt,
     targetPlayerId: data.targetPlayerId ?? null,
     activationData: data.activationData ?? null,
+    activatedRound: data.activatedRound ?? null,
   }).where(eq(playerPowerUps.id, id));
 }
 
@@ -323,16 +388,43 @@ export async function expirePlayerPowerUps(gameId: number) {
   if (!active.length) return;
   const catalog = await db.select().from(powerUps).where(eq(powerUps.gameId, gameId));
   const catalogById = Object.fromEntries(catalog.map(powerUp => [powerUp.id, powerUp]));
+  const game = await getGame(gameId);
   for (const item of active) {
-    if (item.expiresAt && item.expiresAt <= now) {
+    const name = catalogById[item.powerUpId]?.name;
+    const roundExpired = name === "Vendetta" && item.activatedRound != null && item.activatedRound !== game?.currentRound;
+    if ((item.expiresAt && item.expiresAt <= now) || roundExpired) {
       await db.update(playerPowerUps).set({ status: "expired", isActive: false }).where(eq(playerPowerUps.id, item.id));
-      if (catalogById[item.powerUpId]?.name === "Witness Protection") {
+      if (name === "Witness Protection") {
         const holder = await getPlayerById(item.gamePlayerId);
         if (holder && holder.status === "safe") {
           await db.update(gamePlayers).set({ status: "alive" }).where(eq(gamePlayers.id, holder.id));
         }
       }
+      if (name === "Bodyguard") {
+        const holder = await getPlayerById(item.gamePlayerId);
+        if (holder) await db.update(gamePlayers).set({ reservedPoints: Math.max(0, (holder.reservedPoints || 0) - 150) }).where(eq(gamePlayers.id, holder.id));
+      }
+      if (name === "Blackout") {
+        const remainingBlackouts = await getActiveGamePowerUpsByName(gameId, "Blackout");
+        if (!remainingBlackouts.length) {
+          const players = await getGamePlayers(gameId);
+          for (const player of players) await createNotification({ userId: player.userId, gameId, type: "power_up_used", title: "Blackout Ended", body: "Player locations are visible again under the normal map rules." });
+          await createKillFeedEvent({ gameId, eventType: "power_up_used", message: "Blackout has ended." });
+          const { sendPushToUsers } = await import("./push-service");
+          await sendPushToUsers(players.map(player => player.userId), { title: "Blackout Ended", body: "Normal map visibility has resumed.", data: { type: "blackout_end", gameId } });
+        }
+      }
+      if (name === "Monkey Wrench") {
+        const players = await getGamePlayers(gameId);
+        await db.update(games).set({ temporarySafeObject: null, temporarySafeObjectExpiresAt: null }).where(eq(games.id, gameId));
+        for (const player of players) await createNotification({ userId: player.userId, gameId, type: "power_up_used", title: "Safe Object Restored", body: `The official safe object is “${game?.safeObject || "not set"}”.` });
+        const { sendPushToUsers } = await import("./push-service");
+        await sendPushToUsers(players.map(player => player.userId), { title: "Safe Object Restored", body: `Use “${game?.safeObject || "the admin's official object"}”.`, data: { type: "monkey_wrench_end", gameId } });
+      }
     }
+  }
+  if (game?.temporarySafeObjectExpiresAt && game.temporarySafeObjectExpiresAt <= now) {
+    await db.update(games).set({ temporarySafeObject: null, temporarySafeObjectExpiresAt: null }).where(eq(games.id, gameId));
   }
 }
 
@@ -340,6 +432,50 @@ export async function updatePlayerPowerUpActivationData(id: number, activationDa
   const db = await getDb();
   if (!db) throw new Error("Database not available");
   await db.update(playerPowerUps).set({ activationData }).where(eq(playerPowerUps.id, id));
+}
+
+export async function approveSanctuaryPowerUp(id: number, activationData: Record<string, unknown>) {
+  const database = await getDb();
+  if (!database) throw new Error("Database not available");
+  await database.update(playerPowerUps).set({ activationData, isActive: true, status: "active", activatedAt: new Date(), expiresAt: new Date(Date.now() + 6 * 60 * 60 * 1000) }).where(eq(playerPowerUps.id, id));
+}
+
+export async function returnPowerUpToInventory(id: number) {
+  const database = await getDb();
+  if (!database) throw new Error("Database not available");
+  await database.update(playerPowerUps).set({ status: "inventory", isActive: false, activatedAt: null, expiresAt: null, targetPlayerId: null, activationData: null, activatedRound: null }).where(eq(playerPowerUps.id, id));
+}
+
+export async function pausePurgeSensitivePowerUps(gameId: number) {
+  const database = await getDb();
+  if (!database) return;
+  const inventory = await database.select().from(playerPowerUps).where(and(eq(playerPowerUps.gameId, gameId), eq(playerPowerUps.isActive, true)));
+  const catalog = await database.select().from(powerUps).where(eq(powerUps.gameId, gameId));
+  const names = Object.fromEntries(catalog.map(powerUp => [powerUp.id, powerUp.name]));
+  for (const item of inventory) {
+    if (!["Untouchable", "Bodyguard"].includes(names[item.powerUpId]) || !item.expiresAt) continue;
+    await database.update(playerPowerUps).set({
+      isActive: false,
+      pausedAt: new Date(),
+      remainingDurationSeconds: Math.max(1, Math.ceil((item.expiresAt.getTime() - Date.now()) / 1000)),
+      expiresAt: null,
+    }).where(eq(playerPowerUps.id, item.id));
+  }
+}
+
+export async function resumePurgeSensitivePowerUps(gameId: number) {
+  const database = await getDb();
+  if (!database) return;
+  const inventory = await database.select().from(playerPowerUps).where(eq(playerPowerUps.gameId, gameId));
+  for (const item of inventory) {
+    if (item.status !== "active" || !item.pausedAt || !item.remainingDurationSeconds) continue;
+    await database.update(playerPowerUps).set({
+      isActive: true,
+      pausedAt: null,
+      expiresAt: new Date(Date.now() + item.remainingDurationSeconds * 1000),
+      remainingDurationSeconds: null,
+    }).where(eq(playerPowerUps.id, item.id));
+  }
 }
 
 export async function getPendingSanctuaryZones(gameId: number) {
@@ -383,12 +519,40 @@ export async function getActiveGamePowerUpsByName(gameId: number, name: string) 
     .map(item => ({ ...item, powerUp: catalogById[item.powerUpId] }));
 }
 
-export async function deactivateAllPlayerPowerUps(gamePlayerId: number) {
+export async function getGamePowerUpActivationsByName(gameId: number, name: string) {
+  const database = await getDb();
+  if (!database) return [];
+  const inventory = await database.select().from(playerPowerUps).where(eq(playerPowerUps.gameId, gameId));
+  const catalog = await database.select().from(powerUps).where(and(eq(powerUps.gameId, gameId), eq(powerUps.name, name)));
+  const ids = new Set(catalog.map(powerUp => powerUp.id));
+  return inventory.filter(item => ids.has(item.powerUpId) && item.activatedAt);
+}
+
+export async function getPowerUpEligibleAt(gamePlayerId: number, name: string, at: Date) {
+  const inventory = await getPlayerPowerUps(gamePlayerId);
+  return inventory.find(item => item.powerUp?.name === name
+    && item.activatedAt && item.activatedAt <= at
+    && (!item.expiresAt || item.expiresAt >= at)
+    && item.status !== "consumed");
+}
+
+export async function deactivateAllPlayerPowerUps(gamePlayerId: number, excludedNames: string[] = []) {
   const db = await getDb();
   if (!db) throw new Error("Database not available");
-  const active = await db.select().from(playerPowerUps).where(and(eq(playerPowerUps.gamePlayerId, gamePlayerId), eq(playerPowerUps.isActive, true)));
-  for (const item of active) await consumePlayerPowerUp(item.id);
-  return active.length;
+  const active = await getPlayerPowerUps(gamePlayerId);
+  const eligible = active.filter(item => item.isActive && item.status === "active" && !excludedNames.includes(item.powerUp?.name || ""));
+  for (const item of eligible) {
+    if (item.powerUp?.name === "Bodyguard") {
+      const holder = await getPlayerById(item.gamePlayerId);
+      if (holder) await updatePlayer(holder.id, { reservedPoints: Math.max(0, (holder.reservedPoints || 0) - 150) });
+    }
+    await consumePlayerPowerUp(item.id);
+  }
+  const holder = await getPlayerById(gamePlayerId);
+  if (holder?.status === "safe" && eligible.some(item => item.powerUp?.name === "Witness Protection")) {
+    await updatePlayer(gamePlayerId, { status: "alive" });
+  }
+  return eligible.length;
 }
 
 export async function transferPlayerPowerUp(id: number, toGamePlayerId: number) {
@@ -448,13 +612,9 @@ export async function clearPlayerBounties(gameId: number, targetPlayerId: number
 export async function doublePlayerBounties(gameId: number, targetPlayerId: number, placedByPlayerId: number) {
   const db = await getDb();
   if (!db) throw new Error("Database not available");
+  await expireBounties(gameId);
   const active = await db.select().from(bounties).where(and(eq(bounties.gameId, gameId), eq(bounties.targetPlayerId, targetPlayerId), eq(bounties.isActive, true)));
-  if (!active.length) {
-    const game = await getGame(gameId);
-    const amount = (game?.eliminationPoints || 100) * 2;
-    await createBounty({ gameId, targetPlayerId, placedByPlayerId, amount });
-    return amount;
-  }
+  if (!active.length) throw new Error("The selected player has no active bounty to raise");
   for (const bounty of active) await db.update(bounties).set({ amount: bounty.amount * 2 }).where(eq(bounties.id, bounty.id));
   const total = active.reduce((sum, bounty) => sum + bounty.amount * 2, 0);
   await db.update(gamePlayers).set({ bountyPoints: total, bountyCount: active.length }).where(eq(gamePlayers.id, targetPlayerId));
@@ -464,6 +624,7 @@ export async function doublePlayerBounties(gameId: number, targetPlayerId: numbe
 export async function transferPlayerBounties(gameId: number, fromPlayerId: number, toPlayerId: number) {
   const db = await getDb();
   if (!db) throw new Error("Database not available");
+  await expireBounties(gameId);
   const active = await db.select().from(bounties).where(and(eq(bounties.gameId, gameId), eq(bounties.targetPlayerId, fromPlayerId), eq(bounties.isActive, true)));
   if (!active.length) throw new Error("You do not have an active bounty to transfer");
   for (const bounty of active) await db.update(bounties).set({ targetPlayerId: toPlayerId }).where(eq(bounties.id, bounty.id));
@@ -485,7 +646,14 @@ export async function createElimination(data: typeof eliminations.$inferInsert) 
 export async function getPendingEliminations(gameId: number) {
   const db = await getDb();
   if (!db) return [];
-  return db.select().from(eliminations).where(and(eq(eliminations.gameId, gameId), eq(eliminations.status, "pending")));
+  const pending = await db.select().from(eliminations).where(and(eq(eliminations.gameId, gameId), eq(eliminations.status, "pending")));
+  const players = await getGamePlayers(gameId);
+  const playerMap = Object.fromEntries(players.map(player => [player.id, player]));
+  return Promise.all(pending.map(async elimination => {
+    const defenderInventory = await getPlayerPowerUps(elimination.eliminatedId);
+    const protection = defenderInventory.find(item => item.status === "active" && item.isActive && ["Immunity Shield", "Untouchable", "Witness Protection"].includes(item.powerUp?.name || ""));
+    return { ...elimination, eliminator: playerMap[elimination.eliminatorId], eliminated: playerMap[elimination.eliminatedId], activeProtection: protection?.powerUp?.name || null, protectionExpiresAt: protection?.expiresAt || null };
+  }));
 }
 
 export async function updateElimination(id: number, data: Partial<typeof eliminations.$inferInsert>) {
@@ -606,6 +774,12 @@ export async function getMapPowerUps(gameId: number) {
   return db.select().from(mapPowerUps).where(eq(mapPowerUps.gameId, gameId));
 }
 
+export async function getMapPowerUpDiscoveries(gamePlayerId: number) {
+  const database = await getDb();
+  if (!database) return [];
+  return database.select().from(mapPowerUpGuesses).where(and(eq(mapPowerUpGuesses.gamePlayerId, gamePlayerId), eq(mapPowerUpGuesses.isCorrect, true)));
+}
+
 export async function claimMapPowerUp(id: number, playerId: number) {
   const db = await getDb();
   if (!db) throw new Error("Database not available");
@@ -619,17 +793,45 @@ export async function claimMapPowerUp(id: number, playerId: number) {
 
 // ===== DUEL QUERIES (Sniper's Duel) =====
 
-export async function createDuel(data: { gameId: number; challengerId: number; opponentId: number }) {
+export async function createDuel(data: { gameId: number; challengerId: number; opponentId: number; challengerStakeId: number; stakeDeadline: Date }) {
   const db = await getDb();
   if (!db) throw new Error("Database not available");
   const result = await db.insert(duels).values(data);
+  await db.update(playerPowerUps).set({ lockedForDuelId: result[0].insertId }).where(eq(playerPowerUps.id, data.challengerStakeId));
   return result[0].insertId;
+}
+
+export async function getDuel(duelId: number) {
+  const database = await getDb();
+  if (!database) return undefined;
+  return (await database.select().from(duels).where(eq(duels.id, duelId)).limit(1))[0];
+}
+
+export async function getPlayerDuels(gameId: number, playerId: number) {
+  const database = await getDb();
+  if (!database) return [];
+  const all = await database.select().from(duels).where(eq(duels.gameId, gameId));
+  return all.filter(duel => duel.challengerId === playerId || duel.opponentId === playerId);
+}
+
+export async function setDuelOpponentStake(duelId: number, opponentStakeId: number) {
+  const database = await getDb();
+  if (!database) throw new Error("Database not available");
+  await database.update(duels).set({ opponentStakeId, status: "awaiting_result" }).where(eq(duels.id, duelId));
+  await database.update(playerPowerUps).set({ lockedForDuelId: duelId }).where(eq(playerPowerUps.id, opponentStakeId));
+}
+
+export async function submitDuelResult(duelId: number, proposedWinnerId: number, evidenceUrl?: string, witnessName?: string, submissionNotes?: string) {
+  const database = await getDb();
+  if (!database) throw new Error("Database not available");
+  await database.update(duels).set({ proposedWinnerId, evidenceUrl, witnessName, submissionNotes, submittedAt: new Date(), status: "pending_review" }).where(eq(duels.id, duelId));
 }
 
 export async function getPendingDuels(gameId: number) {
   const db = await getDb();
   if (!db) return [];
-  const pending = await db.select().from(duels).where(and(eq(duels.gameId, gameId), eq(duels.status, "pending")));
+  const all = await db.select().from(duels).where(eq(duels.gameId, gameId));
+  const pending = all.filter(duel => duel.status === "pending_review");
   const players = await getGamePlayers(gameId);
   const playerMap = Object.fromEntries(players.map(p => [p.id, p]));
   return pending.map(duel => ({
@@ -639,27 +841,29 @@ export async function getPendingDuels(gameId: number) {
   }));
 }
 
-export async function resolveDuel(duelId: number, winnerId: number) {
+export async function resolveDuel(duelId: number, approved: boolean, reviewedBy: number) {
   const db = await getDb();
   if (!db) throw new Error("Database not available");
   const rows = await db.select().from(duels).where(eq(duels.id, duelId)).limit(1);
   const duel = rows[0];
   if (!duel) throw new Error("Duel not found");
-  if (duel.status !== "pending") throw new Error("This duel has already been resolved");
-  if (winnerId !== duel.challengerId && winnerId !== duel.opponentId) {
-    throw new Error("Winner must be one of the two duelists");
-  }
+  if (duel.status !== "pending_review" || !duel.proposedWinnerId) throw new Error("This duel is not awaiting review");
+  const winnerId = duel.proposedWinnerId;
   const loserId = winnerId === duel.challengerId ? duel.opponentId : duel.challengerId;
-  await db.update(duels).set({ status: "resolved", winnerId, resolvedAt: new Date() }).where(eq(duels.id, duelId));
-  const winner = await getPlayerById(winnerId);
-  if (winner) await updatePlayer(winnerId, { points: (winner.points || 0) + 100 });
-  // Steal one power-up from the loser's inventory, if they have any
-  const loserInventory = await db.select().from(playerPowerUps).where(and(eq(playerPowerUps.gamePlayerId, loserId), eq(playerPowerUps.status, "inventory")));
-  if (loserInventory.length > 0) {
-    const stolen = loserInventory[Math.floor(Math.random() * loserInventory.length)];
-    await transferPlayerPowerUp(stolen.id, winnerId);
+  if (!approved) {
+    await db.update(duels).set({ status: "rejected", reviewedBy, resolvedAt: new Date() }).where(eq(duels.id, duelId));
+    if (duel.challengerStakeId) await db.update(playerPowerUps).set({ lockedForDuelId: null }).where(eq(playerPowerUps.id, duel.challengerStakeId));
+    if (duel.opponentStakeId) await db.update(playerPowerUps).set({ lockedForDuelId: null }).where(eq(playerPowerUps.id, duel.opponentStakeId));
+    return { winnerId, loserId, stoleItem: false, approved: false };
   }
-  return { winnerId, loserId, stoleItem: loserInventory.length > 0 };
+  await db.update(duels).set({ status: "resolved", winnerId, reviewedBy, resolvedAt: new Date() }).where(eq(duels.id, duelId));
+  const winner = await getPlayerById(winnerId);
+  if (winner) await updatePlayer(winnerId, { points: (winner.points || 0) + 350 });
+  const loserStakeId = loserId === duel.challengerId ? duel.challengerStakeId : duel.opponentStakeId;
+  const winnerStakeId = winnerId === duel.challengerId ? duel.challengerStakeId : duel.opponentStakeId;
+  if (loserStakeId) await db.update(playerPowerUps).set({ gamePlayerId: winnerId, lockedForDuelId: null }).where(eq(playerPowerUps.id, loserStakeId));
+  if (winnerStakeId) await db.update(playerPowerUps).set({ lockedForDuelId: null }).where(eq(playerPowerUps.id, winnerStakeId));
+  return { winnerId, loserId, stoleItem: Boolean(loserStakeId), approved: true };
 }
 
 // ===== TEAM QUERIES =====
@@ -889,7 +1093,7 @@ export async function getCompletedGames(userId: number) {
   if (allGameIds.length === 0) return [];
   // Fetch all those games and filter to completed
   const allGames = await db.select().from(games);
-  const completedGames = allGames.filter(g => allGameIds.includes(g.id) && g.status === "completed");
+  const completedGames = allGames.filter(g => allGameIds.includes(g.id) && g.status === "completed" && !g.deletedAt);
   // For each completed game, attach the user's player record (if any)
   const playerMap = Object.fromEntries(playerGames.map(p => [p.gameId, p]));
   return completedGames

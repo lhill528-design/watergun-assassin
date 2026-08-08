@@ -9,12 +9,14 @@ export default function RoundControlScreen() {
   const { activeGameId } = useGame();
   const router = useRouter();
   const [purgeDuration, setPurgeDuration] = useState("60");
+  const [purgeSchedule, setPurgeSchedule] = useState("");
 
   const gameQuery = trpc.game.get.useQuery({ gameId: activeGameId! }, { enabled: !!activeGameId });
   const startRound = trpc.game.startRound.useMutation({ onSuccess: () => { gameQuery.refetch(); Alert.alert("Round Started!"); } });
   const endRound = trpc.game.endRound.useMutation({ onSuccess: () => { gameQuery.refetch(); Alert.alert("Round Ended!"); } });
   const startPurge = trpc.game.startPurge.useMutation({ onSuccess: () => { gameQuery.refetch(); Alert.alert("Purge Activated!"); } });
   const endPurge = trpc.game.endPurge.useMutation({ onSuccess: () => { gameQuery.refetch(); Alert.alert("Purge Ended!"); } });
+  const schedulePurge = trpc.game.schedulePurge.useMutation({ onSuccess: () => { gameQuery.refetch(); Alert.alert("Purge Schedule Updated"); }, onError: error => Alert.alert("Could not schedule", error.message) });
   const endGame = trpc.game.endGame.useMutation({ onSuccess: () => { gameQuery.refetch(); Alert.alert("Game Over!"); } });
   const updateGame = trpc.game.update.useMutation({ onSuccess: () => gameQuery.refetch() });
 
@@ -82,6 +84,8 @@ export default function RoundControlScreen() {
         <View className="gap-3 mb-6">
           {!game?.purgeActive ? (
             <View>
+              <Text className="text-muted text-xs mb-2">Scheduled purge (ISO date/time, e.g. 2026-08-04T18:00:00-04:00)</Text>
+              <View className="flex-row gap-2 mb-4"><TextInput className="flex-1 bg-surface border border-border rounded-lg px-3 py-2 text-foreground" value={purgeSchedule} onChangeText={setPurgeSchedule} placeholder={game?.purgeScheduledAt ? new Date(game.purgeScheduledAt).toISOString() : "Future date/time"} placeholderTextColor="#777"/><TouchableOpacity className="bg-warning/20 border border-warning rounded-lg px-3 justify-center" onPress={() => schedulePurge.mutate({ gameId: activeGameId!, startsAt: purgeSchedule.trim() || null })}><Text className="text-warning font-bold">Save</Text></TouchableOpacity></View>
               <View className="flex-row items-center gap-3 mb-3">
                 <Text className="text-foreground text-sm">Duration (minutes):</Text>
                 <TextInput

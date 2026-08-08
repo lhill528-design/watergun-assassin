@@ -35,14 +35,18 @@ export function getApiBaseUrl(): string {
     return API_BASE_URL.replace(/\/$/, "");
   }
 
-  // On web, derive from current hostname by replacing port 8081 with 3000
+  // On the managed preview, derive the API origin by replacing port 8081 with 3000.
+  // A published site serves both the web client and API at the same origin, so use
+  // the current origin instead of producing a relative OAuth redirect URI.
   if (ReactNative.Platform.OS === "web" && typeof window !== "undefined" && window.location) {
-    const { protocol, hostname } = window.location;
+    const { protocol, hostname, origin } = window.location;
     // Pattern: 8081-sandboxid.region.domain -> 3000-sandboxid.region.domain
     const apiHostname = hostname.replace(/^8081-/, "3000-");
     if (apiHostname !== hostname) {
       return `${protocol}//${apiHostname}`;
     }
+
+    return origin;
   }
 
   // Fallback to empty (will use relative URL)

@@ -129,7 +129,7 @@ export default function HomeScreen() {
         {/* Safe Object */}
         <View className="bg-surface rounded-xl p-4 mb-4 border border-border">
           <Text className="text-xs text-muted uppercase tracking-wider mb-1">🛡️ Safe Object</Text>
-          <Text className="text-foreground text-xl font-bold">{player?.currentSafeObject || game?.safeObject || "Not Set"}</Text>
+          <Text className="text-foreground text-xl font-bold">{(game?.temporarySafeObjectExpiresAt && new Date(game.temporarySafeObjectExpiresAt).getTime() > Date.now() ? game.temporarySafeObject : null) || game?.safeObject || "Not Set"}</Text>
           <Text className="text-muted text-xs mt-1">Hold this to be immune from elimination</Text>
         </View>
 
@@ -138,7 +138,7 @@ export default function HomeScreen() {
           <Text className="text-xs text-primary uppercase tracking-wider mb-1">🎯 Your Target</Text>
           {player?.targetId ? (
             <View>
-              <Text className="text-foreground text-xl font-bold">Target #{player.targetId}</Text>
+              <Text className="text-foreground text-xl font-bold">{player.targetName || `Player #${player.targetId}`}</Text>
               <TouchableOpacity
                 className="bg-primary/20 px-4 py-2 rounded-lg mt-2 self-start"
                 onPress={() => router.push("/(tabs)/map" as any)}
@@ -214,6 +214,8 @@ export default function HomeScreen() {
             <Text className="text-success font-bold text-sm">Leaderboard</Text>
           </TouchableOpacity>
         </View>
+
+        <TouchableOpacity className="bg-surface rounded-xl p-4 mb-4 border border-warning flex-row items-center justify-between" onPress={() => router.push("/duels" as any)}><View className="flex-row items-center gap-3"><Text className="text-2xl">🎯</Text><Text className="text-foreground font-bold">Sniper's Duels</Text></View><Text className="text-warning">View / Respond →</Text></TouchableOpacity>
 
         {/* Notifications */}
         <TouchableOpacity

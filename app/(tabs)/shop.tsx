@@ -17,9 +17,9 @@ const CATEGORIES = [
 ];
 
 const TARGETED_POWER_UPS = new Set([
-  "Bounty", "Raise the Stakes", "Killswitch", "Recon", "Blacklist", "Asset Freeze", "Sabotage",
-  "Sniper's Duel", "Fall Guy", "Frame Job", "Strip Search", "Doppleganger", "Mirror, Mirror", "Bodyguard", "Pickpocket",
-  "Lifeline", "Care package", "Wildcard", "Vendetta", "Reassignment", "Boomerang",
+  "Bounty", "Raise the Stakes", "Blacklist", "Asset Freeze", "Sabotage",
+  "Sniper's Duel", "Fall Guy", "Frame Job", "Strip Search", "Doppelganger", "Mirror, Mirror", "Bodyguard", "Pickpocket",
+  "Lifeline", "Care Package", "Wildcard", "Vendetta", "Reassignment",
 ]);
 
 export default function ShopScreen() {
@@ -32,6 +32,8 @@ export default function ShopScreen() {
   const [selectedGifts, setSelectedGifts] = useState<Record<number, number>>({});
   const [safeObjects, setSafeObjects] = useState<Record<number, string>>({});
   const [sanctuaryAddresses, setSanctuaryAddresses] = useState<Record<number, string>>({});
+  const [decoyModes, setDecoyModes] = useState<Record<number, "automatic" | "manual">>({});
+  const [decoyAddresses, setDecoyAddresses] = useState<Record<number, string>>({});
   const [geocodingSanctuary, setGeocodingSanctuary] = useState<number | null>(null);
 
   const powerUpsQuery = trpc.powerUp.list.useQuery(
@@ -63,15 +65,11 @@ export default function ShopScreen() {
     onError: (err) => Alert.alert("Error", err.message),
   });
   const activateMutation = trpc.powerUp.activate.useMutation({
-    onSuccess: (result) => {
+    onSuccess: () => {
       inventoryQuery.refetch();
       playerQuery.refetch();
       playersQuery.refetch();
-      if (result.paymentRequired) {
-        Alert.alert("Payment required", `Ask the administrator to mark the $${((result.amountCents || 0) / 100).toFixed(2)} fee paid, then tap Activate again.`);
-      } else {
-        Alert.alert("Activated!", "The power-up is now in effect.");
-      }
+      Alert.alert("Activated!", "The power-up is now in effect. Any cash fee was added to the admin's collection queue.");
     },
     onError: (err) => Alert.alert("Unable to activate", err.message),
   });
@@ -87,8 +85,8 @@ export default function ShopScreen() {
   const eliminatedPlayers = (playersQuery.data || []).filter(p => p.id !== player?.id && p.status === "eliminated");
 
   const filteredPowerUps = selectedCategory === "all"
-    ? powerUps.filter(p => p.isEnabled)
-    : powerUps.filter(p => p.isEnabled && p.category === selectedCategory);
+    ? powerUps.filter(p => p.isEnabled && p.name !== "Roulette")
+    : powerUps.filter(p => p.isEnabled && p.name !== "Roulette" && p.category === selectedCategory);
 
   const handlePurchase = (powerUpId: number, name: string, cost: number) => {
     Alert.alert(
@@ -102,18 +100,18 @@ export default function ShopScreen() {
   };
 
   const handleActivate = async (item: any) => {
-    if (item.powerUp?.name === "Roulette") {
-      router.push("/roulette" as any);
-      return;
-    }
     const targetPlayerId = selectedTargets[item.id];
     if (TARGETED_POWER_UPS.has(item.powerUp?.name) && !targetPlayerId) {
       Alert.alert("Choose a target", "Select a player before activating this power-up.");
       return;
     }
     const giftInventoryId = selectedGifts[item.id];
-    if (item.powerUp?.name === "Care package" && !giftInventoryId) {
+    if (item.powerUp?.name === "Care Package" && !giftInventoryId) {
       Alert.alert("Choose a gift", "Select another unused inventory item to give away.");
+      return;
+    }
+    if (item.powerUp?.name === "Sniper's Duel" && !giftInventoryId) {
+      Alert.alert("Choose your stake", "Select an unused power-up to stake in the duel.");
       return;
     }
     const safeObject = safeObjects[item.id]?.trim();
@@ -141,10 +139,26 @@ export default function ShopScreen() {
         }
       }
     }
+    let decoyData: Record<string, unknown> | undefined;
+    if (item.powerUp?.name === "Decoy") {
+      const mode = decoyModes[item.id] || "automatic";
+      if (mode === "manual") {
+        const address = decoyAddresses[item.id]?.trim();
+        if (!address) { Alert.alert("Enter your location", "Manual Decoy needs the address where you will be."); return; }
+        try {
+          const results = await Location.geocodeAsync(address);
+          if (!results.length) { Alert.alert("Address not found", "Try a more specific address."); return; }
+          decoyData = { mode, address, anchorLatitude: results[0].latitude, anchorLongitude: results[0].longitude };
+        } catch { Alert.alert("Search failed", "Couldn't locate that address."); return; }
+      } else decoyData = { mode };
+    }
     const activationData = {
       ...(giftInventoryId ? { giftInventoryId } : {}),
       ...(safeObject ? { safeObject } : {}),
       ...(sanctuaryCoords || {}),
+      ...(item.powerUp?.name === "Sanctuary" && sanctuaryAddresses[item.id]?.trim() ? { address: sanctuaryAddresses[item.id].trim() } : {}),
+      ...(item.powerUp?.name === "Sniper's Duel" && giftInventoryId ? { challengerStakeId: giftInventoryId } : {}),
+      ...(decoyData || {}),
     };
     const activateLabel = item.powerUp?.name === "Sanctuary" ? "Send this Sanctuary to the admin for approval?" : `Activate ${item.powerUp?.name} now? Its timer begins immediately.`;
     Alert.alert("Activate Power-Up", activateLabel, [
@@ -166,9 +180,7 @@ export default function ShopScreen() {
   }
 
   const roulettePowerUp = powerUps.find(powerUp => powerUp.name === "Roulette" && powerUp.isEnabled);
-  const rouletteCost = roulettePowerUp
-    ? (roulettePowerUp.discount ? Math.floor(roulettePowerUp.cost * (1 - roulettePowerUp.discount / 100)) : roulettePowerUp.cost)
-    : null;
+  const rouletteCost = roulettePowerUp ? 50 : null;
   const pendingDiscountPercent = (player as any)?.pendingDiscountPercent as number | null | undefined;
 
   return (
@@ -218,7 +230,7 @@ export default function ShopScreen() {
             <Text className="text-foreground text-sm">Balance: {reconQuery.data.points} pts</Text>
             {reconQuery.data.activePowerUps.length > 0 ? (
               <Text className="text-muted text-xs mt-1">
-                Active: {reconQuery.data.activePowerUps.map(p => `${p.emoji} ${p.name}`).join(", ")}
+                Power-ups: {reconQuery.data.activePowerUps.map((p: any) => `${p.emoji} ${p.name} (${p.status})`).join(", ")}
               </Text>
             ) : (
               <Text className="text-muted text-xs mt-1">No active power-ups.</Text>
@@ -266,14 +278,14 @@ export default function ShopScreen() {
                           onPress={() => setSelectedTargets(current => ({ ...current, [item.id]: candidate.id }))}
                         >
                           <Text className={selectedTargets[item.id] === candidate.id ? "text-background font-bold" : "text-foreground"}>
-                            {candidate.user?.name || `Player ${candidate.id}`}
+                            {candidate.user?.displayName || candidate.user?.name || `Player ${candidate.id}`} {(candidate as any).protectionBadge ? `🛡️ ${(candidate as any).protectionBadge.label}` : ""}
                           </Text>
                         </TouchableOpacity>
                       ))}
                     </View>
                   </ScrollView>
                 )}
-                {item.powerUp?.name === "Care package" && item.status !== "active" && (
+                {item.powerUp?.name === "Care Package" && item.status !== "active" && (
                   <ScrollView horizontal showsHorizontalScrollIndicator={false} className="mt-3">
                     <View className="flex-row gap-2">
                       {inventory.filter((gift: any) => gift.id !== item.id && gift.status === "inventory").map((gift: any) => (
@@ -289,6 +301,12 @@ export default function ShopScreen() {
                       ))}
                     </View>
                   </ScrollView>
+                )}
+                {item.powerUp?.name === "Sniper's Duel" && item.status !== "active" && (
+                  <ScrollView horizontal showsHorizontalScrollIndicator={false} className="mt-3"><View className="flex-row gap-2">{inventory.filter((stake: any) => stake.id !== item.id && stake.status === "inventory" && !stake.lockedForDuelId).map((stake: any) => <TouchableOpacity key={stake.id} className={`px-3 py-2 rounded-lg ${selectedGifts[item.id] === stake.id ? "bg-primary" : "bg-background border border-border"}`} onPress={() => setSelectedGifts(current => ({ ...current, [item.id]: stake.id }))}><Text className={selectedGifts[item.id] === stake.id ? "text-background font-bold" : "text-foreground"}>Stake: {stake.powerUp?.name} ({stake.powerUp?.cost || 0})</Text></TouchableOpacity>)}</View></ScrollView>
+                )}
+                {item.powerUp?.name === "Decoy" && item.status !== "active" && (
+                  <View className="mt-3"><View className="flex-row gap-2 mb-2"><TouchableOpacity className={`px-3 py-2 rounded-lg ${(decoyModes[item.id] || "automatic") === "automatic" ? "bg-primary" : "bg-background border border-border"}`} onPress={() => setDecoyModes(current => ({ ...current, [item.id]: "automatic" }))}><Text className="text-foreground">Automatic (current GPS)</Text></TouchableOpacity><TouchableOpacity className={`px-3 py-2 rounded-lg ${decoyModes[item.id] === "manual" ? "bg-primary" : "bg-background border border-border"}`} onPress={() => setDecoyModes(current => ({ ...current, [item.id]: "manual" }))}><Text className="text-foreground">Manual address</Text></TouchableOpacity></View>{decoyModes[item.id] === "manual" && <TextInput className="bg-background border border-border rounded-lg px-3 py-2 text-foreground" placeholder="Address where you will be" placeholderTextColor="#8B8B9E" value={decoyAddresses[item.id] || ""} onChangeText={value => setDecoyAddresses(current => ({ ...current, [item.id]: value }))}/>}<Text className="text-muted text-xs mt-1">The displayed decoy is placed exactly five miles from the anchor.</Text></View>
                 )}
                 {item.powerUp?.name === "Monkey Wrench" && item.status !== "active" && (
                   <TextInput
@@ -345,7 +363,7 @@ export default function ShopScreen() {
               const discountedCost = pendingDiscountPercent != null
                 ? Math.floor(adminDiscountedCost * (1 - pendingDiscountPercent / 100))
                 : adminDiscountedCost;
-              const canAfford = (player?.points || 0) >= discountedCost;
+              const canAfford = (player?.points || 0) - ((player as any)?.reservedPoints || 0) >= discountedCost;
               const usageCount = usageCountByPowerUpId[pu.id] || 0;
               const maxUsesPerGame = pu.maxUsesPerGame;
               const hasReachedUsageLimit = maxUsesPerGame != null && usageCount >= maxUsesPerGame;

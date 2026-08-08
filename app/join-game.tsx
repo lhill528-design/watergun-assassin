@@ -10,7 +10,6 @@ export default function JoinGameScreen() {
   const { setActiveGameId } = useGame();
   const params = useLocalSearchParams<{ code?: string }>();
   const [joinCode, setJoinCode] = useState("");
-  const [safeObject, setSafeObject] = useState("");
 
   // Auto-fill join code from deep link params
   useEffect(() => {
@@ -34,7 +33,7 @@ export default function JoinGameScreen() {
       Alert.alert("Error", "Enter a join code");
       return;
     }
-    joinMutation.mutate({ joinCode: joinCode.trim().toUpperCase(), safeObject: safeObject.trim() || undefined });
+    joinMutation.mutate({ joinCode: joinCode.trim().toUpperCase() });
   };
 
   return (
@@ -70,17 +69,6 @@ export default function JoinGameScreen() {
             autoCapitalize="characters"
             returnKeyType="done"
           />
-
-          <Text className="text-muted text-xs uppercase tracking-wider mt-6 mb-2">Your Safe Object</Text>
-          <TextInput
-            className="bg-background border border-border rounded-xl px-4 py-3 text-foreground"
-            placeholder="e.g., Red water bottle, Keys, etc."
-            placeholderTextColor="#555"
-            value={safeObject}
-            onChangeText={setSafeObject}
-            returnKeyType="done"
-          />
-          <Text className="text-muted text-xs mt-2">Hold this object to be immune from elimination. Cannot be changed after game starts.</Text>
         </View>
 
         <TouchableOpacity

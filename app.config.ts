@@ -88,6 +88,14 @@ const config: ExpoConfig = {
   plugins: [
     "expo-router",
     [
+      "expo-image-picker",
+      {
+        photosPermission: "Allow Watergun Assassin to select elimination video evidence.",
+        cameraPermission: "Allow Watergun Assassin to record elimination video evidence.",
+        microphonePermission: "Allow Watergun Assassin to record audio with elimination videos.",
+      },
+    ],
+    [
       "expo-location",
       {
         locationAlwaysAndWhenInUsePermission: "Allow Watergun Assassin to use your location to track game positions.",

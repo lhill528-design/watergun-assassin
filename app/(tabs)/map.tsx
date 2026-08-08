@@ -83,7 +83,7 @@ export default function MapScreen() {
   );
   const mapPowerUpsQuery = trpc.mapPowerUp.list.useQuery(
     { gameId },
-    { enabled: gameId > 0 && isAuthenticated }
+    { enabled: gameId > 0 && isAuthenticated, refetchInterval: 15000, refetchOnWindowFocus: true }
   );
   const vendettaTargetQuery = trpc.player.vendettaTarget.useQuery(
     { gameId },
@@ -135,6 +135,7 @@ export default function MapScreen() {
   const submitGuessMutation = trpc.mapPowerUp.submitGuess.useMutation({
     onSuccess: (data) => {
       setGuessModal(g => ({ ...g, result: data }));
+      if (data.correct) mapPowerUpsQuery.refetch();
       if (data.correct && Platform.OS !== "web") {
         Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
       }
@@ -231,7 +232,7 @@ export default function MapScreen() {
     return 2 * R * Math.asin(Math.sqrt(h));
   };
 
-  const visibleUnclaimedPowerUps = mapPowerUps.filter(mp => mp.isVisible && !mp.claimedBy && mp.latitude && mp.longitude);
+  const visibleUnclaimedPowerUps = mapPowerUps.filter(mp => (mp.isVisible || (mp as any).discovered) && !mp.claimedBy && mp.latitude && mp.longitude);
   const safeZones = players
     .map(p => (p as any).sanctuaryZone as { latitude: string; longitude: string; radiusMeters: number; approved?: boolean } | null | undefined)
     .filter((zone): zone is { latitude: string; longitude: string; radiusMeters: number; approved?: boolean } => !!zone && zone.approved !== false)
@@ -306,10 +307,10 @@ export default function MapScreen() {
       }
     }
 
-    mapPowerUps.filter(mp => !mp.claimedBy && mp.isVisible && mp.latitude && mp.longitude).forEach(mp => {
+    mapPowerUps.filter(mp => !mp.claimedBy && (mp.isVisible || (mp as any).discovered) && mp.latitude && mp.longitude).forEach(mp => {
       pins.push({
         id: mp.id, label: "Power-Up",
-        latitude: parseFloat(mp.latitude), longitude: parseFloat(mp.longitude),
+        latitude: Number(mp.latitude), longitude: Number(mp.longitude),
         type: "powerup",
       });
     });
@@ -331,7 +332,7 @@ export default function MapScreen() {
 
   const pins = buildPins();
   const purgeActive = game?.purgeActive ?? false;
-  const hiddenPowerUps = mapPowerUps.filter(mp => !mp.claimedBy && !mp.isVisible);
+  const hiddenPowerUps = mapPowerUps.filter(mp => !mp.claimedBy && !mp.isVisible && !(mp as any).discovered);
 
   return (
     <ScreenContainer>
@@ -432,7 +433,7 @@ export default function MapScreen() {
             pins={pins}
             purgeActive={purgeActive}
             zones={safeZones}
-            onMapPress={guessModal.visible ? (coords) => {
+            onMapPress={guessModal.visible ? (coords: { latitude: number; longitude: number }) => {
               setGuessModal(g => ({ ...g, guessLat: coords.latitude.toFixed(6), guessLon: coords.longitude.toFixed(6) }));
               if (Platform.OS !== "web") Haptics.selectionAsync();
             } : undefined}
@@ -445,7 +446,7 @@ export default function MapScreen() {
         {/* Visible Power-Ups on the map */}
         {visibleUnclaimedPowerUps.length > 0 && (
           <View style={styles.cluesSection}>
-            <Text style={styles.cluesSectionTitle}>⚡ Power-Ups on the Map</Text>
+            <Text style={styles.cluesSectionTitle}>⚡ Power-Ups Ready to Collect</Text>
             {visibleUnclaimedPowerUps.map((mp) => {
               const dist = myLocation
                 ? distanceMeters(myLocation, { latitude: parseFloat(mp.latitude!), longitude: parseFloat(mp.longitude!) })
@@ -527,7 +528,7 @@ export default function MapScreen() {
                 onPress={() => checkLocationMutation.mutate({ gameId: activeGameId!, targetPlayerId: p.id })}
               >
                 <Text style={[styles.playerRowName, !canCheck && { opacity: 0.5 }]}>
-                  {isMyTarget ? "💀 " : ""}{resolvePlayerLabel(p)}
+                  {isMyTarget ? "💀 " : ""}{resolvePlayerLabel(p)} {(p as any).protectionBadge ? `🛡️ ${(p as any).protectionBadge.label}` : ""}
                 </Text>
                 <Text style={canCheck ? styles.playerRowCheck : styles.playerRowLocked}>
                   {canCheck ? "📍 Check Location" : "🔒 Not your target"}

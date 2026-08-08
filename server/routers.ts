@@ -6,6 +6,21 @@ import { publicProcedure, protectedProcedure, router } from "./_core/trpc";
 import * as db from "./db";
 import { storagePut } from "./storage";
 import { sendPushToUser, sendPushToUsers, registerPushToken } from "./push-service";
+import { MAP_CLAIM_METERS, MAP_DISCOVERY_METERS, ROULETTE_SPIN_COST, calculateKillAwards, derangedTargetPermutation, distanceMeters, isOpenSeasonSubmissionEligible, openSeasonWindow, pointFiveMilesAway, rouletteBalanceAfterOutcome } from "./power-up-rules";
+
+async function addProtectionBadges<T extends { id: number }>(players: T[]) {
+  return Promise.all(players.map(async player => {
+    const inventory = await db.getPlayerPowerUps(player.id);
+    const shield = inventory.find(item => item.powerUp?.name === "Immunity Shield" && item.status === "active" && item.isActive);
+    const untouchable = inventory.find(item => item.powerUp?.name === "Untouchable" && item.status === "active");
+    const protectionBadge = shield
+      ? { type: "immunity_shield" as const, label: "Shielded", expiresAt: shield.expiresAt, paused: false }
+      : untouchable
+        ? { type: "untouchable" as const, label: untouchable.isActive ? "Untouchable" : "Paused for Purge", expiresAt: untouchable.expiresAt, paused: !untouchable.isActive }
+        : null;
+    return { ...player, protectionBadge };
+  }));
+}
 
 export const appRouter = router({
   system: systemRouter,
@@ -88,8 +103,10 @@ export const appRouter = router({
         purgeEliminationPoints: z.number().nullable().optional(),
         locationPingInterval: z.number().optional(),
       }))
-      .mutation(async ({ input }) => {
+      .mutation(async ({ input, ctx }) => {
         const { gameId, purgeEndTime, roundEndTime, ...rest } = input;
+        const game = await db.getGame(gameId);
+        if (!game || (game.adminId !== ctx.user.id && !ctx.user.isSuperAdmin)) throw new Error("Admin access required");
         const updateData: any = { ...rest };
         if (purgeEndTime) updateData.purgeEndTime = new Date(purgeEndTime);
         if (roundEndTime) updateData.roundEndTime = new Date(roundEndTime);
@@ -98,7 +115,7 @@ export const appRouter = router({
       }),
 
     join: protectedProcedure
-      .input(z.object({ gameId: z.number().optional(), joinCode: z.string().optional(), safeObject: z.string().optional() }))
+      .input(z.object({ gameId: z.number().optional(), joinCode: z.string().optional() }))
       .mutation(async ({ ctx, input }) => {
         let gameId = input.gameId;
         if (!gameId && input.joinCode) {
@@ -109,14 +126,17 @@ export const appRouter = router({
         if (!gameId) throw new Error("Game ID or join code required");
         const existing = await db.getPlayerInGame(gameId, ctx.user.id);
         if (existing) return { playerId: existing.id, gameId };
-        const playerId = await db.joinGame({ gameId, userId: ctx.user.id, currentSafeObject: input.safeObject });
+        const playerId = await db.joinGame({ gameId, userId: ctx.user.id });
         return { playerId, gameId };
       }),
 
     startPurge: protectedProcedure
       .input(z.object({ gameId: z.number(), durationMinutes: z.number().default(60) }))
-      .mutation(async ({ input }) => {
+      .mutation(async ({ input, ctx }) => {
+        const game = await db.getGame(input.gameId);
+        if (!game || (game.adminId !== ctx.user.id && !ctx.user.isSuperAdmin)) throw new Error("Admin access required");
         const endTime = new Date(Date.now() + input.durationMinutes * 60000);
+        await db.pausePurgeSensitivePowerUps(input.gameId);
         await db.updateGame(input.gameId, { purgeActive: true, purgeEndTime: endTime });
         await db.createKillFeedEvent({ gameId: input.gameId, eventType: "purge_start", message: `⚠️ PURGE ACTIVATED! ${input.durationMinutes} minutes of chaos!` });
         // Notify all players (in-app + push)
@@ -136,8 +156,11 @@ export const appRouter = router({
 
     endPurge: protectedProcedure
       .input(z.object({ gameId: z.number() }))
-      .mutation(async ({ input }) => {
+      .mutation(async ({ input, ctx }) => {
+        const game = await db.getGame(input.gameId);
+        if (!game || (game.adminId !== ctx.user.id && !ctx.user.isSuperAdmin)) throw new Error("Admin access required");
         await db.updateGame(input.gameId, { purgeActive: false, purgeEndTime: null });
+        await db.resumePurgeSensitivePowerUps(input.gameId);
         await db.createKillFeedEvent({ gameId: input.gameId, eventType: "purge_end", message: "🕊️ Purge has ended. Normal rules resume." });
         // Push notify all players purge ended
         const purgeEndPlayers = await db.getGamePlayers(input.gameId);
@@ -150,16 +173,43 @@ export const appRouter = router({
         return { success: true };
       }),
 
+    schedulePurge: protectedProcedure
+      .input(z.object({ gameId: z.number(), startsAt: z.string().nullable() }))
+      .mutation(async ({ input, ctx }) => {
+        const game = await db.getGame(input.gameId);
+        if (!game || (game.adminId !== ctx.user.id && !ctx.user.isSuperAdmin)) throw new Error("Admin access required");
+        const startsAt = input.startsAt ? new Date(input.startsAt) : null;
+        if (startsAt && (!Number.isFinite(startsAt.getTime()) || startsAt.getTime() <= Date.now())) throw new Error("Choose a future purge time");
+        await db.updateGame(input.gameId, { purgeScheduledAt: startsAt });
+        return { success: true };
+      }),
+
     startRound: protectedProcedure
       .input(z.object({ gameId: z.number() }))
-      .mutation(async ({ input }) => {
+      .mutation(async ({ input, ctx }) => {
         const game = await db.getGame(input.gameId);
         if (!game) throw new Error("Game not found");
+        if (game.adminId !== ctx.user.id && !ctx.user.isSuperAdmin) throw new Error("Admin access required");
         const newRound = (game.currentRound || 0) + 1;
         const roundEnd = new Date(Date.now() + (game.roundLength || 72) * 3600000);
         const roundPlayers = await db.getGamePlayers(input.gameId);
         for (const player of roundPlayers) {
           if (player.nextRoundTargetId) await db.updatePlayer(player.id, { targetId: player.nextRoundTargetId, nextRoundTargetId: null });
+        }
+        const wildcards = await db.getActiveGamePowerUpsByName(input.gameId, "Wildcard");
+        for (const wildcard of wildcards) {
+          const owner = roundPlayers.find(player => player.id === wildcard.gamePlayerId);
+          const selected = roundPlayers.find(player => player.id === wildcard.targetPlayerId);
+          const selectedHunter = selected ? roundPlayers.find(player => player.id !== owner?.id && player.targetId === selected.id && player.status === "alive") : undefined;
+          if (!owner || owner.status !== "alive" || !selected || selected.status !== "alive" || !selectedHunter || !owner.targetId || owner.targetId === selectedHunter.id) {
+            await db.returnPowerUpToInventory(wildcard.id);
+            if (owner) await db.createNotification({ userId: owner.userId, gameId: input.gameId, type: "power_up_used", title: "Wildcard Returned", body: "Your selected target was no longer valid at round start. Choose again for a later round." });
+            continue;
+          }
+          const oldTarget = owner.targetId;
+          await db.updatePlayer(owner.id, { targetId: selected.id });
+          await db.updatePlayer(selectedHunter.id, { targetId: oldTarget });
+          await db.consumePlayerPowerUp(wildcard.id);
         }
         await db.updateGame(input.gameId, { currentRound: newRound, roundEndTime: roundEnd, status: "active" });
         await db.createKillFeedEvent({ gameId: input.gameId, eventType: "round_start", message: `🎯 Round ${newRound} has begun!` });
@@ -168,8 +218,10 @@ export const appRouter = router({
 
     endRound: protectedProcedure
       .input(z.object({ gameId: z.number() }))
-      .mutation(async ({ input }) => {
+      .mutation(async ({ input, ctx }) => {
         const game = await db.getGame(input.gameId);
+        if (!game || (game.adminId !== ctx.user.id && !ctx.user.isSuperAdmin)) throw new Error("Admin access required");
+        for (const vendetta of await db.getActiveGamePowerUpsByName(input.gameId, "Vendetta")) await db.consumePlayerPowerUp(vendetta.id);
         await db.updateGame(input.gameId, { roundEndTime: null });
         await db.createKillFeedEvent({ gameId: input.gameId, eventType: "round_end", message: `🏁 Round ${game?.currentRound || 0} has ended!` });
         return { success: true };
@@ -177,16 +229,28 @@ export const appRouter = router({
 
     endGame: protectedProcedure
       .input(z.object({ gameId: z.number() }))
-      .mutation(async ({ input }) => {
+      .mutation(async ({ input, ctx }) => {
+        const game = await db.getGame(input.gameId);
+        if (!game || (game.adminId !== ctx.user.id && !ctx.user.isSuperAdmin)) throw new Error("Admin access required");
         await db.updateGame(input.gameId, { status: "completed" });
         await db.createKillFeedEvent({ gameId: input.gameId, eventType: "game_end", message: "🏆 Game Over!" });
+        return { success: true };
+      }),
+
+    delete: protectedProcedure
+      .input(z.object({ gameId: z.number(), confirmationName: z.string() }))
+      .mutation(async ({ ctx, input }) => {
+        const game = await db.getGame(input.gameId);
+        if (!game || (game.adminId !== ctx.user.id && !ctx.user.isSuperAdmin)) throw new Error("Admin access required");
+        if (input.confirmationName.trim() !== game.name) throw new Error("Type the exact game name to confirm permanent deletion");
+        await db.deleteGamePermanently(input.gameId);
         return { success: true };
       }),
 
     leaderboard: protectedProcedure
       .input(z.object({ gameId: z.number() }))
       .query(async ({ input }) => {
-        return db.getLeaderboard(input.gameId);
+        return addProtectionBadges(await db.getLeaderboard(input.gameId));
       }),
 
     history: protectedProcedure.query(async ({ ctx }) => {
@@ -212,32 +276,35 @@ export const appRouter = router({
       .query(async ({ input, ctx }) => {
         const players = await db.getGamePlayers(input.gameId);
         const game = await db.getGame(input.gameId);
-        if (game?.adminId === ctx.user.id || ctx.user.isSuperAdmin) return players;
+        if (game?.adminId === ctx.user.id || ctx.user.isSuperAdmin) return addProtectionBadges(players);
         const viewer = players.find(player => player.userId === ctx.user.id);
         if (!viewer) return [];
         await db.expirePlayerPowerUps(input.gameId);
         const blackout = (await db.getActiveGamePowerUpsByName(input.gameId, "Blackout")).length > 0;
-        if (blackout) return players.map(player => ({ ...player, latitude: null, longitude: null }));
         const hiddenIds = new Set<number>();
+        if (blackout) for (const player of players) hiddenIds.add(player.id);
         const radar = await db.getActivePowerUpByName(viewer.id, "Radar");
         const vendetta = await db.getActivePowerUpByName(viewer.id, "Vendetta");
         const vendettaTargetId = vendetta?.targetPlayerId ?? null;
         const canSeeAll = Boolean(radar || (game?.purgeActive && game.showLocationsDuringPurge));
         for (const player of players) {
           if (player.id === viewer.id) continue;
+          if (blackout) continue;
           if (!canSeeAll && player.id !== viewer.targetId && player.id !== vendettaTargetId) {
             hiddenIds.add(player.id);
             continue;
           }
+          const isDirectTarget = player.id === viewer.targetId || player.id === vendettaTargetId;
           const hidden = await Promise.all([
             db.getActivePowerUpByName(player.id, "Dead Zone"),
             db.getActivePowerUpByName(player.id, "Witness Protection"),
-            radar ? db.getActivePowerUpByName(player.id, "Burner Phone") : Promise.resolve(undefined),
+            radar && !isDirectTarget ? db.getActivePowerUpByName(player.id, "Burner Phone") : Promise.resolve(undefined),
           ]);
           if (hidden.some(Boolean)) hiddenIds.add(player.id);
         }
         const visiblePlayers = players.map(player => hiddenIds.has(player.id) ? { ...player, latitude: null, longitude: null } : { ...player });
-        const swaps = await db.getActiveGamePowerUpsByName(input.gameId, "Doppleganger");
+        const swaps = await db.getActiveGamePowerUpsByName(input.gameId, "Doppelganger");
+        swaps.sort((a, b) => (a.activatedAt?.getTime() || a.id) - (b.activatedAt?.getTime() || b.id));
         for (const swap of swaps) {
           if (!swap.targetPlayerId) continue;
           const owner = visiblePlayers.find(player => player.id === swap.gamePlayerId);
@@ -251,12 +318,13 @@ export const appRouter = router({
         }
         const withZones: Array<(typeof visiblePlayers)[number] & { sanctuaryZone?: { latitude: string; longitude: string; radiusMeters: number; approved: boolean } | null }> = visiblePlayers;
         for (const otherPlayer of withZones) {
-          if (otherPlayer.id === viewer.id || hiddenIds.has(otherPlayer.id)) continue;
-          const decoy = await db.getActivePowerUpByName(otherPlayer.id, "Decoy");
-          const decoyData = decoy?.activationData as { decoyLatitude?: string; decoyLongitude?: string } | null | undefined;
-          if (decoyData?.decoyLatitude && decoyData?.decoyLongitude) {
-            otherPlayer.latitude = decoyData.decoyLatitude;
-            otherPlayer.longitude = decoyData.decoyLongitude;
+          if (otherPlayer.id !== viewer.id && !hiddenIds.has(otherPlayer.id)) {
+            const decoy = await db.getActivePowerUpByName(otherPlayer.id, "Decoy");
+            const decoyData = decoy?.activationData as { decoyLatitude?: string; decoyLongitude?: string } | null | undefined;
+            if (decoyData?.decoyLatitude && decoyData?.decoyLongitude) {
+              otherPlayer.latitude = decoyData.decoyLatitude;
+              otherPlayer.longitude = decoyData.decoyLongitude;
+            }
           }
           const sanctuary = await db.getActivePowerUpByName(otherPlayer.id, "Sanctuary");
           const zoneData = sanctuary?.activationData as { zoneLatitude?: string; zoneLongitude?: string; zoneRadiusMeters?: number; approved?: boolean } | null | undefined;
@@ -282,7 +350,7 @@ export const appRouter = router({
             };
           }
         }
-        return withZones;
+        return addProtectionBadges(withZones);
       }),
 
     checkLocation: protectedProcedure
@@ -305,7 +373,7 @@ export const appRouter = router({
           const hiddenChecks = await Promise.all([
             db.getActivePowerUpByName(target.id, "Dead Zone"),
             db.getActivePowerUpByName(target.id, "Witness Protection"),
-            radar ? db.getActivePowerUpByName(target.id, "Burner Phone") : Promise.resolve(undefined),
+            radar && !isMyTarget ? db.getActivePowerUpByName(target.id, "Burner Phone") : Promise.resolve(undefined),
           ]);
           if (hiddenChecks.some(Boolean)) throw new Error("This player's location is currently hidden");
         }
@@ -326,7 +394,14 @@ export const appRouter = router({
     me: protectedProcedure
       .input(z.object({ gameId: z.number() }))
       .query(async ({ ctx, input }) => {
-        return db.getPlayerInGame(input.gameId, ctx.user.id);
+        const player = await db.getPlayerInGame(input.gameId, ctx.user.id);
+        if (!player) return undefined;
+        const players = await db.getGamePlayers(input.gameId);
+        const target = player.targetId ? players.find(candidate => candidate.id === player.targetId) : undefined;
+        const targetName = target
+          ? target.user?.displayName?.trim() || target.user?.name?.trim() || `Player #${target.userId}`
+          : null;
+        return { ...player, targetName };
       }),
 
     reconTarget: protectedProcedure
@@ -334,22 +409,19 @@ export const appRouter = router({
       .query(async ({ ctx, input }) => {
         const viewer = await db.getPlayerInGame(input.gameId, ctx.user.id);
         if (!viewer || !viewer.targetId) return null;
-        const recon = await db.getActivePowerUpByName(viewer.id, "Recon");
-        if (!recon) return null;
+        const inventory = await db.getPlayerPowerUps(viewer.id);
+        const currentGame = await db.getGame(input.gameId);
+        const recon = [...inventory].reverse().find(item => item.powerUp?.name === "Recon" && (item.activationData as any)?.reportRound === currentGame?.currentRound);
+        const report = recon?.activationData as any;
+        if (!recon || !report) return null;
         const players = await db.getGamePlayers(input.gameId);
-        const target = players.find(p => p.id === viewer.targetId);
+        const target = players.find(p => p.id === report.targetPlayerId);
         if (!target) return null;
-        const inventory = await db.getPlayerPowerUps(target.id);
-        const active = inventory.filter(item => item.status === "active" && item.powerUp);
         return {
           targetName: target.user?.displayName || target.user?.name || `Player #${target.userId}`,
-          points: target.points || 0,
-          activePowerUps: active.map(item => ({
-            name: item.powerUp!.name,
-            emoji: item.powerUp!.emoji,
-            expiresAt: item.expiresAt,
-          })),
-          expiresAt: recon.expiresAt,
+          points: report.targetPoints || 0,
+          activePowerUps: report.inventory || [],
+          expiresAt: null,
         };
       }),
 
@@ -488,67 +560,69 @@ export const appRouter = router({
         discount: z.number().default(0),
         description: z.string().optional(),
       }))
-      .mutation(async ({ input }) => {
+      .mutation(async ({ input, ctx }) => {
+        const game = await db.getGame(input.gameId);
+        if (!game || (game.adminId !== ctx.user.id && !ctx.user.isSuperAdmin)) throw new Error("Admin access required");
         const id = await db.createPowerUp(input);
         return { id };
       }),
 
     seedAll: protectedProcedure
       .input(z.object({ gameId: z.number() }))
-      .mutation(async ({ input }) => {
+      .mutation(async ({ input, ctx }) => {
+        const seedGame = await db.getGame(input.gameId);
+        if (!seedGame || (seedGame.adminId !== ctx.user.id && !ctx.user.isSuperAdmin)) throw new Error("Admin access required");
         const defaultPowerUps: Array<{name:string;emoji:string;effect:string;cost:number;duration:number|null;maxUsesPerGame?:number;category:"offensive"|"defensive"|"utility"|"special"|"chaos";description:string}> = [
           // === OFFENSIVE (20) ===
-          { name: "Bounty", emoji: "💰", effect: "Place bounty on any player (Hunter receives double the elimination points)", cost: 200, duration: 360, category: "offensive", description: "Place bounty on any player. The hunter who eliminates that player receives double the elimination points. Bounty lasts 6hrs. Your name is NOT revealed as the bounty placer." },
-          { name: "Raise the Stakes", emoji: "📈", effect: "Double the existing bounty on any player (hunter receives double the elimination points)", cost: 350, duration: 180, category: "offensive", description: "Double the existing bounty on any player. The hunter who eliminates them receives double the elimination points. Lasts 3hrs. If no bounty exists, this places a standard bounty instead." },
+          { name: "Bounty", emoji: "💰", effect: "Place a 6-hour bounty on any alive player", cost: 100, duration: null, category: "offensive", description: "Place an anonymous bounty on any alive player for 6 hours. The player who eliminates them receives 200 total points for the elimination." },
+          { name: "Raise the Stakes", emoji: "📈", effect: "Double a player's active bounties", cost: 350, duration: null, category: "offensive", description: "Double all active bounties on an alive player. This does not create a new bounty and every bounty keeps its original expiration time." },
           { name: "Killswitch", emoji: "💀", effect: "Strip all of the target's active power-ups (destroys ALL)", cost: 400, duration: null, category: "offensive", description: "Immediately deactivates ALL active power-ups on your current target. Shield? Gone. Ghost Mode? Disabled. Immunity Lock? Stripped. They receive a notification that their power-ups were stripped but NOT who did it." },
           { name: "Radar", emoji: "📡", effect: "Reveal all active players' locations on the map", cost: 100, duration: 120, category: "offensive", description: "For 2 hours, your map shows the real-time location of EVERY alive player, not just your target. Essentially a personal mini-purge without revealing your own location." },
-          { name: "Recon", emoji: "🔍", effect: "See target's purchased power-ups and current point balance", cost: 150, duration: 120, category: "offensive", description: "Reveals your target's current point balance and all their active/purchased power-ups with remaining durations. Know if they have a Shield before you make your move. Lasts 2hrs." },
-          { name: "Blacklist", emoji: "\u{1F6AB}", effect: "Block a target from buying power-ups", cost: 250, duration: 120, category: "offensive", description: "For 2 hours, your target cannot purchase power-ups from the shop. They can still use power-ups they already own." },
+          { name: "Recon", emoji: "🔍", effect: "Take a one-time snapshot of your current target", cost: 150, duration: null, category: "offensive", description: "Take a one-time snapshot of your current normal target's points and every active or unused power-up. The saved report remains available until the round ends." },
+          { name: "Blacklist", emoji: "\u{1F6AB}", effect: "Block a target from catalog purchases", cost: 250, duration: 240, category: "offensive", description: "For 4 hours, your target cannot purchase power-ups from the Shop catalog. Inventory activation, gifts, map pickups, and direct Roulette spins still work. Only one Blacklist may affect a player at a time." },
           { name: "Asset Freeze", emoji: "🧊", effect: "Block a target from using power-ups", cost: 250, duration: 120, category: "offensive", description: "For 2 hours, your target cannot activate or use power-ups they already own. They may still purchase power-ups." },
           { name: "Sabotage", emoji: "🔧", effect: "Target's next power-up purchase costs double", cost: 150, duration: 360, category: "offensive", description: "The next power-up your target purchases within 6 hours costs them double the listed price. They are NOT notified of the sabotage until they make the purchase and see the inflated cost." },
-          { name: "Sniper's Duel", emoji: "🎯", effect: "Challenge any active player to a duel. Winner gets 100pts & can steal one power-up", cost: 50, duration: null, maxUsesPerGame: 1, category: "offensive", description: "Challenge any active player to a duel. Your opponent is notified they've been challenged — tell the admin in person. Once the admin picks a winner, both duelists are notified. Winner gets 100pts and can steal one of the loser's power-ups." },
+          { name: "Sniper's Duel", emoji: "🎯", effect: "Mandatory real-world duel for 350 points and the loser's stake", cost: 50, duration: null, maxUsesPerGame: 1, category: "offensive", description: "Challenge any other alive player and stake an unused power-up. They must stake an unused power-up of equal or greater catalog value. Submit video or a witness and the proposed winner for admin review. The approved winner earns 350 points and the loser's stake." },
           { name: "Jackpot", emoji: "✨", effect: "Next kill earns double points (1x per game)", cost: 300, duration: 1440, maxUsesPerGame: 1, category: "offensive", description: "Your next confirmed elimination earns double the normal elimination points. Stacks with bounty points. One-time use per game, lasts up to 24hrs until triggered." },
-          { name: "Bounty Hunter", emoji: "🎯", effect: "Bonus points for next bounty you collect (Earns 450pts for 1 kill)", cost: 250, duration: 1440, maxUsesPerGame: 3, category: "offensive", description: "The next time you eliminate a player who has a bounty on them, you receive 450pts instead of the normal 300. One-time use, lasts up to 24hrs." },
-          { name: "Vampire", emoji: "🧛", effect: "Gain 1 extra life for every kill in the time period (Max 3 lives / 1x per game)", cost: 350, duration: 120, maxUsesPerGame: 1, category: "offensive", description: "For 2 hours, each confirmed elimination grants you an automatic Revive token (max 3). As long as you keep killing, you can't stay dead. One-time use per game." },
+          { name: "Bounty Hunter", emoji: "🎯", effect: "Earn 450 total points on your next bounty elimination", cost: 250, duration: 1440, maxUsesPerGame: 3, category: "offensive", description: "For up to 24 hours, your next approved elimination of a player who had an active bounty at submission time pays 450 total base-and-bounty points. Up to 3 uses per game, with no active stacking." },
+          { name: "Vampire", emoji: "🧛", effect: "Bank a life for every approved elimination in the game", cost: 350, duration: 120, maxUsesPerGame: 1, category: "offensive", description: "For 2 hours, every approved elimination anywhere in the game banks one extra life for you, up to 3. Banked lives remain until used or the game ends. An active Lucky Charm is used first." },
           { name: "Smoke Screen", emoji: "💨", effect: "Hide all map power-up pickups from every active player", cost: 150, duration: 120, category: "offensive", description: "For 2 hours, ALL hidden map power-ups become invisible to every player except you. You can collect them freely while others can't even see they exist." },
-          { name: "Vendetta", emoji: "⚔️", effect: "Add a second target for the duration", cost: 200, duration: 120, category: "offensive", description: "Choose any player to add as a second target. For 2 hours, you have two active targets at once and can see the extra target's location. Reverts to your normal single target when it expires." },
+          { name: "Vendetta", emoji: "⚔️", effect: "Add a second target for this round", cost: 200, duration: 360, category: "offensive", description: "Choose any other alive player as a second target for up to 6 hours. Vendetta ends when that player is eliminated or the current round ends and never carries into another round." },
           { name: "Blackout", emoji: "⚫", effect: "Remove all player locations from the map for certain time period", cost: 300, duration: 120, category: "offensive", description: "For 2 hours, NO player locations are visible on anyone's map. Even during purge, the map goes dark. Everyone is notified when Blackout starts and ends." },
           { name: "Fall Guy", emoji: "🪖", effect: "Force someone to be your bodyguard, if you're shot, they're eliminated (1x per game)", cost: 300, duration: 240, maxUsesPerGame: 1, category: "offensive", description: "Force any alive player to be your human shield for 4 hours. If someone eliminates you during this time, the conscripted player is eliminated INSTEAD. They are notified. 1x per game." },
-          { name: "Hitman's Cut", emoji: "💎", effect: "Get half the points from any kills achieved while active", cost: 250, duration: 240, maxUsesPerGame: 2, category: "offensive", description: "For 4 hours, whenever ANY player eliminates someone, you receive 50% of their earned points (bonus points generated, not taken from them). Passive income." },
+          { name: "Hitman's Cut", emoji: "💎", effect: "Get half the qualifying points from other players' eliminations", cost: 250, duration: 240, maxUsesPerGame: 2, category: "offensive", description: "For 4 hours, receive a generated bonus equal to 50% of qualifying points from every other player's approved eliminations. Your own eliminations and Open Season's separate 50-point award do not count." },
           { name: "Frame Job", emoji: "🖼️", effect: "Transfer your bounty to someone else, if they're eliminated your bounty is fulfilled", cost: 250, duration: null, maxUsesPerGame: 1, category: "offensive", description: "Transfer all bounties currently on you to another player. The bounty stays on them for as long as it would have stayed on you — it does not expire on its own or transfer back." },
-          { name: "Strip Search", emoji: "🔓", effect: "Remove your target's immunity shield for 2hrs", cost: 200, duration: 120, category: "offensive", description: "Immediately removes your current target's active Immunity Shield or Shield power-up for 2 hours. They are notified their shield was stripped but not by whom." },
-          { name: "Boomerang", emoji: "🪃", effect: "Choose a player — if you're eliminated while active, your elimination boomerangs onto them instead", cost: 350, duration: 180, maxUsesPerGame: 1, category: "offensive", description: "Choose any active player when you activate this. For 3 hours, if anyone eliminates you, the elimination boomerangs back — instead of you, your chosen player is eliminated. They are not warned." },
+          { name: "Strip Search", emoji: "🔓", effect: "Destroy an active Immunity Shield", cost: 200, duration: null, category: "offensive", description: "Choose any alive player and permanently destroy their currently active Immunity Shield. They are told who stripped it. If no shield is active, this power-up is not consumed." },
+          { name: "Boomerang", emoji: "🪃", effect: "Redirect an elimination onto the attacker", cost: 350, duration: 180, maxUsesPerGame: 1, category: "offensive", description: "For 3 hours, the first player who tries to eliminate you is eliminated by you instead. You receive the kill and points. The redirect is consumed even if their defense blocks it." },
           // === DEFENSIVE (15) ===
           { name: "Immunity Shield", emoji: "🛡️", effect: "Immunity from elimination while active", cost: 200, duration: 240, category: "defensive", description: "Activates a protective barrier. While active, any elimination attempt against you automatically fails. The attacker is NOT notified. Lasts 4 hours." },
           { name: "Dead Zone", emoji: "👻", effect: "Hide location from the map while active", cost: 150, duration: 120, category: "defensive", description: "Your location completely disappears from all maps for 2 hours — nothing is shown, not even a last-known pin. Great for ambushes or escaping hunters." },
           { name: "Clean Slate", emoji: "🧹", effect: "Remove a bounty placed on you", cost: 400, duration: null, maxUsesPerGame: 1, category: "defensive", description: "Instantly removes ALL active bounties placed on you. The bounty points vanish. Use when your bounty is climbing and you want to reduce incentive for others to target you." },
-          { name: "Radar Detector", emoji: "📟", effect: "Get notified when someone checks your location on the map", cost: 125, duration: 240, category: "defensive", description: "For 4 hours, you receive a push notification any time another player views your location on the map. You'll know their name and the exact time." },
+          { name: "Radar Detector", emoji: "📟", effect: "Get a generic alert when someone explicitly checks your location", cost: 125, duration: 240, category: "defensive", description: "For 4 hours, receive a generic in-app alert when someone explicitly checks your location. The alert does not identify who checked and passive map refreshes do not trigger it." },
           { name: "Revive", emoji: "❤️", effect: "Come back to life after an elimination within 2hrs. Must be used in the same round. (1x per game)", cost: 350, duration: null, maxUsesPerGame: 1, category: "defensive", description: "Come back to life after an elimination. Must be used in the round the elimination occurred and within 2 hours of the elimination. One-time use per game." },
-          { name: "Untouchable", emoji: "🔒", effect: "24hr Immunity (Only 1x per game; not usable during a purge)", cost: 500, duration: 1440, maxUsesPerGame: 1, category: "defensive", description: "Grants 24-hour immunity. May only be used once per game and may not be used during a purge." },
-          { name: "Lucky Charm", emoji: "🍀", effect: "Auto-revive if you're eliminated while active", cost: 400, duration: 10080, maxUsesPerGame: 3, category: "defensive", description: "Stays active until used. If you're eliminated while it's active, the elimination still counts for your attacker, but you're instantly revived — no re-entry fee. Up to 3 per game." },
-          { name: "Decoy", emoji: "🎭", effect: "Drop a fake location marker that others think is you", cost: 100, duration: 120, category: "defensive", description: "Places a fake GPS marker at a location you choose. For 2 hours, anyone tracking you sees the decoy location instead of your real one. Set it and move." },
-          { name: "Doppleganger", emoji: "📌", effect: "Swap map location with any active player", cost: 100, duration: 120, category: "defensive", description: "For 2 hours, swap your displayed map location with any active player." },
-          { name: "Mirror, Mirror", emoji: "🪞", effect: "Steal power of someone else's active power-up and get effects applied to you", cost: 250, duration: 120, category: "defensive", description: "Copy the effects of another player's active power-up onto yourself for 2 hours. The original player keeps their power-up. You get the same benefits." },
-          { name: "Bodyguard", emoji: "💪", effect: "Give another player protection. If they get shot you lose 150pts. (1x per game)", cost: 50, duration: 180, maxUsesPerGame: 1, category: "defensive", description: "Assign protection to any player for 3 hours. While protected, elimination attempts against them fail. If they are eliminated, you lose 150pts. One-time use per game and not usable during a purge." },
+          { name: "Untouchable", emoji: "🔒", effect: "24 active hours of public immunity", cost: 500, duration: 1440, maxUsesPerGame: 1, category: "defensive", description: "Grants 24 active hours of public immunity, once per game. It cannot start during a purge or within 24 hours of a scheduled purge. A purge that begins later pauses the timer and protection, then it resumes afterward." },
+          { name: "Lucky Charm", emoji: "🍀", effect: "Auto-revive on your next approved elimination", cost: 400, duration: null, maxUsesPerGame: 3, category: "defensive", description: "Activate it and it remains ready until triggered or the game ends. Your next approved elimination still counts for the attacker, but you immediately remain alive. Lucky Charm is used before a banked Vampire life." },
+          { name: "Decoy", emoji: "🎭", effect: "Display a fixed fake marker five miles from an anchor", cost: 100, duration: 120, category: "defensive", description: "For 2 hours, choose Manual and enter where you will be, or Automatic to use your current GPS. The app places a fixed decoy marker five miles from that anchor while privately retaining your real GPS." },
+          { name: "Doppelganger", emoji: "📌", effect: "Swap displayed map locations with an alive player", cost: 100, duration: 120, category: "defensive", description: "Silently swap your displayed map location with any other alive player for 2 hours. While your swap is active you cannot activate Radar, Dead Zone, Burner Phone, Decoy, Witness Protection, or another Doppelganger." },
+          { name: "Mirror, Mirror", emoji: "🪞", effect: "Copy an allowed active power-up for its remaining time", cost: 250, duration: null, category: "defensive", description: "Copy one compatible active power-up from another player. The original stays active and your copy receives exactly the original's remaining time, not a fresh duration." },
+          { name: "Bodyguard", emoji: "💪", effect: "Protect another player from one attempt", cost: 50, duration: 240, maxUsesPerGame: 1, category: "defensive", description: "Reserve 150 of your points to protect another alive player for 4 hours. Their first otherwise-valid elimination attempt is blocked, the 150 points are deducted, and Bodyguard is consumed. Unused reserved points return at expiration. Only one external Bodyguard can protect a player." },
           { name: "Respawn", emoji: "🔄", effect: "Undo your elimination, must pay half revival fee. Within 1hr of approval", cost: 350, duration: null, maxUsesPerGame: 1, category: "defensive", description: "If eliminated, activate within 1 hour of elimination approval. You return to alive status immediately. A half revival fee is added to the admin's fee queue for you to pay." },
-          { name: "Witness Protection", emoji: "🕶️", effect: "Temporary safety from elimination and location removed from map", cost: 250, duration: 240, category: "defensive", description: "For 4 hours, you cannot be eliminated and your location is removed from the map. You cannot attack during this time." },
-          { name: "Sanctuary", emoji: "⛪", effect: "Mark a safe zone for admin approval. Once approved, it shows on the map for 6hrs. (1x per game)", cost: 200, duration: 360, maxUsesPerGame: 1, category: "defensive", description: "Mark your current location or type an address for your sanctuary. The admin must approve it before it becomes a safe zone shown on everyone's map. Once approved it lasts 6hrs. One-time use per game and not usable during a purge." },
-          { name: "Burner Phone", emoji: "📱", effect: "Blocks Radar from finding you (your own hunter can still see you)", cost: 150, duration: 240, category: "defensive", description: "For 4 hours, players using Radar cannot locate you. Your own hunter can still see you normally, and you can still see map power-ups." },
+          { name: "Witness Protection", emoji: "🕶️", effect: "Temporary safety with location removed", cost: 250, duration: 240, category: "defensive", description: "For 4 hours, you are marked safe and cannot be eliminated, and your location is removed from the map. You may still attack." },
+          { name: "Sanctuary", emoji: "⛪", effect: "Publish an admin-approved real-world safe zone", cost: 200, duration: 360, maxUsesPerGame: 1, category: "defensive", description: "Enter an address or use your current location and send it for admin approval. Once approved, a 30-meter zone appears on everyone's map for 6 hours. The app shows the zone but does not enforce real-world eliminations inside it." },
+          { name: "Burner Phone", emoji: "📱", effect: "Blocks Radar from finding you", cost: 150, duration: 240, category: "defensive", description: "For 4 hours, Radar cannot grant other players access to your location." },
           // === CHAOS (9) ===
-          { name: "Monkey Wrench", emoji: "🔀", effect: "Swap safe object for all players", cost: 100, duration: 1440, category: "chaos", description: "Changes the safe object for all players for 24 hours." },
+          { name: "Monkey Wrench", emoji: "🔀", effect: "Temporarily replace the admin's official safe object", cost: 100, duration: 1440, category: "chaos", description: "Replace the game's official real-world safe object for 24 hours. Everyone is notified of the temporary object; when it expires, the admin's normal safe object returns." },
           { name: "Reassignment", emoji: "🔄", effect: "Swap targets with another player's hunter", cost: 300, duration: null, maxUsesPerGame: 2, category: "chaos", description: "Choose any alive player to become your new target. Whoever currently hunts that player receives your old target in exchange. Use when your current target is too difficult." },
-          { name: "Pickpocket", emoji: "🪙", effect: "Drain half the current points from a target & add to your score (Max 400)", cost: 250, duration: null, maxUsesPerGame: 3, category: "chaos", description: "Steals half the points from your current target (max 400pts) and adds them to your balance. They receive a notification they were robbed but not by whom." },
-          { name: "Freaky Friday", emoji: "🎭", effect: "Swap ALL players' targets at once for remainder of the round", cost: 600, duration: null, maxUsesPerGame: 2, category: "chaos", description: "The ultimate chaos power-up. EVERY player in the game gets randomly reassigned a new target simultaneously. Everyone is notified. Creates total confusion and resets all strategies." },
-          { name: "Lifeline", emoji: "🚑", effect: "Revive one eliminated player, must be used in same round (2x max per game)", cost: 400, duration: null, maxUsesPerGame: 2, category: "chaos", description: "Bring back one eliminated player of your choice from the current round. Can be used 2x max per game. The revived player owes you nothing." },
-          { name: "Care package", emoji: "🎁", effect: "Gift any power-up you own to any other player", cost: 50, duration: null, category: "chaos", description: "Transfer any unused power-up from your inventory to another player. The recipient is notified who sent it. Useful for alliances or generosity." },
-          { name: "Open Season", emoji: "🔫", effect: "Eliminate any player, no safe objects. +50pts for every elimination in the game while active", cost: 600, duration: 30, category: "chaos", description: "All players are notified immediately. After a 5-minute warning, Open Season is active for 30 minutes — anyone can eliminate anyone. You earn +50pts for every elimination that happens in the game while it's active, plus your normal kill points if you get one yourself." },
-          { name: "Roulette", emoji: "🎰", effect: "Spin for random power-ups, discounts and points", cost: 50, duration: null, category: "chaos", description: "Spin the wheel! Possible outcomes set by admin: free power-up, point bonus, point penalty, discount coupon, or nothing. Cheap gamble that could pay off big or cost you." },
+          { name: "Pickpocket", emoji: "🪙", effect: "Steal half an alive player's points, up to 400", cost: 250, duration: null, maxUsesPerGame: 3, category: "chaos", description: "Choose any other alive player and steal half their current points, up to 400. The named theft and exact amount appear in the public kill feed." },
+          { name: "Freaky Friday", emoji: "🎭", effect: "Reassign every alive player's target for the round", cost: 600, duration: null, maxUsesPerGame: 2, category: "chaos", description: "Every alive player receives a different target. The reassignment remains one-to-one: nobody targets themselves or keeps their old target. No notification is sent." },
+          { name: "Lifeline", emoji: "🚑", effect: "Revive an eliminated player from this round", cost: 400, duration: null, maxUsesPerGame: 2, category: "chaos", description: "Choose any eliminated player whose latest approved elimination was in the current round and revive them. Their elimination record and points remain. No point deduction is applied." },
+          { name: "Care Package", emoji: "🎁", effect: "Gift an unused power-up to another alive player", cost: 50, duration: null, category: "chaos", description: "Transfer an unused inventory power-up to another alive player who has capacity to use it. The public feed names sender and recipient but keeps the item private." },
+          { name: "Open Season", emoji: "🔫", effect: "30 minutes of real-world open targeting plus upload grace", cost: 600, duration: 40, category: "chaos", description: "All players receive a 5-minute warning, followed by 30 active minutes and a 5-minute upload grace period. Safe objects do not count in real life. You earn 50 points for each elimination submitted during the active or grace window that is later approved." },
+          { name: "Roulette", emoji: "🎰", effect: "Pay 50 points and spin directly from the Shop banner", cost: 50, duration: null, category: "chaos", description: "Roulette is opened from the Shop banner. It is not purchased, stored, or activated as an inventory power-up." },
           { name: "Wildcard", emoji: "🃏", effect: "Choose your target for the next round", cost: 300, duration: null, maxUsesPerGame: 3, category: "chaos", description: "Choose which active player will be your target for the next round." },
         ];
         const ids: number[] = [];
         const usageFeesByName: Record<string, number> = {
-          "Bounty": 500,
-          "Raise the Stakes": 1000,
           "Clean Slate": 500,
           "Revive": 1500,
           "Respawn": 750,
@@ -558,9 +632,17 @@ export const appRouter = router({
           "Lifeline": 500,
           "Wildcard": 500,
         };
+        const existingCatalog = await db.getGamePowerUps(input.gameId);
         for (const pu of defaultPowerUps) {
-          const id = await db.createPowerUp({ ...pu, usageFeeCents: usageFeesByName[pu.name] || 0, gameId: input.gameId, isEnabled: true, discount: 0 });
-          ids.push(id);
+          const aliases = pu.name === "Doppelganger" ? ["Doppelganger", "Doppleganger"] : pu.name === "Care Package" ? ["Care Package", "Care package"] : [pu.name];
+          const existing = existingCatalog.find(candidate => aliases.includes(candidate.name));
+          const values = { ...pu, usageFeeCents: usageFeesByName[pu.name] || 0, gameId: input.gameId, isEnabled: true, discount: existing?.discount || 0 };
+          if (existing) {
+            await db.updatePowerUp(existing.id, values);
+            ids.push(existing.id);
+          } else {
+            ids.push(await db.createPowerUp(values));
+          }
         }
         return { count: ids.length, ids };
       }),
@@ -590,6 +672,7 @@ export const appRouter = router({
         const allPowerUps = await db.getGamePowerUps(input.gameId);
         const powerUp = allPowerUps.find(p => p.id === input.powerUpId);
         if (!powerUp || !powerUp.isEnabled) throw new Error("Power-up not available");
+        if (powerUp.name === "Roulette") throw new Error("Roulette is available only from the Shop banner and cannot be purchased");
         if (powerUp.maxUsesPerGame != null) {
           const usageCount = await db.getPlayerPowerUpUsageCount(player.id, powerUp.id, input.gameId);
           if (usageCount >= powerUp.maxUsesPerGame) {
@@ -606,7 +689,7 @@ export const appRouter = router({
         const cost = pendingDiscountPercent == null
           ? standardCost
           : Math.floor(standardCost * (1 - pendingDiscountPercent / 100));
-        if ((player.points || 0) < cost) throw new Error("Not enough points");
+        if ((player.points || 0) - (player.reservedPoints || 0) < cost) throw new Error("Not enough available points (Bodyguard reservations cannot be spent)");
         await db.updatePlayer(player.id, {
           points: (player.points || 0) - cost,
           ...(pendingDiscountPercent == null ? {} : { pendingDiscountPercent: null }),
@@ -656,41 +739,73 @@ export const appRouter = router({
         const assetFreeze = await db.getActiveTargetedPowerUp(input.gameId, player.id, "Asset Freeze");
         if (assetFreeze) throw new Error("Your power-up inventory is currently frozen");
 
-        const requiresFinalRuleDesign = new Set(["Roulette"]);
-        if (requiresFinalRuleDesign.has(item.powerUp.name)) {
-          throw new Error(`${item.powerUp.name} is in your inventory, but its final game rule must be configured before activation`);
+        const gameBeforePayment = await db.getGame(input.gameId);
+        if (item.powerUp.name === "Clean Slate" && !(await db.getGameBounties(input.gameId)).some(bounty => bounty.targetPlayerId === player.id)) {
+          throw new Error("You have no active bounties to clear");
         }
+        if (["Revive", "Respawn"].includes(item.powerUp.name)) {
+          const latest = await db.getLatestApprovedEliminationForPlayer(input.gameId, player.id);
+          const limit = item.powerUp.name === "Revive" ? 2 * 60 * 60 * 1000 : 60 * 60 * 1000;
+          if (!latest || player.status !== "eliminated" || !latest.reviewedAt || Date.now() - latest.reviewedAt.getTime() > limit || (item.powerUp.name === "Revive" && latest.round !== (gameBeforePayment?.currentRound || 1))) {
+            throw new Error(`${item.powerUp.name} is not available for your latest elimination`);
+          }
+        }
+
+        if (item.powerUp.name === "Roulette") throw new Error("Roulette is played directly from the Shop banner and cannot be activated from inventory");
 
         if ((item.powerUp.usageFeeCents || 0) > 0) {
           const fee = await db.getPowerUpUsageFee(item.id);
           if (!fee) {
-            const feeId = await db.createPowerUpUsageFee({
+            await db.createPowerUpUsageFee({
               gameId: input.gameId,
               gamePlayerId: player.id,
               playerPowerUpId: item.id,
               amountCents: item.powerUp.usageFeeCents || 0,
               status: "pending",
             });
-            await db.setPlayerPowerUpPendingPayment(item.id);
-            return { success: false, paymentRequired: true, feeId, amountCents: item.powerUp.usageFeeCents || 0 };
           }
-          if (fee.status === "pending") return { success: false, paymentRequired: true, feeId: fee.id, amountCents: fee.amountCents };
         }
 
         const targetRequired = new Set([
-          "Bounty", "Raise the Stakes", "Killswitch", "Recon", "Blacklist", "Asset Freeze", "Sabotage",
-          "Sniper's Duel", "Fall Guy", "Frame Job", "Strip Search", "Doppleganger", "Mirror, Mirror", "Bodyguard", "Pickpocket",
-          "Lifeline", "Care package", "Wildcard", "Vendetta", "Reassignment", "Boomerang"
+          "Bounty", "Raise the Stakes", "Blacklist", "Asset Freeze", "Sabotage",
+          "Sniper's Duel", "Fall Guy", "Frame Job", "Strip Search", "Doppelganger", "Mirror, Mirror", "Bodyguard", "Pickpocket",
+          "Lifeline", "Care Package", "Wildcard", "Vendetta", "Reassignment"
         ]);
         if (targetRequired.has(item.powerUp.name) && !input.targetPlayerId) throw new Error("Choose a target before activating this power-up");
         if (input.targetPlayerId) {
           const target = await db.getPlayerById(input.targetPlayerId);
           if (!target || target.gameId !== input.gameId) throw new Error("Invalid target player");
+          if (item.powerUp.name !== "Lifeline" && target.status !== "alive") throw new Error("Choose an alive player");
+          if (target.id === player.id && !["Revive", "Respawn"].includes(item.powerUp.name)) throw new Error("You cannot choose yourself");
         }
 
         const game = await db.getGame(input.gameId);
+        if (item.powerUp.name === "Killswitch") input.targetPlayerId = player.targetId || undefined;
+        if (item.powerUp.name === "Recon") input.targetPlayerId = player.targetId || undefined;
+        if (["Killswitch", "Recon"].includes(item.powerUp.name) && !input.targetPlayerId) throw new Error("You do not have a current target");
+        if (["Blacklist", "Asset Freeze", "Sabotage"].includes(item.powerUp.name) && await db.getActiveTargetedPowerUp(input.gameId, input.targetPlayerId!, item.powerUp.name)) {
+          throw new Error(`${item.powerUp.name} is already active on that player`);
+        }
+        if (["Jackpot", "Bounty Hunter", "Hitman's Cut", "Immunity Shield", "Radar Detector"].includes(item.powerUp.name) && await db.getActivePowerUpByName(player.id, item.powerUp.name)) {
+          throw new Error(`${item.powerUp.name} is already active`);
+        }
+        if (["Immunity Shield", "Untouchable"].includes(item.powerUp.name) && (await db.getActivePowerUpByName(player.id, "Immunity Shield") || await db.getActivePowerUpByName(player.id, "Untouchable"))) {
+          throw new Error("You already have an immunity power-up active");
+        }
+        const ownDoppelganger = await db.getActivePowerUpByName(player.id, "Doppelganger");
+        if (ownDoppelganger && ["Radar", "Dead Zone", "Burner Phone", "Decoy", "Witness Protection", "Doppelganger"].includes(item.powerUp.name)) {
+          throw new Error(`${item.powerUp.name} cannot be activated while your Doppelganger swap is active`);
+        }
+        if (item.powerUp.name === "Doppelganger") {
+          for (const incompatible of ["Radar", "Dead Zone", "Burner Phone", "Decoy", "Witness Protection", "Doppelganger"]) {
+            if (await db.getActivePowerUpByName(player.id, incompatible)) throw new Error(`End ${incompatible} before activating Doppelganger`);
+          }
+        }
         if (["Untouchable", "Bodyguard", "Sanctuary"].includes(item.powerUp.name) && game?.purgeActive) {
           throw new Error(`${item.powerUp.name} cannot be activated during a purge`);
+        }
+        if (item.powerUp.name === "Untouchable" && game?.purgeScheduledAt && game.purgeScheduledAt.getTime() <= Date.now() + 24 * 60 * 60 * 1000) {
+          throw new Error("Untouchable cannot start within 24 hours of a scheduled purge");
         }
 
         let consumeImmediately = item.powerUp.duration == null;
@@ -698,9 +813,9 @@ export const appRouter = router({
         let effectiveDurationMinutes: number | null = item.powerUp.duration;
         switch (item.powerUp.name) {
           case "Open Season": {
-            const effectStartsAt = new Date(Date.now() + 5 * 60000);
-            finalActivationData = { ...(input.activationData || {}), effectStartsAt: effectStartsAt.toISOString() };
-            effectiveDurationMinutes = (item.powerUp.duration || 30) + 5;
+            const window = openSeasonWindow(Date.now());
+            finalActivationData = { effectStartsAt: new Date(window.startsAt).toISOString(), activeEndsAt: new Date(window.activeEndsAt).toISOString(), submissionsCloseAt: new Date(window.submissionsCloseAt).toISOString() };
+            effectiveDurationMinutes = 40;
             const allPlayers = await db.getGamePlayers(input.gameId);
             for (const gamePlayer of allPlayers) {
               await db.createNotification({
@@ -711,21 +826,36 @@ export const appRouter = router({
                 body: "Open Season activates in 5 minutes. No safe objects will protect anyone once it starts.",
               });
             }
+            await sendPushToUsers(allPlayers.map(gamePlayer => gamePlayer.userId), { title: "🔫 Open Season Incoming", body: "Starts in 5 minutes, runs for 30 minutes, then allows 5 minutes for video uploads.", data: { type: "open_season", gameId: input.gameId } });
+            break;
+          }
+          case "Blackout": {
+            const allPlayers = await db.getGamePlayers(input.gameId);
+            for (const gamePlayer of allPlayers) await db.createNotification({ userId: gamePlayer.userId, gameId: input.gameId, type: "power_up_used", title: "Blackout Active", body: "All player locations are hidden for 2 hours." });
+            await sendPushToUsers(allPlayers.map(gamePlayer => gamePlayer.userId), { title: "⚫ Blackout Active", body: "All player locations are hidden for 2 hours.", data: { type: "blackout", gameId: input.gameId } });
             break;
           }
           case "Sniper's Duel": {
             if (!input.targetPlayerId) throw new Error("Choose an opponent before activating this power-up");
-            const duelId = await db.createDuel({ gameId: input.gameId, challengerId: player.id, opponentId: input.targetPlayerId });
+            const challengerStakeId = Number(input.activationData?.challengerStakeId);
+            const stake = await db.getPlayerPowerUpById(challengerStakeId);
+            if (!stake || stake.gamePlayerId !== player.id || stake.status !== "inventory" || stake.lockedForDuelId || stake.powerUp?.name === "Sniper's Duel") throw new Error("Choose an unused power-up to stake");
+            const opponentInventory = await db.getPlayerPowerUps(input.targetPlayerId);
+            if (!opponentInventory.some(candidate => candidate.status === "inventory" && !candidate.lockedForDuelId && candidate.powerUp?.name !== "Sniper's Duel" && (candidate.powerUp?.cost || 0) >= (stake.powerUp?.cost || 0))) throw new Error("That opponent has no eligible equal-or-higher-value stake");
+            const duelId = await db.createDuel({ gameId: input.gameId, challengerId: player.id, opponentId: input.targetPlayerId, challengerStakeId, stakeDeadline: new Date(Date.now() + 60 * 60 * 1000) });
             const opponent = await db.getPlayerById(input.targetPlayerId);
+            const challengerName = ctx.user.displayName?.trim() || ctx.user.name?.trim() || `Player #${player.userId}`;
             if (opponent) {
               await db.createNotification({
                 userId: opponent.userId,
                 gameId: input.gameId,
                 type: "power_up_used",
                 title: "🎯 You've Been Challenged!",
-                body: "A player has challenged you to a Sniper's Duel. Let the admin know so they can pick a winner.",
+                body: `${challengerName} challenged you to a mandatory Sniper's Duel. Choose an unused power-up worth at least ${stake.powerUp?.cost || 0} points within 1 hour.`,
               });
+              await sendPushToUser(opponent.userId, { title: "🎯 Sniper's Duel Challenge", body: `${challengerName} challenged you. Choose your stake within 1 hour.`, data: { type: "snipers_duel", gameId: input.gameId, duelId } });
             }
+            await db.createKillFeedEvent({ gameId: input.gameId, eventType: "power_up_used", actorId: player.id, targetId: input.targetPlayerId, message: `${challengerName} issued a Sniper's Duel challenge!` });
             finalActivationData = { ...(input.activationData || {}), duelId };
             break;
           }
@@ -740,9 +870,11 @@ export const appRouter = router({
             finalActivationData = {
               zoneLatitude,
               zoneLongitude,
+              address: typeof input.activationData?.address === "string" ? input.activationData.address : null,
               zoneRadiusMeters: 30,
               approved: false,
             };
+            effectiveDurationMinutes = null;
             if (game?.adminId) {
               await db.createNotification({
                 userId: game.adminId,
@@ -755,17 +887,12 @@ export const appRouter = router({
             break;
           }
           case "Decoy": {
-            if (!player.latitude || !player.longitude) {
-              throw new Error("Enable your location before using Decoy");
-            }
-            const realLat = parseFloat(player.latitude);
-            const realLng = parseFloat(player.longitude);
-            // Random offset roughly 100-300 meters away in a random direction
-            const angle = Math.random() * 2 * Math.PI;
-            const distanceDegrees = (0.001 + Math.random() * 0.002);
-            const decoyLatitude = (realLat + Math.cos(angle) * distanceDegrees).toFixed(6);
-            const decoyLongitude = (realLng + Math.sin(angle) * distanceDegrees).toFixed(6);
-            finalActivationData = { ...(input.activationData || {}), decoyLatitude, decoyLongitude };
+            const mode = input.activationData?.mode === "manual" ? "manual" : "automatic";
+            const anchorLatitude = mode === "manual" ? Number(input.activationData?.anchorLatitude) : Number(player.latitude);
+            const anchorLongitude = mode === "manual" ? Number(input.activationData?.anchorLongitude) : Number(player.longitude);
+            if (!Number.isFinite(anchorLatitude) || !Number.isFinite(anchorLongitude)) throw new Error(mode === "manual" ? "Enter and locate a valid address" : "Enable your location before using Decoy");
+            const decoy = pointFiveMilesAway(anchorLatitude, anchorLongitude);
+            finalActivationData = { mode, address: input.activationData?.address || null, anchorLatitude: String(anchorLatitude), anchorLongitude: String(anchorLongitude), decoyLatitude: decoy.latitude.toFixed(6), decoyLongitude: decoy.longitude.toFixed(6) };
             break;
           }
           case "Bounty":
@@ -773,28 +900,45 @@ export const appRouter = router({
               gameId: input.gameId,
               targetPlayerId: input.targetPlayerId!,
               placedByPlayerId: player.id,
-              amount: (game?.eliminationPoints || 100) * 2,
+              amount: 100,
             });
             break;
           case "Raise the Stakes":
             await db.doublePlayerBounties(input.gameId, input.targetPlayerId!, player.id);
             break;
           case "Killswitch":
-            await db.deactivateAllPlayerPowerUps(input.targetPlayerId!);
+            if (await db.deactivateAllPlayerPowerUps(input.targetPlayerId!, ["Sanctuary"]) === 0) throw new Error("Your current target has no eligible active power-ups");
+            {
+              const victim = await db.getPlayerById(input.targetPlayerId!);
+              if (victim) await db.createNotification({ userId: victim.userId, gameId: input.gameId, type: "power_up_used", title: "Killswitch", body: "Someone destroyed your active power-ups. Sanctuary was not affected." });
+            }
             break;
+          case "Recon": {
+            const target = await db.getPlayerById(input.targetPlayerId!);
+            if (!target) throw new Error("Current target not found");
+            const inventory = await db.getPlayerPowerUps(target.id);
+            finalActivationData = {
+              reportRound: game?.currentRound || 0,
+              targetPlayerId: target.id,
+              targetPoints: target.points || 0,
+              inventory: inventory.filter(candidate => candidate.status === "inventory" || candidate.status === "active").map(candidate => ({ name: candidate.powerUp?.name, emoji: candidate.powerUp?.emoji, status: candidate.status, expiresAt: candidate.expiresAt?.toISOString() || null })),
+            };
+            break;
+          }
           case "Clean Slate":
+            if (!(await db.getGameBounties(input.gameId)).some(bounty => bounty.targetPlayerId === player.id)) throw new Error("You have no active bounties to clear");
             await db.clearPlayerBounties(input.gameId, player.id);
             break;
           case "Witness Protection":
             await db.updatePlayer(player.id, { status: "safe" });
             break;
           case "Strip Search": {
-            if (input.targetPlayerId !== player.targetId) {
-              throw new Error("Strip Search can only be used on your current target");
-            }
             const immunity = await db.getActivePowerUpByName(input.targetPlayerId!, "Immunity Shield");
             if (!immunity) throw new Error("The selected player has no active Immunity Shield");
             await db.consumePlayerPowerUp(immunity.id);
+            const target = await db.getPlayerById(input.targetPlayerId!);
+            const actorName = ctx.user.displayName?.trim() || ctx.user.name?.trim() || "A player";
+            if (target) await db.createNotification({ userId: target.userId, gameId: input.gameId, type: "power_up_used", title: "Immunity Shield Destroyed", body: `${actorName} destroyed your Immunity Shield.` });
             break;
           }
           case "Frame Job":
@@ -802,7 +946,9 @@ export const appRouter = router({
             break;
           case "Mirror, Mirror": {
             const targetInventory = await db.getPlayerPowerUps(input.targetPlayerId!);
-            const copied = targetInventory.find(candidate => candidate.status === "active" && candidate.powerUp?.name !== "Mirror, Mirror");
+            const allowed = new Set(["Radar", "Recon", "Jackpot", "Bounty Hunter", "Vampire", "Hitman's Cut", "Immunity Shield", "Dead Zone", "Radar Detector", "Lucky Charm", "Burner Phone", "Untouchable"]);
+            const requestedId = Number(input.activationData?.copyInventoryId);
+            const copied = targetInventory.find(candidate => candidate.status === "active" && allowed.has(candidate.powerUp?.name || "") && (!requestedId || candidate.id === requestedId));
             if (!copied?.powerUp) throw new Error("The selected player has no active power-up to copy");
             const copiedInventoryId = await db.purchasePowerUp(player.id, copied.powerUp.id, input.gameId);
             await db.activatePlayerPowerUp(copiedInventoryId, {
@@ -818,6 +964,11 @@ export const appRouter = router({
               throw new Error("Revive must be used within 2 hours of an elimination in the current round");
             }
             await db.updatePlayer(player.id, { status: "alive" });
+            await db.repairTargetChainAfterRevive(input.gameId, player.id);
+            const reviveName = ctx.user.displayName?.trim() || ctx.user.name?.trim() || `Player #${player.userId}`;
+            await db.createKillFeedEvent({ gameId: input.gameId, eventType: "revival", actorId: player.id, message: `${reviveName} used Revive and returned to the game!` });
+            await db.createNotification({ userId: player.userId, gameId: input.gameId, type: "revival", title: "Revive Activated", body: "You are alive again. Your elimination record and the attacker's points remain." });
+            await sendPushToUser(player.userId, { title: "❤️ Revived", body: "You are back in the game.", data: { type: "revival", gameId: input.gameId } });
             break;
           }
           case "Respawn": {
@@ -826,6 +977,10 @@ export const appRouter = router({
               throw new Error("Respawn must be used within 1 hour of elimination approval");
             }
             await db.updatePlayer(player.id, { status: "alive" });
+            await db.repairTargetChainAfterRevive(input.gameId, player.id);
+            const respawnName = ctx.user.displayName?.trim() || ctx.user.name?.trim() || `Player #${player.userId}`;
+            await db.createKillFeedEvent({ gameId: input.gameId, eventType: "revival", actorId: player.id, message: `${respawnName} used Respawn and returned to the game!` });
+            await db.createNotification({ userId: player.userId, gameId: input.gameId, type: "revival", title: "Respawn Activated", body: "You are alive again. A $7.50 fee was added to the admin queue." });
             break;
           }
           case "Pickpocket": {
@@ -834,6 +989,11 @@ export const appRouter = router({
             const stolen = Math.min(400, Math.floor((target.points || 0) / 2));
             await db.updatePlayer(target.id, { points: (target.points || 0) - stolen });
             await db.updatePlayer(player.id, { points: (player.points || 0) + stolen });
+            const targetPlayers = await db.getGamePlayers(input.gameId);
+            const targetWithUser = targetPlayers.find(candidate => candidate.id === target.id);
+            const actorName = ctx.user.displayName?.trim() || ctx.user.name?.trim() || `Player #${player.userId}`;
+            const targetName = targetWithUser?.user?.displayName?.trim() || targetWithUser?.user?.name?.trim() || `Player #${target.userId}`;
+            await db.createKillFeedEvent({ gameId: input.gameId, eventType: "power_up_used", actorId: player.id, targetId: target.id, message: `${actorName} stole ${stolen} points from ${targetName}!` });
             break;
           }
           case "Reassignment": {
@@ -853,45 +1013,81 @@ export const appRouter = router({
           }
           case "Freaky Friday": {
             const alive = (await db.getGamePlayers(input.gameId)).filter(p => p.status === "alive");
-            const shuffled = [...alive].sort(() => Math.random() - 0.5);
-            for (let index = 0; index < alive.length; index++) {
-              let target = shuffled[index];
-              if (target.id === alive[index].id) target = shuffled[(index + 1) % shuffled.length];
-              if (target && target.id !== alive[index].id) await db.updatePlayer(alive[index].id, { targetId: target.id });
-            }
+            const assignments = derangedTargetPermutation(alive.map(candidate => ({ id: candidate.id, targetId: candidate.targetId })));
+            for (const assignment of assignments) await db.updatePlayer(assignment.playerId, { targetId: assignment.targetId });
             break;
           }
           case "Monkey Wrench": {
             const safeObject = String(input.activationData?.safeObject || "").trim();
             if (!safeObject) throw new Error("Choose the replacement safe object");
-            await db.updateGame(input.gameId, { safeObject });
-            const players = await db.getGamePlayers(input.gameId);
-            for (const gamePlayer of players) await db.updatePlayer(gamePlayer.id, { currentSafeObject: safeObject });
+            if (game?.temporarySafeObjectExpiresAt && game.temporarySafeObjectExpiresAt.getTime() > Date.now()) throw new Error("A Monkey Wrench safe object is already active");
+            await db.updateGame(input.gameId, { temporarySafeObject: safeObject, temporarySafeObjectExpiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000) });
+            const allPlayers = await db.getGamePlayers(input.gameId);
+            for (const gamePlayer of allPlayers) await db.createNotification({ userId: gamePlayer.userId, gameId: input.gameId, type: "power_up_used", title: "Safe Object Changed", body: `The official safe object is now “${safeObject}” for 24 hours.` });
+            await sendPushToUsers(allPlayers.map(gamePlayer => gamePlayer.userId), { title: "🔀 Safe Object Changed", body: `Use “${safeObject}” for the next 24 hours.`, data: { type: "monkey_wrench", gameId: input.gameId } });
             break;
           }
-          case "Lifeline":
+          case "Lifeline": {
+            const revived = await db.getPlayerById(input.targetPlayerId!);
+            const latest = await db.getLatestApprovedEliminationForPlayer(input.gameId, input.targetPlayerId!);
+            if (!revived || revived.status !== "eliminated" || !latest || latest.round !== (game?.currentRound || 1)) throw new Error("Choose a player eliminated during the current round");
             await db.updatePlayer(input.targetPlayerId!, { status: "alive" });
+            await db.repairTargetChainAfterRevive(input.gameId, input.targetPlayerId!);
+            const revivedPlayers = await db.getGamePlayers(input.gameId);
+            const revivedWithUser = revivedPlayers.find(candidate => candidate.id === input.targetPlayerId);
+            const revivedName = revivedWithUser?.user?.displayName?.trim() || revivedWithUser?.user?.name?.trim() || `Player #${input.targetPlayerId}`;
+            await db.createKillFeedEvent({ gameId: input.gameId, eventType: "revival", actorId: player.id, targetId: input.targetPlayerId, message: `${revivedName} was revived!` });
+            if (revived) {
+              await db.createNotification({ userId: revived.userId, gameId: input.gameId, type: "revival", title: "You've Been Revived", body: "Lifeline returned you to the current round." });
+              await sendPushToUser(revived.userId, { title: "❤️ You've Been Revived", body: "Lifeline returned you to the game.", data: { type: "revival", gameId: input.gameId } });
+            }
             break;
+          }
           case "Wildcard":
-            await db.updatePlayer(player.id, { nextRoundTargetId: input.targetPlayerId! });
+            if (await db.getActivePowerUpByName(player.id, "Wildcard")) throw new Error("You already have a Wildcard waiting for the next round");
+            consumeImmediately = false;
+            effectiveDurationMinutes = null;
+            finalActivationData = { scheduledForRound: (game?.currentRound || 0) + 1 };
             break;
-          case "Care package": {
+          case "Care Package": {
             const giftInventoryId = Number(input.activationData?.giftInventoryId);
             if (!giftInventoryId || giftInventoryId === item.id) throw new Error("Choose an inventory item to gift");
             const gift = await db.getPlayerPowerUpById(giftInventoryId);
-            if (!gift || gift.gamePlayerId !== player.id || gift.status !== "inventory") throw new Error("Gift item is not available");
+            if (!gift || gift.gamePlayerId !== player.id || gift.status !== "inventory" || gift.lockedForDuelId) throw new Error("Gift item is not available");
+            const giftMax = gift.powerUp?.maxUsesPerGame;
+            if (giftMax != null && await db.getPlayerPowerUpUsageCount(input.targetPlayerId!, gift.powerUpId, input.gameId) >= giftMax) throw new Error("That player has already reached this power-up's game limit");
             await db.transferPlayerPowerUp(gift.id, input.targetPlayerId!);
+            const players = await db.getGamePlayers(input.gameId);
+            const recipient = players.find(candidate => candidate.id === input.targetPlayerId);
+            const senderName = ctx.user.displayName?.trim() || ctx.user.name?.trim() || `Player #${player.userId}`;
+            const recipientName = recipient?.user?.displayName?.trim() || recipient?.user?.name?.trim() || "another player";
+            await db.createKillFeedEvent({ gameId: input.gameId, eventType: "power_up_used", actorId: player.id, targetId: input.targetPlayerId, message: `${senderName} sent a power-up to ${recipientName}!` });
             break;
           }
+          case "Bodyguard": {
+            if ((player.points || 0) - (player.reservedPoints || 0) < 150) throw new Error("Bodyguard requires 150 available points to reserve");
+            if (await db.getActiveTargetedPowerUp(input.gameId, input.targetPlayerId!, "Bodyguard")) throw new Error("That player already has Bodyguard protection");
+            await db.updatePlayer(player.id, { reservedPoints: (player.reservedPoints || 0) + 150 });
+            break;
+          }
+          case "Lucky Charm":
+            consumeImmediately = false;
+            effectiveDurationMinutes = null;
+            break;
         }
 
         if (consumeImmediately) {
+          if (finalActivationData) await db.updatePlayerPowerUpActivationData(item.id, finalActivationData);
           await db.consumePlayerPowerUp(item.id);
         } else {
-          const expiresAt = new Date(Date.now() + effectiveDurationMinutes! * 60000);
-          await db.activatePlayerPowerUp(item.id, { expiresAt, targetPlayerId: input.targetPlayerId, activationData: finalActivationData });
+          const expiresAt = effectiveDurationMinutes == null ? null : new Date(Date.now() + effectiveDurationMinutes * 60000);
+          await db.activatePlayerPowerUp(item.id, { expiresAt, targetPlayerId: input.targetPlayerId, activationData: finalActivationData, activatedRound: game?.currentRound || 0 });
         }
-        await db.createKillFeedEvent({ gameId: input.gameId, eventType: "power_up_used", actorId: player.id, targetId: input.targetPlayerId, message: `${item.powerUp.emoji} ${item.powerUp.name} activated!` });
+        const silent = new Set(["Radar", "Recon", "Blacklist", "Asset Freeze", "Sabotage", "Sniper's Duel", "Vampire", "Smoke Screen", "Vendetta", "Fall Guy", "Hitman's Cut", "Dead Zone", "Radar Detector", "Lucky Charm", "Decoy", "Doppelganger", "Mirror, Mirror", "Bodyguard", "Witness Protection", "Burner Phone", "Reassignment", "Freaky Friday", "Lifeline", "Care Package", "Wildcard"]);
+        if (!silent.has(item.powerUp.name)) {
+          const anonymous = new Set(["Killswitch", "Blackout", "Boomerang", "Clean Slate", "Monkey Wrench"]);
+          await db.createKillFeedEvent({ gameId: input.gameId, eventType: "power_up_used", actorId: anonymous.has(item.powerUp.name) ? null : player.id, targetId: anonymous.has(item.powerUp.name) ? null : input.targetPlayerId, message: anonymous.has(item.powerUp.name) ? `Someone activated ${item.powerUp.name}!` : `${item.powerUp.emoji} ${item.powerUp.name} activated!` });
+        }
         await db.checkAndAwardAchievements(player.id, input.gameId);
         return { success: true, paymentRequired: false, status: consumeImmediately ? "consumed" as const : "active" as const };
       }),
@@ -929,11 +1125,24 @@ export const appRouter = router({
         const item = await db.getPlayerPowerUpById(input.inventoryId);
         if (!item || item.gameId !== input.gameId) throw new Error("Sanctuary request not found");
         const activationData = (item.activationData as Record<string, unknown> | null) || {};
-        await db.updatePlayerPowerUpActivationData(item.id, { ...activationData, approved: true });
+        await db.approveSanctuaryPowerUp(item.id, { ...activationData, approved: true });
         const holder = await db.getPlayerById(item.gamePlayerId);
         if (holder) {
           await db.createNotification({ userId: holder.userId, gameId: input.gameId, type: "power_up_used", title: "⛪ Sanctuary Approved", body: "Your Sanctuary was approved and now shows as a safe zone on the map." });
         }
+        return { success: true };
+      }),
+
+    rejectSanctuary: protectedProcedure
+      .input(z.object({ gameId: z.number(), inventoryId: z.number(), reason: z.string().optional() }))
+      .mutation(async ({ ctx, input }) => {
+        const game = await db.getGame(input.gameId);
+        if (!game || (game.adminId !== ctx.user.id && !ctx.user.isSuperAdmin)) throw new Error("Admin access required");
+        const item = await db.getPlayerPowerUpById(input.inventoryId);
+        if (!item || item.gameId !== input.gameId || item.powerUp?.name !== "Sanctuary") throw new Error("Sanctuary request not found");
+        await db.returnPowerUpToInventory(item.id);
+        const holder = await db.getPlayerById(item.gamePlayerId);
+        if (holder) await db.createNotification({ userId: holder.userId, gameId: input.gameId, type: "power_up_used", title: "Sanctuary Needs Changes", body: input.reason?.trim() || "The admin rejected this location. Your Sanctuary was returned so you can submit another address." });
         return { success: true };
       }),
   }),
@@ -945,12 +1154,26 @@ export const appRouter = router({
         const player = await db.getPlayerInGame(input.gameId, ctx.user.id);
         if (!player) throw new Error("Not in this game");
         const game = await db.getGame(input.gameId);
+        const eliminated = await db.getPlayerById(input.eliminatedId);
+        if (!game || !eliminated || eliminated.gameId !== input.gameId || eliminated.status !== "alive" || eliminated.id === player.id) throw new Error("Choose another alive player");
+        if (!input.videoUrl || input.videoUrl === "pending-upload") throw new Error("Upload the elimination video before submitting");
+        await db.expirePlayerPowerUps(input.gameId);
+        const vendetta = await db.getActivePowerUpByName(player.id, "Vendetta");
+        const openSeason = (await db.getActiveGamePowerUpsByName(input.gameId, "Open Season")).some(holder => {
+          const data = holder.activationData as { effectStartsAt?: string; submissionsCloseAt?: string } | null;
+          return data?.effectStartsAt && data?.submissionsCloseAt && Date.now() >= new Date(data.effectStartsAt).getTime() && Date.now() <= new Date(data.submissionsCloseAt).getTime();
+        });
+        const canTarget = game.purgeActive || openSeason || player.targetId === eliminated.id || vendetta?.targetPlayerId === eliminated.id;
+        if (!canTarget) throw new Error("That player is not currently an eligible target");
+        const bountyPointsAtSubmission = (await db.getGameBounties(input.gameId)).filter(bounty => bounty.targetPlayerId === eliminated.id).reduce((sum, bounty) => sum + bounty.amount, 0);
         const id = await db.createElimination({
           gameId: input.gameId,
           eliminatorId: player.id,
           eliminatedId: input.eliminatedId,
           videoUrl: input.videoUrl,
           round: game?.currentRound || 1,
+          basePointsAtSubmission: (game.purgeActive ? game.purgeEliminationPoints : null) ?? game.eliminationPoints ?? 100,
+          bountyPointsAtSubmission,
         });
         // Notify admin
         if (game) {
@@ -974,48 +1197,60 @@ export const appRouter = router({
       .mutation(async ({ ctx, input }) => {
         let approved = input.approved;
         let submittedElimination = await db.getElimination(input.eliminationId);
+        const originalVictimId = submittedElimination?.eliminatedId;
+        let fallGuyRedirected = false;
         if (approved && submittedElimination) {
           await db.expirePlayerPowerUps(input.gameId);
+          for (const protectionName of ["Immunity Shield", "Untouchable", "Witness Protection"]) {
+            const protection = await db.getActivePowerUpByName(submittedElimination.eliminatedId, protectionName);
+            if (protection) {
+              approved = false;
+              const protectedPlayer = await db.getPlayerById(submittedElimination.eliminatedId);
+              if (protectedPlayer) await db.createNotification({ userId: protectedPlayer.userId, gameId: input.gameId, type: "power_up_used", title: `${protectionName} Protected You`, body: "An elimination submission against you was blocked." });
+              break;
+            }
+          }
+          if (!approved) submittedElimination = await db.getElimination(input.eliminationId);
+        }
+        if (approved && submittedElimination) {
           const fallGuy = await db.getActivePowerUpByName(submittedElimination.eliminatedId, "Fall Guy");
           if (fallGuy?.targetPlayerId) {
+            fallGuyRedirected = true;
             await db.updateElimination(input.eliminationId, { eliminatedId: fallGuy.targetPlayerId });
             await db.consumePlayerPowerUp(fallGuy.id);
             submittedElimination = await db.getElimination(input.eliminationId);
           }
           if (submittedElimination) {
             const boomerang = await db.getActivePowerUpByName(submittedElimination.eliminatedId, "Boomerang");
-            if (boomerang && boomerang.targetPlayerId) {
+            if (boomerang) {
               const boomerangHolderId = submittedElimination.eliminatedId;
-              await db.updateElimination(input.eliminationId, { eliminatorId: boomerangHolderId, eliminatedId: boomerang.targetPlayerId });
+              await db.updateElimination(input.eliminationId, { eliminatorId: boomerangHolderId, eliminatedId: submittedElimination.eliminatorId });
               await db.consumePlayerPowerUp(boomerang.id);
               submittedElimination = await db.getElimination(input.eliminationId);
             }
           }
           if (submittedElimination) {
+            if (submittedElimination.eliminatedId !== originalVictimId) {
+              for (const protectionName of ["Immunity Shield", "Untouchable", "Witness Protection"]) {
+                if (await db.getActivePowerUpByName(submittedElimination.eliminatedId, protectionName)) { approved = false; break; }
+              }
+            }
+          }
+          if (approved && submittedElimination) {
             const bodyguard = await db.getActiveTargetedPowerUp(input.gameId, submittedElimination.eliminatedId, "Bodyguard");
             if (bodyguard) {
               approved = false;
               const bodyguardPlayer = await db.getPlayerById(bodyguard.gamePlayerId);
-              if (bodyguardPlayer) await db.updatePlayer(bodyguardPlayer.id, { points: Math.max(0, (bodyguardPlayer.points || 0) - 150) });
+              if (bodyguardPlayer) await db.updatePlayer(bodyguardPlayer.id, { points: Math.max(0, (bodyguardPlayer.points || 0) - 150), reservedPoints: Math.max(0, (bodyguardPlayer.reservedPoints || 0) - 150) });
+              await db.consumePlayerPowerUp(bodyguard.id);
               await db.createKillFeedEvent({ gameId: input.gameId, eventType: "power_up_used", actorId: bodyguard.gamePlayerId, targetId: submittedElimination.eliminatedId, message: "Bodyguard blocked an elimination!" });
-            }
-          }
-          if (submittedElimination) {
-            const defendedPlayerId = submittedElimination.eliminatedId;
-            const protectionNames = ["Immunity Shield", "Untouchable", "Witness Protection"];
-            for (const protectionName of approved ? protectionNames : []) {
-              const protection = await db.getActivePowerUpByName(defendedPlayerId, protectionName);
-              if (protection) {
-                approved = false;
-                await db.createKillFeedEvent({ gameId: input.gameId, eventType: "power_up_used", actorId: defendedPlayerId, message: `${protectionName} blocked an elimination!` });
-                break;
-              }
             }
           }
         }
         const status = approved ? "approved" : "denied";
         const game = await db.getGame(input.gameId);
-        const eliminationPoints = (game?.purgeActive ? game?.purgeEliminationPoints : null) ?? game?.eliminationPoints ?? 100;
+        const originalSubmission = submittedElimination || await db.getElimination(input.eliminationId);
+        const eliminationPoints = originalSubmission?.basePointsAtSubmission ?? game?.eliminationPoints ?? 100;
         await db.updateElimination(input.eliminationId, { status, reviewedBy: ctx.user.id, reviewedAt: new Date(), pointsAwarded: approved ? eliminationPoints : 0 });
         
         if (approved) {
@@ -1026,79 +1261,64 @@ export const appRouter = router({
             const eliminator = players.find(p => p.id === elim.eliminatorId);
             const eliminated = players.find(p => p.id === elim.eliminatedId);
             if (eliminator) {
-              let killPoints = eliminationPoints;
-              const jackpot = await db.getActivePowerUpByName(eliminator.id, "Jackpot");
-              if (jackpot) {
-                killPoints *= 2;
-                await db.consumePlayerPowerUp(jackpot.id);
-              }
-              let totalAward = killPoints;
+              const jackpot = await db.getPowerUpEligibleAt(eliminator.id, "Jackpot", elim.createdAt);
+              const hasBounty = (elim.bountyPointsAtSubmission || 0) > 0;
+              const bountyHunter = hasBounty ? await db.getPowerUpEligibleAt(eliminator.id, "Bounty Hunter", elim.createdAt) : undefined;
+              const awards = calculateKillAwards({ basePoints: eliminationPoints, jackpot: Boolean(jackpot), bountyActive: hasBounty, bountyHunter: Boolean(bountyHunter), bountyBonusPoints: elim.bountyPointsAtSubmission || 0 });
+              if (jackpot) await db.consumePlayerPowerUp(jackpot.id);
+              if (bountyHunter) await db.consumePlayerPowerUp(bountyHunter.id);
+              let totalAward = awards.total;
               // Claim any bounties on the eliminated player
               if (eliminated) {
-                const bountyTotal = eliminated.bountyPoints || 0;
-                if (bountyTotal > 0) {
-                  let bountyAward = bountyTotal;
-                  const bountyHunter = await db.getActivePowerUpByName(eliminator.id, "Bounty Hunter");
-                  if (bountyHunter) {
-                    bountyAward = 450;
-                    await db.consumePlayerPowerUp(bountyHunter.id);
-                  }
+                if (hasBounty) {
                   await db.claimBounties(input.gameId, eliminated.id, eliminator.id);
-                  totalAward += bountyAward;
-                  await db.createKillFeedEvent({ gameId: input.gameId, eventType: "bounty_claimed", actorId: eliminator.id, targetId: eliminated.id, message: `💰 Bounty of ${bountyAward} points claimed!` });
+                  await db.createKillFeedEvent({ gameId: input.gameId, eventType: "bounty_claimed", actorId: eliminator.id, targetId: eliminated.id, message: "💰 Bounty claimed!" });
                 }
               }
               await db.updatePlayer(eliminator.id, { points: (eliminator.points || 0) + totalAward, kills: (eliminator.kills || 0) + 1 });
-              const vampire = await db.getActivePowerUpByName(eliminator.id, "Vampire");
-              if (vampire) {
-                const currentCredits = (eliminator as any).reviveCredits || 0;
-                if (currentCredits < 3) {
-                  await db.updatePlayer(eliminator.id, { reviveCredits: currentCredits + 1 } as any);
-                  await db.createNotification({ userId: eliminator.userId, gameId: input.gameId, type: "power_up_used", title: "🧛 Vampire Charge Gained", body: `You now have ${currentCredits + 1} extra life/lives banked.` });
-                }
-              }
-              const cuts = await db.getActiveGamePowerUpsByName(input.gameId, "Hitman's Cut");
+              const cuts = (await db.getGamePowerUpActivationsByName(input.gameId, "Hitman's Cut")).filter(cut => cut.activatedAt! <= elim.createdAt && (!cut.expiresAt || cut.expiresAt >= elim.createdAt));
               for (const cut of cuts) {
                 if (cut.gamePlayerId === eliminator.id) continue;
                 const beneficiary = players.find(p => p.id === cut.gamePlayerId);
                 if (beneficiary) await db.updatePlayer(beneficiary.id, { points: (beneficiary.points || 0) + Math.floor(totalAward / 2) });
               }
-              const openSeasonHolders = await db.getActiveGamePowerUpsByName(input.gameId, "Open Season");
+              const openSeasonHolders = await db.getGamePowerUpActivationsByName(input.gameId, "Open Season");
               for (const holder of openSeasonHolders) {
-                const holderData = holder.activationData as { effectStartsAt?: string } | null;
-                const effectStartsAt = holderData?.effectStartsAt ? new Date(holderData.effectStartsAt).getTime() : 0;
-                if (Date.now() < effectStartsAt) continue;
+                if (!holder.activatedAt || !isOpenSeasonSubmissionEligible(elim.createdAt.getTime(), holder.activatedAt.getTime())) continue;
                 const holderPlayer = await db.getPlayerById(holder.gamePlayerId);
                 if (holderPlayer) await db.updatePlayer(holderPlayer.id, { points: (holderPlayer.points || 0) + 50 });
               }
               // Inherit target if enabled
-              if (game?.inheritTarget && eliminated) {
+              const pendingLucky = eliminated ? await db.getActivePowerUpByName(eliminated.id, "Lucky Charm") : undefined;
+              const willAutoRevive = Boolean(pendingLucky || (eliminated?.reviveCredits || 0) > 0);
+              const eliminatorVendetta = await db.getActivePowerUpByName(eliminator.id, "Vendetta");
+              const isVendettaKill = eliminatorVendetta?.targetPlayerId === eliminated?.id;
+              if (game?.inheritTarget && eliminated && !willAutoRevive) {
                 const inheritedTarget = eliminated.targetId;
-                if (inheritedTarget && inheritedTarget !== eliminator.id) {
+                if (isVendettaKill || fallGuyRedirected) {
+                  const normalHunter = players.find(candidate => candidate.targetId === eliminated.id && candidate.id !== eliminator.id);
+                  if (normalHunter && inheritedTarget && inheritedTarget !== normalHunter.id) await db.updatePlayer(normalHunter.id, { targetId: inheritedTarget });
+                } else if (inheritedTarget && inheritedTarget !== eliminator.id) {
                   await db.updatePlayer(eliminator.id, { targetId: inheritedTarget });
                   await db.createNotification({ userId: eliminator.userId, gameId: input.gameId, type: "new_target", title: "New Target Assigned", body: "You've inherited your victim's target!" });
                 }
               }
+              if (eliminated) {
+                const vendettas = await db.getActiveGamePowerUpsByName(input.gameId, "Vendetta");
+                for (const vendetta of vendettas) if (vendetta.targetPlayerId === eliminated.id) await db.consumePlayerPowerUp(vendetta.id);
+              }
               // Notify eliminator (in-app + push)
-              await db.createNotification({ userId: eliminator.userId, gameId: input.gameId, type: "elimination_approved", title: "Elimination Approved!", body: `+${eliminationPoints} points awarded.` });
+              await db.createNotification({ userId: eliminator.userId, gameId: input.gameId, type: "elimination_approved", title: "Elimination Approved!", body: `+${totalAward} points awarded.` });
               await sendPushToUser(eliminator.userId, {
                 title: "✅ Elimination Approved!",
-                body: `+${eliminationPoints} points awarded. Keep hunting.`,
+                body: `+${totalAward} points awarded. Keep hunting.`,
                 data: { type: "elimination_approved", gameId: input.gameId },
               });
             }
             if (eliminated) {
               const reviveCredits = (eliminated as any).reviveCredits || 0;
               const luckyCharm = await db.getActivePowerUpByName(eliminated.id, "Lucky Charm");
-              if (reviveCredits > 0) {
-                await db.updatePlayer(eliminated.id, { status: "alive", deaths: (eliminated.deaths || 0) + 1, reviveCredits: reviveCredits - 1 } as any);
-                await db.createNotification({ userId: eliminated.userId, gameId: input.gameId, type: "elimination_result", title: "🧛 Vampire Saved You!", body: "You were eliminated, but an extra life brought you back instantly." });
-                await sendPushToUser(eliminated.userId, {
-                  title: "🧛 Extra Life Used!",
-                  body: "You were eliminated but a banked Vampire life revived you instantly.",
-                  data: { type: "vampire_revive", gameId: input.gameId },
-                });
-              } else if (luckyCharm) {
+              if (luckyCharm) {
                 await db.consumePlayerPowerUp(luckyCharm.id);
                 await db.updatePlayer(eliminated.id, { status: "alive", deaths: (eliminated.deaths || 0) + 1 });
                 await db.createNotification({ userId: eliminated.userId, gameId: input.gameId, type: "elimination_result", title: "🍀 Lucky Charm Saved You!", body: "You were eliminated, but your Lucky Charm revived you instantly." });
@@ -1107,6 +1327,10 @@ export const appRouter = router({
                   body: "You were eliminated but your Lucky Charm brought you back instantly.",
                   data: { type: "lucky_charm_revive", gameId: input.gameId },
                 });
+              } else if (reviveCredits > 0) {
+                await db.updatePlayer(eliminated.id, { status: "alive", deaths: (eliminated.deaths || 0) + 1, reviveCredits: reviveCredits - 1 } as any);
+                await db.createNotification({ userId: eliminated.userId, gameId: input.gameId, type: "elimination_result", title: "🧛 Vampire Saved You!", body: "You were eliminated, but a banked life brought you back instantly." });
+                await sendPushToUser(eliminated.userId, { title: "🧛 Extra Life Used!", body: "A banked Vampire life revived you instantly.", data: { type: "vampire_revive", gameId: input.gameId } });
               } else {
                 await db.updatePlayer(eliminated.id, { status: "eliminated", deaths: (eliminated.deaths || 0) + 1 });
                 await db.createNotification({ userId: eliminated.userId, gameId: input.gameId, type: "elimination_result", title: "You've Been Eliminated", body: "Better luck next round!" });
@@ -1116,6 +1340,16 @@ export const appRouter = router({
                   body: "Your elimination has been confirmed. Better luck next round!",
                   data: { type: "eliminated", gameId: input.gameId },
                 });
+              }
+            }
+            const vampires = (await db.getGamePowerUpActivationsByName(input.gameId, "Vampire")).filter(vampire => vampire.activatedAt! <= elim.createdAt && (!vampire.expiresAt || vampire.expiresAt >= elim.createdAt));
+            for (const vampire of vampires) {
+              if (vampire.gamePlayerId === elim.eliminatedId) continue;
+              const holder = await db.getPlayerById(vampire.gamePlayerId);
+              if (holder && (holder.reviveCredits || 0) < 3) {
+                const credits = (holder.reviveCredits || 0) + 1;
+                await db.updatePlayer(holder.id, { reviveCredits: credits });
+                await db.createNotification({ userId: holder.userId, gameId: input.gameId, type: "power_up_used", title: "🧛 Vampire Life Banked", body: `You now have ${credits} banked ${credits === 1 ? "life" : "lives"}.` });
               }
             }
           }
@@ -1156,7 +1390,10 @@ export const appRouter = router({
     uploadVideo: protectedProcedure
       .input(z.object({ gameId: z.number(), fileName: z.string(), fileBase64: z.string(), contentType: z.string() }))
       .mutation(async ({ ctx, input }) => {
+        if (!await db.getPlayerInGame(input.gameId, ctx.user.id)) throw new Error("Not in this game");
+        if (!input.contentType.startsWith("video/")) throw new Error("Only video evidence is accepted");
         const buffer = Buffer.from(input.fileBase64, "base64");
+        if (buffer.length > 100 * 1024 * 1024) throw new Error("Video must be 100 MB or smaller");
         const key = `eliminations/${input.gameId}/${ctx.user.id}-${Date.now()}-${input.fileName}`;
         const { url } = await storagePut(key, buffer, input.contentType);
         return { url };
@@ -1164,6 +1401,48 @@ export const appRouter = router({
   }),
 
   duel: router({
+    mine: protectedProcedure
+      .input(z.object({ gameId: z.number() }))
+      .query(async ({ input, ctx }) => {
+        const player = await db.getPlayerInGame(input.gameId, ctx.user.id);
+        if (!player) return [];
+        const playerDuels = await db.getPlayerDuels(input.gameId, player.id);
+        for (const duel of playerDuels) {
+          if (duel.status !== "awaiting_opponent_stake" || !duel.stakeDeadline || duel.stakeDeadline.getTime() > Date.now() || !duel.challengerStakeId) continue;
+          const challengerStake = await db.getPlayerPowerUpById(duel.challengerStakeId);
+          const eligible = (await db.getPlayerPowerUps(duel.opponentId)).filter(candidate => candidate.status === "inventory" && !candidate.lockedForDuelId && candidate.powerUp?.name !== "Sniper's Duel" && (candidate.powerUp?.cost || 0) >= (challengerStake?.powerUp?.cost || 0));
+          eligible.sort((a, b) => (a.powerUp?.cost || 0) - (b.powerUp?.cost || 0));
+          if (eligible[0]) await db.setDuelOpponentStake(duel.id, eligible[0].id);
+        }
+        const refreshed = await db.getPlayerDuels(input.gameId, player.id);
+        return Promise.all(refreshed.map(async duel => ({ ...duel, challengerStake: duel.challengerStakeId ? await db.getPlayerPowerUpById(duel.challengerStakeId) : null, opponentStake: duel.opponentStakeId ? await db.getPlayerPowerUpById(duel.opponentStakeId) : null })));
+      }),
+
+    chooseStake: protectedProcedure
+      .input(z.object({ gameId: z.number(), duelId: z.number(), inventoryId: z.number() }))
+      .mutation(async ({ input, ctx }) => {
+        const player = await db.getPlayerInGame(input.gameId, ctx.user.id);
+        const duel = await db.getDuel(input.duelId);
+        if (!player || !duel || duel.gameId !== input.gameId || duel.opponentId !== player.id || duel.status !== "awaiting_opponent_stake") throw new Error("This duel is not awaiting your stake");
+        const challengerStake = duel.challengerStakeId ? await db.getPlayerPowerUpById(duel.challengerStakeId) : undefined;
+        const stake = await db.getPlayerPowerUpById(input.inventoryId);
+        if (!stake || stake.gamePlayerId !== player.id || stake.status !== "inventory" || stake.lockedForDuelId || stake.powerUp?.name === "Sniper's Duel" || (stake.powerUp?.cost || 0) < (challengerStake?.powerUp?.cost || 0)) throw new Error("Choose an unused equal-or-higher-value power-up");
+        await db.setDuelOpponentStake(duel.id, stake.id);
+        return { success: true };
+      }),
+
+    submitResult: protectedProcedure
+      .input(z.object({ gameId: z.number(), duelId: z.number(), proposedWinnerId: z.number(), evidenceUrl: z.string().optional(), witnessName: z.string().optional(), notes: z.string().optional() }))
+      .mutation(async ({ input, ctx }) => {
+        const player = await db.getPlayerInGame(input.gameId, ctx.user.id);
+        const duel = await db.getDuel(input.duelId);
+        if (!player || !duel || duel.gameId !== input.gameId || duel.challengerId !== player.id || duel.status !== "awaiting_result") throw new Error("This duel is not ready for your result");
+        if (![duel.challengerId, duel.opponentId].includes(input.proposedWinnerId)) throw new Error("Winner must be one of the duelists");
+        if (!input.evidenceUrl?.trim() && !input.witnessName?.trim()) throw new Error("Attach video evidence or name a witness");
+        await db.submitDuelResult(duel.id, input.proposedWinnerId, input.evidenceUrl, input.witnessName, input.notes);
+        return { success: true };
+      }),
+
     pending: protectedProcedure
       .input(z.object({ gameId: z.number() }))
       .query(async ({ input, ctx }) => {
@@ -1173,20 +1452,22 @@ export const appRouter = router({
       }),
 
     resolve: protectedProcedure
-      .input(z.object({ gameId: z.number(), duelId: z.number(), winnerId: z.number() }))
+      .input(z.object({ gameId: z.number(), duelId: z.number(), approved: z.boolean() }))
       .mutation(async ({ input, ctx }) => {
         const game = await db.getGame(input.gameId);
         if (!game || (game.adminId !== ctx.user.id && !ctx.user.isSuperAdmin)) throw new Error("Admin access required");
-        const result = await db.resolveDuel(input.duelId, input.winnerId);
+        const result = await db.resolveDuel(input.duelId, input.approved, ctx.user.id);
         const winner = await db.getPlayerById(result.winnerId);
         const loser = await db.getPlayerById(result.loserId);
         if (winner) {
-          await db.createNotification({ userId: winner.userId, gameId: input.gameId, type: "power_up_used", title: "🎯 You Won the Duel!", body: `+100 points${result.stoleItem ? " and you stole a power-up" : ""}.` });
+          await db.createNotification({ userId: winner.userId, gameId: input.gameId, type: "power_up_used", title: result.approved ? "🎯 You Won the Duel!" : "Duel Result Rejected", body: result.approved ? `+350 points${result.stoleItem ? " and you received the loser's stake" : ""}.` : "The admin rejected the result and both stakes were unlocked." });
+          await sendPushToUser(winner.userId, { title: result.approved ? "🎯 Duel Won" : "Duel Result Rejected", body: result.approved ? "You earned 350 points and the loser's stake." : "Both stakes were returned.", data: { type: "snipers_duel", gameId: input.gameId } });
         }
         if (loser) {
-          await db.createNotification({ userId: loser.userId, gameId: input.gameId, type: "power_up_used", title: "You Lost the Duel", body: "Better luck next time." });
+          await db.createNotification({ userId: loser.userId, gameId: input.gameId, type: "power_up_used", title: result.approved ? "You Lost the Duel" : "Duel Result Rejected", body: result.approved ? "Your staked power-up was awarded to the winner." : "Both stakes were returned." });
+          await sendPushToUser(loser.userId, { title: result.approved ? "Duel Result" : "Duel Result Rejected", body: result.approved ? "The admin approved the submitted winner." : "Both stakes were returned.", data: { type: "snipers_duel", gameId: input.gameId } });
         }
-        await db.createKillFeedEvent({ gameId: input.gameId, eventType: "power_up_used", actorId: result.winnerId, targetId: result.loserId, message: "🎯 Sniper's Duel resolved!" });
+        if (result.approved) await db.createKillFeedEvent({ gameId: input.gameId, eventType: "power_up_used", actorId: result.winnerId, targetId: result.loserId, message: "🎯 Sniper's Duel resolved: 350 points and the loser's stake awarded!" });
         return { success: true };
       }),
   }),
@@ -1357,10 +1638,18 @@ export const appRouter = router({
       .query(async ({ input, ctx }) => {
         const viewer = await db.getPlayerInGame(input.gameId, ctx.user.id);
         if (!viewer) return [];
+        const game = await db.getGame(input.gameId);
+        const isAdmin = game?.adminId === ctx.user.id || ctx.user.isSuperAdmin;
         await db.expirePlayerPowerUps(input.gameId);
         const smokeScreens = await db.getActiveGamePowerUpsByName(input.gameId, "Smoke Screen");
-        if (smokeScreens.length && !smokeScreens.some(smoke => smoke.gamePlayerId === viewer.id)) return [];
-        return db.getMapPowerUps(input.gameId);
+        if (!isAdmin && smokeScreens.length && !smokeScreens.some(smoke => smoke.gamePlayerId === viewer.id)) return [];
+        const placed = await db.getMapPowerUps(input.gameId);
+        if (isAdmin) return placed.map(item => ({ ...item, discovered: true }));
+        const discoveries = await db.getMapPowerUpDiscoveries(viewer.id);
+        const discoveredIds = new Set(discoveries.map(discovery => discovery.mapPowerUpId));
+        return placed.map(item => item.isVisible || discoveredIds.has(item.id)
+          ? { ...item, discovered: item.isVisible || discoveredIds.has(item.id) }
+          : { ...item, latitude: null, longitude: null, discovered: false });
       }),
 
     create: protectedProcedure
@@ -1372,7 +1661,9 @@ export const appRouter = router({
         isVisible: z.boolean().default(true),
         clue: z.string().optional(),
       }))
-      .mutation(async ({ input }) => {
+      .mutation(async ({ input, ctx }) => {
+        const game = await db.getGame(input.gameId);
+        if (!game || (game.adminId !== ctx.user.id && !ctx.user.isSuperAdmin)) throw new Error("Admin access required");
         const id = await db.createMapPowerUp(input);
         return { id };
       }),
@@ -1382,6 +1673,19 @@ export const appRouter = router({
       .mutation(async ({ ctx, input }) => {
         const player = await db.getPlayerInGame(input.gameId, ctx.user.id);
         if (!player) throw new Error("Not in this game");
+        await db.expirePlayerPowerUps(input.gameId);
+        const smokeScreens = await db.getActiveGamePowerUpsByName(input.gameId, "Smoke Screen");
+        if (smokeScreens.length && !smokeScreens.some(smoke => smoke.gamePlayerId === player.id)) throw new Error("Map pickups are hidden by Smoke Screen");
+        const placed = await db.getMapPowerUps(input.gameId);
+        const pickup = placed.find(item => item.id === input.mapPowerUpId);
+        if (!pickup || pickup.claimedBy) throw new Error("This map power-up is no longer available");
+        if (!player.latitude || !player.longitude) throw new Error("Enable location before collecting");
+        if (!pickup.isVisible) {
+          const discoveries = await db.getMapPowerUpDiscoveries(player.id);
+          if (!discoveries.some(discovery => discovery.mapPowerUpId === pickup.id)) throw new Error("Find this hidden power-up before collecting it");
+        }
+        const distance = distanceMeters(Number(player.latitude), Number(player.longitude), Number(pickup.latitude), Number(pickup.longitude));
+        if (distance > MAP_CLAIM_METERS) throw new Error(`Move within ${MAP_CLAIM_METERS} meters to collect this power-up`);
         await db.claimMapPowerUp(input.mapPowerUpId, player.id);
         return { success: true };
       }),
@@ -1396,17 +1700,11 @@ export const appRouter = router({
       .query(async ({ ctx, input }) => {
         const player = await db.getPlayerInGame(input.gameId, ctx.user.id);
         if (!player) throw new Error("Not in this game");
+        const smokeScreens = await db.getActiveGamePowerUpsByName(input.gameId, "Smoke Screen");
+        if (smokeScreens.length && !smokeScreens.some(smoke => smoke.gamePlayerId === player.id)) throw new Error("Map pickups are hidden by Smoke Screen");
         const mapPowerUps = await db.getMapPowerUps(input.gameId);
         // Only return proximity for unclaimed, hidden power-ups
         const hidden = mapPowerUps.filter(mp => !mp.isVisible && !mp.claimedBy);
-
-        function haversineMeters(lat1: number, lon1: number, lat2: number, lon2: number) {
-          const R = 6371000; // Earth radius in meters
-          const dLat = (lat2 - lat1) * Math.PI / 180;
-          const dLon = (lon2 - lon1) * Math.PI / 180;
-          const a = Math.sin(dLat/2)**2 + Math.cos(lat1*Math.PI/180)*Math.cos(lat2*Math.PI/180)*Math.sin(dLon/2)**2;
-          return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
-        }
 
         function getTemperature(meters: number): { label: string; color: string; emoji: string } {
           if (meters <= 30) return { label: "ON FIRE! 🔥", color: "#FF3300", emoji: "🔥" };
@@ -1420,7 +1718,7 @@ export const appRouter = router({
         }
 
         return hidden.map(mp => {
-          const dist = haversineMeters(
+          const dist = distanceMeters(
             input.latitude, input.longitude,
             parseFloat(mp.latitude), parseFloat(mp.longitude)
           );
@@ -1448,20 +1746,15 @@ export const appRouter = router({
       .mutation(async ({ ctx, input }) => {
         const player = await db.getPlayerInGame(input.gameId, ctx.user.id);
         if (!player) throw new Error("Not in this game");
+        await db.expirePlayerPowerUps(input.gameId);
+        const smokeScreens = await db.getActiveGamePowerUpsByName(input.gameId, "Smoke Screen");
+        if (smokeScreens.length && !smokeScreens.some(smoke => smoke.gamePlayerId === player.id)) throw new Error("Map pickups are hidden by Smoke Screen");
         const mapPowerUps = await db.getMapPowerUps(input.gameId);
         const target = mapPowerUps.find(mp => mp.id === input.mapPowerUpId);
         if (!target) throw new Error("Power-up not found");
         if (target.claimedBy) throw new Error("This power-up has already been claimed");
 
-        function haversineMeters(lat1: number, lon1: number, lat2: number, lon2: number) {
-          const R = 6371000;
-          const dLat = (lat2 - lat1) * Math.PI / 180;
-          const dLon = (lon2 - lon1) * Math.PI / 180;
-          const a = Math.sin(dLat/2)**2 + Math.cos(lat1*Math.PI/180)*Math.cos(lat2*Math.PI/180)*Math.sin(dLon/2)**2;
-          return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
-        }
-
-        const dist = haversineMeters(
+        const dist = distanceMeters(
           input.guessLatitude, input.guessLongitude,
           parseFloat(target.latitude), parseFloat(target.longitude)
         );
@@ -1473,10 +1766,10 @@ export const appRouter = router({
           guessLatitude: input.guessLatitude.toString(),
           guessLongitude: input.guessLongitude.toString(),
           distanceMeters: Math.round(dist),
-          isCorrect: dist <= 100, // Within 100 meters = correct
+          isCorrect: dist <= MAP_DISCOVERY_METERS,
         });
 
-        if (dist <= 100) {
+        if (dist <= MAP_DISCOVERY_METERS) {
           // Correct guess — reveal the actual address/directions
           return {
             correct: true,
@@ -1558,14 +1851,14 @@ export const appRouter = router({
         const roulettePowerUp = (await db.getGamePowerUps(input.gameId))
           .find(powerUp => powerUp.name === "Roulette" && powerUp.isEnabled);
         if (!roulettePowerUp) throw new Error("Roulette power-up is not available");
-        const rouletteCost = roulettePowerUp.discount
-          ? Math.floor(roulettePowerUp.cost * (1 - roulettePowerUp.discount / 100))
-          : roulettePowerUp.cost;
-        if ((player.points || 0) < rouletteCost) throw new Error("Not enough points");
-        await db.updatePlayer(player.id, { points: (player.points || 0) - rouletteCost });
         const outcomes = await db.getRouletteOutcomes(input.gameId);
         const enabled = outcomes.filter(o => o.isEnabled);
         if (enabled.length === 0) throw new Error("No roulette outcomes configured");
+        if ((player.points || 0) - (player.reservedPoints || 0) < ROULETTE_SPIN_COST) {
+          throw new Error("Not enough available points (50 points are required; Bodyguard reservations cannot be spent)");
+        }
+        const balanceAfterSpin = rouletteBalanceAfterOutcome(player.points || 0, "nothing");
+        await db.updatePlayer(player.id, { points: balanceAfterSpin });
         // Weighted random selection
         const totalWeight = enabled.reduce((sum, o) => sum + o.weight, 0);
         let rand = Math.random() * totalWeight;
@@ -1576,21 +1869,37 @@ export const appRouter = router({
         }
         // Apply the outcome
         let resultMessage = "";
+        let inventoryId: number | null = null;
+        let prizePowerUp: { id: number; name: string; emoji: string } | null = null;
         switch (selected.type) {
           case "points_bonus":
-            await db.updatePlayer(player.id, { points: (player.points || 0) + (selected.value || 0) });
+            await db.updatePlayer(player.id, { points: rouletteBalanceAfterOutcome(player.points || 0, selected.type, selected.value || 0) });
             resultMessage = `Won ${selected.value} points!`;
             break;
           case "points_penalty":
-            await db.updatePlayer(player.id, { points: Math.max(0, (player.points || 0) - (selected.value || 0)) });
+            await db.updatePlayer(player.id, { points: rouletteBalanceAfterOutcome(player.points || 0, selected.type, selected.value || 0) });
             resultMessage = `Lost ${selected.value} points!`;
             break;
           case "power_up":
-            if (selected.powerUpId) {
-              await db.purchasePowerUp(player.id, selected.powerUpId, input.gameId);
-              resultMessage = `Won a free power-up! It has been added to your inventory.`;
-            } else {
-              resultMessage = selected.description || "Mystery prize!";
+            {
+              const catalog = await db.getGamePowerUps(input.gameId);
+              const configuredPrize = selected.powerUpId
+                ? catalog.find(powerUp => powerUp.id === selected.powerUpId && powerUp.isEnabled && powerUp.name !== "Roulette")
+                : null;
+              const eligiblePrizes = configuredPrize ? [configuredPrize] : catalog.filter(powerUp => powerUp.isEnabled && powerUp.name !== "Roulette");
+              const eligibleWithCapacity: typeof eligiblePrizes = [];
+              for (const powerUp of eligiblePrizes) {
+                const usageCount = await db.getPlayerPowerUpUsageCount(player.id, powerUp.id, input.gameId);
+                if (powerUp.maxUsesPerGame == null || usageCount < powerUp.maxUsesPerGame) eligibleWithCapacity.push(powerUp);
+              }
+              if (eligibleWithCapacity.length === 0) {
+                await db.updatePlayer(player.id, { points: player.points || 0 });
+                throw new Error("No eligible power-up prize is currently available. Your 50 points were refunded.");
+              }
+              const wonPowerUp = eligibleWithCapacity[Math.floor(Math.random() * eligibleWithCapacity.length)];
+              inventoryId = await db.purchasePowerUp(player.id, wonPowerUp.id, input.gameId);
+              prizePowerUp = { id: wonPowerUp.id, name: wonPowerUp.name, emoji: wonPowerUp.emoji };
+              resultMessage = `Won ${wonPowerUp.emoji} ${wonPowerUp.name}! It has been added to your inventory.`;
             }
             break;
           case "discount_coupon":
@@ -1604,7 +1913,7 @@ export const appRouter = router({
             resultMessage = selected.description || "Something happened!";
             break;
         }
-        return { outcome: selected, message: resultMessage };
+        return { outcome: selected, message: resultMessage, spinCost: ROULETTE_SPIN_COST, inventoryId, prizePowerUp };
       }),
 
     seedDefaults: protectedProcedure
