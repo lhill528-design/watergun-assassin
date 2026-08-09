@@ -29,7 +29,7 @@ const schemeFromBundleId = `manus${timestamp}`;
 const env = {
   // App branding - update these values directly (do not use env vars)
   appName: "Watergun Assassin",
-  appSlug: "watergun-assassin",
+  appSlug: "watergun-assassin-game",
   // S3 URL of the app logo - set this to the URL returned by generate_image when creating custom logo
   // Leave empty to use the default icon from assets/images/icon.png
   logoUrl: "https://files.manuscdn.com/user_upload_by_module/session_file/310519663820156338/eHVvNVnaFkmzrDGv.png",
@@ -84,6 +84,11 @@ const config: ExpoConfig = {
     bundler: "metro",
     output: "static",
     favicon: "./assets/images/favicon.png",
+  },
+  extra: {
+    eas: {
+      projectId: "420c1c68-9181-4c26-b19f-9f57e7e9376d",
+    },
   },
   plugins: [
     "expo-router",
