@@ -30,6 +30,13 @@ function getParentDomain(hostname: string): string | undefined {
     return undefined;
   }
 
+  // Published Manus Space apps serve their frontend and API from the same
+  // hostname. Keep the cookie host-only: Safari can reject a cookie scoped to
+  // the shared .manus.space parent, and no cross-subdomain sharing is needed.
+  if (hostname.endsWith(".manus.space")) {
+    return undefined;
+  }
+
   // Split hostname into parts
   const parts = hostname.split(".");
 
@@ -54,7 +61,9 @@ export function getSessionCookieOptions(
     domain,
     httpOnly: true,
     path: "/",
-    sameSite: "none",
+    // A published app returns from OAuth in a top-level navigation and then
+    // uses same-origin API calls, so Lax is sufficient and Safari-friendly.
+    sameSite: hostname.endsWith(".manus.space") ? "lax" : "none",
     secure: isSecureRequest(req),
   };
 }

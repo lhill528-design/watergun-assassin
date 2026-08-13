@@ -4,7 +4,7 @@ import * as Auth from "@/lib/_core/auth";
 import * as Linking from "expo-linking";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import { useEffect, useState } from "react";
-import { ActivityIndicator, Text } from "react-native";
+import { ActivityIndicator, Platform, Text } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 
 export default function OAuthCallback() {
@@ -118,9 +118,12 @@ export default function OAuthCallback() {
           // Parse from URL
           try {
             const urlObj = new URL(url);
-            code = urlObj.searchParams.get("code");
-            state = urlObj.searchParams.get("state");
-            sessionToken = urlObj.searchParams.get("sessionToken");
+            // Some iPhone/Safari launch paths preserve OAuth parameters in the
+            // URL fragment instead of the query string. Accept either form.
+            const hashParams = new URLSearchParams(urlObj.hash.replace(/^#\??/, ""));
+            code = urlObj.searchParams.get("code") || hashParams.get("code");
+            state = urlObj.searchParams.get("state") || hashParams.get("state");
+            sessionToken = urlObj.searchParams.get("sessionToken") || hashParams.get("sessionToken");
             console.log("[OAuth] Extracted from URL:", {
               code: code?.substring(0, 20) + "...",
               state: state?.substring(0, 20) + "...",
@@ -169,6 +172,34 @@ export default function OAuthCallback() {
 
         // Otherwise, exchange code for session token
         if (!code || !state) {
+          // Safari can restore an old /oauth/callback tab or Home Screen route
+          // after the server has already exchanged the code and set a cookie.
+          // Check that session before treating the missing one-time parameters
+          // as an authentication failure. If there is no session, return to the
+          // normal sign-in screen instead of trapping the player on this route.
+          if (Platform.OS === "web") {
+            const existingUser = await Api.getMe();
+            if (existingUser) {
+              await Auth.setUserInfo({
+                id: existingUser.id,
+                openId: existingUser.openId,
+                name: existingUser.name,
+                displayName: existingUser.displayName || null,
+                email: existingUser.email,
+                loginMethod: existingUser.loginMethod,
+                lastSignedIn: new Date(existingUser.lastSignedIn || Date.now()),
+                role: (existingUser as any).role || null,
+                isSuperAdmin: (existingUser as any).isSuperAdmin ?? false,
+              });
+              setStatus("success");
+              router.replace("/(tabs)");
+              return;
+            }
+
+            router.replace("/(tabs)");
+            return;
+          }
+
           console.error("[OAuth] Missing code or state parameter", {
             hasCode: !!code,
             hasState: !!state,
