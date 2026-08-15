@@ -2,7 +2,7 @@ import { z } from "zod";
 import { systemRouter } from "./_core/systemRouter";
 import { publicProcedure, protectedProcedure, router } from "./_core/trpc";
 import * as db from "./db";
-import { storagePut } from "./storage";
+import { getCloudinaryUploadSignature } from "./storage";
 import { sendPushToUser, sendPushToUsers, registerPushToken } from "./push-service";
 import { MAP_CLAIM_METERS, MAP_DISCOVERY_METERS, ROULETTE_SPIN_COST, calculateKillAwards, derangedTargetPermutation, distanceMeters, isOpenSeasonSubmissionEligible, openSeasonWindow, pointFiveMilesAway, rouletteBalanceAfterOutcome } from "./power-up-rules";
 
@@ -1386,16 +1386,17 @@ export const appRouter = router({
         return { success: true };
       }),
 
-    uploadVideo: protectedProcedure
-      .input(z.object({ gameId: z.number(), fileName: z.string(), fileBase64: z.string(), contentType: z.string() }))
+  }),
+
+  storage: router({
+    // Client uploads the video straight to Cloudinary using this signature —
+    // the file never passes through our server (avoids the old base64/JSON
+    // upload path's memory and body-size-limit problems for large videos).
+    getEliminationUploadSignature: protectedProcedure
+      .input(z.object({ gameId: z.number() }))
       .mutation(async ({ ctx, input }) => {
         if (!await db.getPlayerInGame(input.gameId, ctx.user.id)) throw new Error("Not in this game");
-        if (!input.contentType.startsWith("video/")) throw new Error("Only video evidence is accepted");
-        const buffer = Buffer.from(input.fileBase64, "base64");
-        if (buffer.length > 100 * 1024 * 1024) throw new Error("Video must be 100 MB or smaller");
-        const key = `eliminations/${input.gameId}/${ctx.user.id}-${Date.now()}-${input.fileName}`;
-        const { url } = await storagePut(key, buffer, input.contentType);
-        return { url };
+        return getCloudinaryUploadSignature(`eliminations/${input.gameId}`);
       }),
   }),
 

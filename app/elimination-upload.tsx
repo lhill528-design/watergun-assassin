@@ -1,4 +1,4 @@
-import { Text, View, TouchableOpacity, Alert, ScrollView, ActivityIndicator } from "react-native";
+import { Text, View, TouchableOpacity, Alert, ScrollView, ActivityIndicator, Platform } from "react-native";
 import { useRouter } from "expo-router";
 import { ScreenContainer } from "@/components/screen-container";
 import { useGame } from "@/lib/game-context";
@@ -9,13 +9,42 @@ import * as ImagePicker from "expo-image-picker";
 
 type SelectedVideo = { uri: string; fileName: string; mimeType: string; duration?: number | null };
 
-function blobToBase64(blob: Blob): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onerror = () => reject(new Error("Could not read the selected video"));
-    reader.onload = () => resolve(String(reader.result).split(",")[1] || "");
-    reader.readAsDataURL(blob);
+type UploadSignature = {
+  cloudName: string;
+  apiKey: string;
+  timestamp: number;
+  folder: string;
+  signature: string;
+};
+
+// Uploads straight to Cloudinary using a server-issued signature — the video
+// never passes through our own API. On native, FormData can stream directly
+// from the file URI instead of loading the whole video into JS memory.
+async function uploadToCloudinary(video: SelectedVideo, signature: UploadSignature): Promise<string> {
+  const formData = new FormData();
+  if (Platform.OS === "web") {
+    const response = await fetch(video.uri);
+    if (!response.ok) throw new Error("Could not open the selected video");
+    formData.append("file", await response.blob(), video.fileName);
+  } else {
+    formData.append("file", { uri: video.uri, name: video.fileName, type: video.mimeType } as any);
+  }
+  formData.append("api_key", signature.apiKey);
+  formData.append("timestamp", String(signature.timestamp));
+  formData.append("signature", signature.signature);
+  formData.append("folder", signature.folder);
+
+  const uploadResp = await fetch(`https://api.cloudinary.com/v1_1/${signature.cloudName}/video/upload`, {
+    method: "POST",
+    body: formData,
   });
+  if (!uploadResp.ok) {
+    const errText = await uploadResp.text().catch(() => "");
+    throw new Error(`Video upload failed${errText ? `: ${errText}` : ""}`);
+  }
+  const uploadJson = (await uploadResp.json()) as { secure_url?: string };
+  if (!uploadJson.secure_url) throw new Error("Cloudinary did not return a video URL");
+  return uploadJson.secure_url;
 }
 
 export default function EliminationUploadScreen() {
@@ -29,7 +58,7 @@ export default function EliminationUploadScreen() {
 
   const playerQuery = trpc.player.me.useQuery({ gameId: activeGameId! }, { enabled: !!activeGameId && isAuthenticated });
   const playersQuery = trpc.player.list.useQuery({ gameId: activeGameId! }, { enabled: !!activeGameId && isAuthenticated });
-  const uploadMutation = trpc.elimination.uploadVideo.useMutation();
+  const uploadSignatureMutation = trpc.storage.getEliminationUploadSignature.useMutation();
   const submitMutation = trpc.elimination.submit.useMutation({
     onSuccess: () => { setSubmitted(true); Alert.alert("Submitted!", "Your elimination video was uploaded and sent for admin review."); },
     onError: (error) => Alert.alert("Could not submit", error.message),
@@ -54,11 +83,9 @@ export default function EliminationUploadScreen() {
     if (!activeGameId || !selectedPlayerId || !video) return;
     setUploading(true);
     try {
-      const response = await fetch(video.uri);
-      if (!response.ok) throw new Error("Could not open the selected video");
-      const fileBase64 = await blobToBase64(await response.blob());
-      const uploaded = await uploadMutation.mutateAsync({ gameId: activeGameId, fileName: video.fileName, fileBase64, contentType: video.mimeType });
-      await submitMutation.mutateAsync({ gameId: activeGameId, eliminatedId: selectedPlayerId, videoUrl: uploaded.url });
+      const signature = await uploadSignatureMutation.mutateAsync({ gameId: activeGameId });
+      const videoUrl = await uploadToCloudinary(video, signature);
+      await submitMutation.mutateAsync({ gameId: activeGameId, eliminatedId: selectedPlayerId, videoUrl });
     } catch (error) {
       Alert.alert("Upload failed", error instanceof Error ? error.message : "Please try again");
     } finally {
