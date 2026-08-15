@@ -42,11 +42,12 @@ export default function HomeScreen() {
   );
   const playerQuery = trpc.player.me.useQuery(
     { gameId: activeGameId! },
-    { enabled: !!activeGameId && isAuthenticated }
+    { enabled: !!activeGameId && isAuthenticated, refetchInterval: 15_000 }
   );
 
   const game = gameQuery.data;
   const player = playerQuery.data;
+  const targetProtection = player?.targetProtectionBadge;
 
   if (!isAuthenticated) {
     return (
@@ -138,7 +139,23 @@ export default function HomeScreen() {
           <Text className="text-xs text-primary uppercase tracking-wider mb-1">🎯 Your Target</Text>
           {player?.targetId ? (
             <View>
-              <Text className="text-foreground text-xl font-bold">{player.targetName || `Player #${player.targetId}`}</Text>
+              <View className="flex-row items-center gap-2 flex-wrap">
+                <Text className="text-foreground text-xl font-bold">{player.targetName || `Player #${player.targetId}`}</Text>
+                {targetProtection && (
+                  <View className="bg-primary/20 border border-primary rounded-full px-2 py-1">
+                    <Text className="text-primary text-xs font-bold">🛡️ {targetProtection.label}</Text>
+                  </View>
+                )}
+              </View>
+              {targetProtection && (
+                <View className={`rounded-lg p-3 mt-2 border ${targetProtection.paused ? "bg-warning/10 border-warning" : "bg-primary/10 border-primary"}`}>
+                  <Text className={targetProtection.paused ? "text-warning text-xs font-bold" : "text-primary text-xs font-bold"}>
+                    {targetProtection.paused
+                      ? "Protection is paused during the current Purge."
+                      : `PROTECTED — ${targetProtection.label} is currently active. Do not submit an elimination.`}
+                  </Text>
+                </View>
+              )}
               <TouchableOpacity
                 className="bg-primary/20 px-4 py-2 rounded-lg mt-2 self-start"
                 onPress={() => router.push("/(tabs)/map" as any)}

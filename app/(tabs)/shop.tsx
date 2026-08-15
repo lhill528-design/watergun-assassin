@@ -42,7 +42,7 @@ export default function ShopScreen() {
   );
   const reconQuery = trpc.player.reconTarget.useQuery(
     { gameId: activeGameId! },
-    { enabled: !!activeGameId && isAuthenticated }
+    { enabled: !!activeGameId && isAuthenticated, refetchOnMount: true }
   );
   const playerQuery = trpc.player.me.useQuery(
     { gameId: activeGameId! },
@@ -65,10 +65,20 @@ export default function ShopScreen() {
     onError: (err) => Alert.alert("Error", err.message),
   });
   const activateMutation = trpc.powerUp.activate.useMutation({
-    onSuccess: () => {
+    onSuccess: async (_result, variables) => {
+      const activatedName = inventoryQuery.data?.find(item => item.id === variables.inventoryId)?.powerUp?.name;
       inventoryQuery.refetch();
       playerQuery.refetch();
       playersQuery.refetch();
+      const reconResult = await reconQuery.refetch();
+      if (activatedName === "Recon" && reconResult.data) {
+        const report = reconResult.data;
+        const powerUps = report.activePowerUps.length
+          ? report.activePowerUps.map((p: any) => `${p.emoji || "⚡"} ${p.name || "Power-up"} (${p.status === "inventory" ? "unused" : p.status === "pending_payment" ? "awaiting fee" : p.status})`).join("\n")
+          : "No active or unused power-ups.";
+        Alert.alert(`Recon: ${report.targetName}`, `Points: ${report.points}\n\nActive & unused power-ups:\n${powerUps}`);
+        return;
+      }
       Alert.alert("Activated!", "The power-up is now in effect. Any cash fee was added to the admin's collection queue.");
     },
     onError: (err) => Alert.alert("Unable to activate", err.message),
@@ -223,17 +233,17 @@ export default function ShopScreen() {
           </View>
         )}
 
-        {/* Recon intel on your target, while active */}
+        {/* Recon is a one-use snapshot saved until the current round ends. */}
         {reconQuery.data && (
           <View className="bg-primary/10 border border-primary rounded-xl p-3 mb-4">
             <Text className="text-primary font-bold text-sm mb-1">🔍 Recon: {reconQuery.data.targetName}</Text>
             <Text className="text-foreground text-sm">Balance: {reconQuery.data.points} pts</Text>
             {reconQuery.data.activePowerUps.length > 0 ? (
               <Text className="text-muted text-xs mt-1">
-                Power-ups: {reconQuery.data.activePowerUps.map((p: any) => `${p.emoji} ${p.name} (${p.status})`).join(", ")}
+                Active & unused power-ups: {reconQuery.data.activePowerUps.map((p: any) => `${p.emoji || "⚡"} ${p.name || "Power-up"} (${p.status === "inventory" ? "unused" : p.status === "pending_payment" ? "awaiting fee" : p.status})`).join(", ")}
               </Text>
             ) : (
-              <Text className="text-muted text-xs mt-1">No active power-ups.</Text>
+              <Text className="text-muted text-xs mt-1">No active or unused power-ups.</Text>
             )}
           </View>
         )}

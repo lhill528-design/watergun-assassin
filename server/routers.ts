@@ -11,8 +11,9 @@ import { MAP_CLAIM_METERS, MAP_DISCOVERY_METERS, ROULETTE_SPIN_COST, calculateKi
 async function addProtectionBadges<T extends { id: number }>(players: T[]) {
   return Promise.all(players.map(async player => {
     const inventory = await db.getPlayerPowerUps(player.id);
-    const shield = inventory.find(item => item.powerUp?.name === "Immunity Shield" && item.status === "active" && item.isActive);
-    const untouchable = inventory.find(item => item.powerUp?.name === "Untouchable" && item.status === "active");
+    const isCurrent = (item: (typeof inventory)[number]) => item.status === "active" && (!item.expiresAt || item.expiresAt.getTime() > Date.now());
+    const shield = inventory.find(item => item.powerUp?.name === "Immunity Shield" && isCurrent(item) && item.isActive);
+    const untouchable = inventory.find(item => item.powerUp?.name === "Untouchable" && isCurrent(item));
     const protectionBadge = shield
       ? { type: "immunity_shield" as const, label: "Shielded", expiresAt: shield.expiresAt, paused: false }
       : untouchable
@@ -401,17 +402,20 @@ export const appRouter = router({
         const targetName = target
           ? target.user?.displayName?.trim() || target.user?.name?.trim() || `Player #${target.userId}`
           : null;
-        return { ...player, targetName };
+        const [targetWithProtection] = target ? await addProtectionBadges([target]) : [];
+        return { ...player, targetName, targetProtectionBadge: targetWithProtection?.protectionBadge ?? null };
       }),
 
     reconTarget: protectedProcedure
       .input(z.object({ gameId: z.number() }))
       .query(async ({ ctx, input }) => {
         const viewer = await db.getPlayerInGame(input.gameId, ctx.user.id);
-        if (!viewer || !viewer.targetId) return null;
+        if (!viewer) return null;
         const inventory = await db.getPlayerPowerUps(viewer.id);
         const currentGame = await db.getGame(input.gameId);
-        const recon = [...inventory].reverse().find(item => item.powerUp?.name === "Recon" && (item.activationData as any)?.reportRound === currentGame?.currentRound);
+        const recon = inventory
+          .filter(item => item.powerUp?.name === "Recon" && (item.activationData as any)?.reportRound === currentGame?.currentRound)
+          .sort((a, b) => b.id - a.id)[0];
         const report = recon?.activationData as any;
         if (!recon || !report) return null;
         const players = await db.getGamePlayers(input.gameId);
@@ -419,8 +423,8 @@ export const appRouter = router({
         if (!target) return null;
         return {
           targetName: target.user?.displayName || target.user?.name || `Player #${target.userId}`,
-          points: report.targetPoints || 0,
-          activePowerUps: report.inventory || [],
+          points: Number.isFinite(Number(report.targetPoints)) ? Number(report.targetPoints) : 0,
+          activePowerUps: Array.isArray(report.inventory) ? report.inventory : [],
           expiresAt: null,
         };
       }),
@@ -921,7 +925,9 @@ export const appRouter = router({
               reportRound: game?.currentRound || 0,
               targetPlayerId: target.id,
               targetPoints: target.points || 0,
-              inventory: inventory.filter(candidate => candidate.status === "inventory" || candidate.status === "active").map(candidate => ({ name: candidate.powerUp?.name, emoji: candidate.powerUp?.emoji, status: candidate.status, expiresAt: candidate.expiresAt?.toISOString() || null })),
+              inventory: inventory
+                .filter(candidate => ["inventory", "pending_payment", "active"].includes(candidate.status))
+                .map(candidate => ({ name: candidate.powerUp?.name, emoji: candidate.powerUp?.emoji, status: candidate.status, expiresAt: candidate.expiresAt?.toISOString() || null })),
             };
             break;
           }
