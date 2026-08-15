@@ -2,11 +2,26 @@ import "dotenv/config";
 import express from "express";
 import { createServer } from "http";
 import net from "net";
-import path from "path";
-import { existsSync } from "fs";
 import { createExpressMiddleware } from "@trpc/server/adapters/express";
 import { appRouter } from "../routers";
 import { createContext } from "./context";
+import { ENV } from "./env";
+
+// CORS only matters for browser requests (native app fetch calls don't send
+// an Origin header, so this doesn't affect Android/iOS builds either way).
+// Localhost dev ports + any Vercel deployment (prod or preview) are allowed
+// by default; CORS_ALLOWED_ORIGINS adds any custom domain on top.
+const DEV_ORIGINS = ["http://localhost:8081", "http://localhost:19006", "http://localhost:3000"];
+
+function isAllowedOrigin(origin: string): boolean {
+  if (!ENV.isProduction && DEV_ORIGINS.includes(origin)) return true;
+  if (origin.endsWith(".vercel.app")) return true;
+  const extra = (process.env.CORS_ALLOWED_ORIGINS ?? "")
+    .split(",")
+    .map((o) => o.trim())
+    .filter(Boolean);
+  return extra.includes(origin);
+}
 
 function isPortAvailable(port: number): Promise<boolean> {
   return new Promise((resolve) => {
@@ -31,10 +46,10 @@ async function startServer() {
   const app = express();
   const server = createServer(app);
 
-  // Enable CORS for all routes - reflect the request origin to support credentials
+  // CORS: only echo back the origin if it's on the allowlist above.
   app.use((req, res, next) => {
     const origin = req.headers.origin;
-    if (origin) {
+    if (origin && isAllowedOrigin(origin)) {
       res.header("Access-Control-Allow-Origin", origin);
     }
     res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
@@ -66,16 +81,6 @@ async function startServer() {
       createContext,
     }),
   );
-
-  const webBuildDir = path.resolve(process.cwd(), "dist", "client");
-  const webIndexPath = path.join(webBuildDir, "index.html");
-  if (existsSync(webIndexPath)) {
-    app.use(express.static(webBuildDir));
-    app.get("*", (req, res, next) => {
-      if (req.path.startsWith("/api/")) return next();
-      res.sendFile(webIndexPath);
-    });
-  }
 
   const preferredPort = parseInt(process.env.PORT || "3000");
   const port = await findAvailablePort(preferredPort);
