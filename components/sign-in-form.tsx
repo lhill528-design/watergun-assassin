@@ -1,6 +1,11 @@
 import { useCallback, useState } from "react";
 import { ActivityIndicator, Text, TextInput, TouchableOpacity, View } from "react-native";
-import { useSignIn, useSignUp } from "@clerk/clerk-expo";
+// @clerk/expo re-exports the new signals-based useSignIn/useSignUp (a
+// different shape). This custom flow is written against Clerk's classic,
+// long-documented custom-flow API, so pull those from the explicit legacy
+// entry point instead — same underlying ClerkProvider/context, just the
+// familiar { isLoaded, signIn, setActive } shape.
+import { useSignIn, useSignUp } from "@clerk/react/legacy";
 
 type Step = "email" | "code";
 type Mode = "sign-in" | "sign-up";

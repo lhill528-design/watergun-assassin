@@ -1,4 +1,4 @@
-import { useAuth as useClerkAuth } from "@clerk/clerk-expo";
+import { useAuth as useClerkAuth } from "@clerk/expo";
 import { useCallback } from "react";
 import { trpc } from "@/lib/trpc";
 

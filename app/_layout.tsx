@@ -1,6 +1,7 @@
 import "@/global.css";
 import "@/lib/background-tasks";
-import { ClerkProvider, useAuth as useClerkAuth } from "@clerk/clerk-expo";
+import { ClerkProvider, useAuth as useClerkAuth } from "@clerk/expo";
+import { tokenCache as clerkTokenCache } from "@clerk/expo/token-cache";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { Stack } from "expo-router";
 import { StatusBar } from "expo-status-bar";
@@ -23,7 +24,6 @@ import { GameProvider } from "@/lib/game-context";
 import { initManusRuntime, subscribeSafeAreaInsets } from "@/lib/_core/manus-runtime";
 import { usePushRegistration } from "@/lib/use-push-registration";
 import { useAuth } from "@/hooks/use-auth";
-import { clerkTokenCache } from "@/lib/clerk-token-cache";
 
 const CLERK_PUBLISHABLE_KEY = process.env.EXPO_PUBLIC_CLERK_PUBLISHABLE_KEY ?? "";
 
