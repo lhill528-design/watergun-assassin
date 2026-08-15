@@ -1,1 +1,0 @@
-ALTER TABLE `game_players` ADD `pendingDiscountPercent` int;

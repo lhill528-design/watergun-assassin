@@ -2,8 +2,7 @@ import { createTRPCReact } from "@trpc/react-query";
 import { httpBatchLink } from "@trpc/client";
 import superjson from "superjson";
 import type { AppRouter } from "@/server/routers";
-import { getApiBaseUrl } from "@/constants/oauth";
-import * as Auth from "@/lib/_core/auth";
+import { getApiBaseUrl } from "@/constants/api";
 
 /**
  * tRPC React client for type-safe API calls.
@@ -15,10 +14,12 @@ import * as Auth from "@/lib/_core/auth";
 export const trpc = createTRPCReact<AppRouter>();
 
 /**
- * Creates the tRPC client with proper configuration.
- * Call this once in your app's root layout.
+ * Creates the tRPC client. `getToken` is Clerk's `useAuth().getToken` —
+ * called fresh on every request so the Authorization header always carries
+ * a valid session token, on both native and web (no cookies involved, so
+ * this works the same across the Vercel/Railway origin split).
  */
-export function createTRPCClient() {
+export function createTRPCClient(getToken: () => Promise<string | null>) {
   return trpc.createClient({
     links: [
       httpBatchLink({
@@ -26,15 +27,8 @@ export function createTRPCClient() {
         // tRPC v11: transformer MUST be inside httpBatchLink, not at root
         transformer: superjson,
         async headers() {
-          const token = await Auth.getSessionToken();
+          const token = await getToken();
           return token ? { Authorization: `Bearer ${token}` } : {};
-        },
-        // Custom fetch to include credentials for cookie-based auth
-        fetch(url, options) {
-          return fetch(url, {
-            ...options,
-            credentials: "include",
-          });
         },
       }),
     ],

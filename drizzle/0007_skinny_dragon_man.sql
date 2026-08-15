@@ -1,1 +1,0 @@
-ALTER TABLE `users` ADD `displayName` varchar(50);

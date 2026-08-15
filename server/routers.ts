@@ -1,6 +1,4 @@
 import { z } from "zod";
-import { COOKIE_NAME } from "../shared/const.js";
-import { getSessionCookieOptions } from "./_core/cookies";
 import { systemRouter } from "./_core/systemRouter";
 import { publicProcedure, protectedProcedure, router } from "./_core/trpc";
 import * as db from "./db";
@@ -27,11 +25,6 @@ export const appRouter = router({
   system: systemRouter,
   auth: router({
     me: publicProcedure.query((opts) => opts.ctx.user),
-    logout: publicProcedure.mutation(({ ctx }) => {
-      const cookieOptions = getSessionCookieOptions(ctx.req);
-      ctx.res.clearCookie(COOKIE_NAME, { ...cookieOptions, maxAge: -1 });
-      return { success: true } as const;
-    }),
     registerPushToken: protectedProcedure
       .input(z.object({ token: z.string(), platform: z.string().default("expo") }))
       .mutation(async ({ ctx, input }) => {

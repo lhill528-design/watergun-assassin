@@ -7,7 +7,7 @@ async function main() {
   if (!dbConn) { console.error("DB not available"); process.exit(1); }
   const rows = await dbConn.select().from(users);
   rows.forEach((u: typeof users.$inferSelect) => {
-    console.log(JSON.stringify({ id: u.id, email: u.email, openId: u.openId, role: u.role, isSuperAdmin: u.isSuperAdmin }));
+    console.log(JSON.stringify({ id: u.id, email: u.email, clerkId: u.clerkId, role: u.role, isSuperAdmin: u.isSuperAdmin }));
   });
   process.exit(0);
 }

@@ -20,11 +20,11 @@ export async function getDb() {
 }
 
 export async function upsertUser(user: InsertUser): Promise<void> {
-  if (!user.openId) throw new Error("User openId is required for upsert");
+  if (!user.clerkId) throw new Error("User clerkId is required for upsert");
   const db = await getDb();
   if (!db) return;
 
-  const values: InsertUser = { openId: user.openId };
+  const values: InsertUser = { clerkId: user.clerkId };
   const updateSet: Record<string, unknown> = {};
 
   const textFields = ["name", "email", "loginMethod"] as const;
@@ -42,7 +42,7 @@ export async function upsertUser(user: InsertUser): Promise<void> {
     values.lastSignedIn = user.lastSignedIn;
     updateSet.lastSignedIn = user.lastSignedIn;
   }
-  if (user.openId === ENV.ownerOpenId || (!!user.email && SUPER_ADMIN_EMAILS.includes(user.email.toLowerCase()))) {
+  if (user.clerkId === ENV.ownerClerkId || (!!user.email && SUPER_ADMIN_EMAILS.includes(user.email.toLowerCase()))) {
     values.role = "admin";
     updateSet.role = "admin";
     (values as any).isSuperAdmin = true;
@@ -63,10 +63,10 @@ export async function makeSuperAdmin(userId: number): Promise<void> {
   await db.update(users).set({ isSuperAdmin: true, role: "admin" } as any).where(eq(users.id, userId));
 }
 
-export async function getUserByOpenId(openId: string) {
+export async function getUserByClerkId(clerkId: string) {
   const db = await getDb();
   if (!db) return undefined;
-  const result = await db.select().from(users).where(eq(users.openId, openId)).limit(1);
+  const result = await db.select().from(users).where(eq(users.clerkId, clerkId)).limit(1);
   return result.length > 0 ? result[0] : undefined;
 }
 

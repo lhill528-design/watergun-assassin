@@ -1,11 +1,11 @@
 import { ScrollView, Text, View, TouchableOpacity, Image } from "react-native";
 import { useRouter } from "expo-router";
 import { ScreenContainer } from "@/components/screen-container";
+import { SignInForm } from "@/components/sign-in-form";
 import { useAuth } from "@/hooks/use-auth";
 import { useGame } from "@/lib/game-context";
 import { trpc } from "@/lib/trpc";
 import { useEffect, useState } from "react";
-import { startOAuthLogin } from "@/constants/oauth";
 
 function CountdownTimer({ endTime, label, color }: { endTime: string | null; label: string; color: string }) {
   const [timeLeft, setTimeLeft] = useState("");
@@ -56,12 +56,9 @@ export default function HomeScreen() {
           <Image source={require("@/assets/images/icon.png")} style={{ width: 120, height: 120, borderRadius: 20 }} />
           <Text className="text-3xl font-bold text-foreground text-center">WATERGUN{"\n"}ASSASSIN</Text>
           <Text className="text-base text-muted text-center">Silent. Soak. Survive.</Text>
-          <TouchableOpacity
-            className="bg-primary px-8 py-4 rounded-full mt-4"
-            onPress={() => startOAuthLogin()}
-          >
-            <Text className="text-background font-bold text-lg">Sign In to Play</Text>
-          </TouchableOpacity>
+          <View className="w-full max-w-sm mt-4">
+            <SignInForm />
+          </View>
         </View>
       </ScreenContainer>
     );

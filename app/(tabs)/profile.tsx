@@ -2,7 +2,6 @@ import { Text, View, ScrollView, TouchableOpacity, Alert, TextInput } from "reac
 import { useRouter } from "expo-router";
 import { ScreenContainer } from "@/components/screen-container";
 import { useAuth } from "@/hooks/use-auth";
-import * as Auth from "@/lib/_core/auth";
 import { useGame } from "@/lib/game-context";
 import { trpc } from "@/lib/trpc";
 import { useEffect, useState } from "react";
@@ -34,9 +33,6 @@ export default function ProfileScreen() {
   const updateDisplayNameMutation = trpc.auth.updateDisplayName.useMutation({
     onSuccess: async (result) => {
       const savedDisplayName = result.displayName;
-      if (user) {
-        await Auth.setUserInfo({ ...user, displayName: savedDisplayName });
-      }
       setDisplayName(savedDisplayName || "");
       await refresh();
       Alert.alert(
