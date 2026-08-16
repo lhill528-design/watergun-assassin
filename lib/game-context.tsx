@@ -8,12 +8,15 @@ import {
   stopBackgroundLocationTracking,
 } from "./location-service";
 
-// EXPO_PUBLIC_API_URL was never a real configured variable -- every build
-// (Railway/Vercel/EAS) only ever sets EXPO_PUBLIC_API_BASE_URL (see
-// constants/api.ts), so this always fell through to the "http://localhost:3000"
-// fallback in every production build. On native that means background
-// location updates (see lib/background-tasks.ts) were POSTing to
-// localhost on the player's own phone, not the real backend.
+// EXPO_PUBLIC_API_URL isn't this app's documented API-base-URL variable --
+// every other reference (constants/api.ts, .env.example, README, Railway,
+// Vercel) uses EXPO_PUBLIC_API_BASE_URL. It was previously configured as
+// its own separate value in EAS specifically, so it wasn't necessarily
+// unset in every build, but having two independently-configured names for
+// what should be the same URL meant they could silently diverge whenever
+// only one was updated. Standardized on the one documented variable so
+// there's a single source of truth for the value background location
+// updates (see lib/background-tasks.ts) get sent to.
 const API_URL = getApiBaseUrl();
 
 interface GameContextType {
