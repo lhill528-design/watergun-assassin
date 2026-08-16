@@ -3,12 +3,27 @@ const { withNativeWind } = require("nativewind/metro");
 const path = require("path");
 const config = getDefaultConfig(__dirname);
 
-// Alias react-native-maps to a no-op stub on web to prevent crash
 config.resolver = config.resolver || {};
 config.resolver.resolveRequest = (context, moduleName, platform) => {
   if (platform === "web" && moduleName === "react-native-maps") {
     return {
       filePath: path.resolve(__dirname, "lib/react-native-maps-web-stub.js"),
+      type: "sourceFile",
+    };
+  }
+  // Force the CJS build of @clerk/react's legacy entry point on web. Its
+  // ESM (.mjs) build transitively pulls in @clerk/shared's raw
+  // `import.meta.env` reference, which is a hard SyntaxError once bundled
+  // into a non-`type="module"` script (Metro's web export output isn't a
+  // module). The .cjs file's own internal requires resolve as CJS too, so
+  // this doesn't just move the problem one hop down the tree.
+  if (platform === "web" && moduleName === "@clerk/react/legacy") {
+    // require.resolve() on a deep path is blocked by the package's own
+    // exports map (same restriction that caused the problem in the first
+    // place) -- so derive the dist/ dir from the main entry instead.
+    const distDir = path.dirname(require.resolve("@clerk/react"));
+    return {
+      filePath: path.join(distDir, "legacy.cjs"),
       type: "sourceFile",
     };
   }
