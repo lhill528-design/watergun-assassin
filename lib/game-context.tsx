@@ -1,13 +1,20 @@
 import React, { createContext, useContext, useState, useEffect } from "react";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { Platform } from "react-native";
+import { getApiBaseUrl } from "@/constants/api";
 import {
   requestLocationPermissions,
   startBackgroundLocationTracking,
   stopBackgroundLocationTracking,
 } from "./location-service";
 
-const API_URL = process.env.EXPO_PUBLIC_API_URL || "http://localhost:3000";
+// EXPO_PUBLIC_API_URL was never a real configured variable -- every build
+// (Railway/Vercel/EAS) only ever sets EXPO_PUBLIC_API_BASE_URL (see
+// constants/api.ts), so this always fell through to the "http://localhost:3000"
+// fallback in every production build. On native that means background
+// location updates (see lib/background-tasks.ts) were POSTing to
+// localhost on the player's own phone, not the real backend.
+const API_URL = getApiBaseUrl();
 
 interface GameContextType {
   activeGameId: number | null;
