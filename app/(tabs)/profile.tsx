@@ -1,6 +1,7 @@
 import { Text, View, ScrollView, TouchableOpacity, Alert, TextInput } from "react-native";
 import { useRouter } from "expo-router";
 import { ScreenContainer } from "@/components/screen-container";
+import { SignInForm } from "@/components/sign-in-form";
 import { useAuth } from "@/hooks/use-auth";
 import { useGame } from "@/lib/game-context";
 import { trpc } from "@/lib/trpc";
@@ -63,12 +64,9 @@ export default function ProfileScreen() {
         <View className="flex-1 items-center justify-center gap-4">
           <Text className="text-4xl">👤</Text>
           <Text className="text-foreground text-xl font-bold">Sign In Required</Text>
-          <TouchableOpacity
-            className="bg-primary px-8 py-3 rounded-full"
-            onPress={() => router.push("/oauth/callback" as any)}
-          >
-            <Text className="text-background font-bold">Sign In</Text>
-          </TouchableOpacity>
+          <View className="w-full max-w-sm mt-2">
+            <SignInForm />
+          </View>
         </View>
       </ScreenContainer>
     );

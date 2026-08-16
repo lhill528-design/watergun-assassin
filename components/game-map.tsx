@@ -78,6 +78,11 @@ function loadLeaflet(): Promise<any> {
     script.setAttribute("data-leaflet-js", "true");
     script.onload = () => resolve((window as any).L);
     script.onerror = () => {
+      // Remove the failed tag so a later mount finds no `data-leaflet-js`
+      // element and issues a fresh request, instead of every future map
+      // seeing this dead script and waiting on a load event that will
+      // never fire.
+      script.remove();
       leafletPromise = null;
       reject(new Error("Failed to load Leaflet"));
     };
@@ -129,11 +134,18 @@ export function GameMap({ myLocation, pins, purgeActive = false, onMapPress, zon
         const node = containerRef.current as unknown as HTMLElement | null;
         if (!node) return;
 
-        const map = L.map(node, { zoomControl: true, attributionControl: false }).setView(
+        const map = L.map(node, { zoomControl: true, attributionControl: true }).setView(
           myLocation ? [myLocation.latitude, myLocation.longitude] : DEFAULT_CENTER,
           myLocation ? 14 : 10,
         );
-        L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", { maxZoom: 19 }).addTo(map);
+        // OSM's tile usage policy (https://operations.osmfoundation.org/policies/tiles/)
+        // requires the single tile.openstreetmap.org host (no {s} subdomain
+        // sharding) and a visible, linked attribution -- both required, not
+        // optional, to keep using their tile server.
+        L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+          maxZoom: 19,
+          attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+        }).addTo(map);
 
         markersLayerRef.current = L.layerGroup().addTo(map);
         zonesLayerRef.current = L.layerGroup().addTo(map);
