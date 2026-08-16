@@ -2,9 +2,29 @@ import { z } from "zod";
 import { systemRouter } from "./_core/systemRouter";
 import { publicProcedure, protectedProcedure, router } from "./_core/trpc";
 import * as db from "./db";
-import { getCloudinaryUploadSignature } from "./storage";
+import { getCloudinaryUploadSignature, isValidEliminationVideoUrl } from "./storage";
 import { sendPushToUser, sendPushToUsers, registerPushToken } from "./push-service";
 import { MAP_CLAIM_METERS, MAP_DISCOVERY_METERS, ROULETTE_SPIN_COST, calculateKillAwards, derangedTargetPermutation, distanceMeters, isOpenSeasonSubmissionEligible, openSeasonWindow, pointFiveMilesAway, rouletteBalanceAfterOutcome } from "./power-up-rules";
+
+// Cloudinary signed uploads have no built-in per-user rate limit, so a
+// compromised/malicious client could otherwise mint unlimited signatures
+// and spam our storage quota. In-memory sliding window is fine here since
+// this runs as a single Railway service instance (not horizontally scaled).
+const UPLOAD_SIGNATURE_LIMIT = 8;
+const UPLOAD_SIGNATURE_WINDOW_MS = 10 * 60 * 1000;
+const uploadSignatureRequests = new Map<number, number[]>();
+
+function checkUploadSignatureRateLimit(userId: number) {
+  const now = Date.now();
+  const recent = (uploadSignatureRequests.get(userId) ?? []).filter(
+    (t) => now - t < UPLOAD_SIGNATURE_WINDOW_MS,
+  );
+  if (recent.length >= UPLOAD_SIGNATURE_LIMIT) {
+    throw new Error("Too many upload attempts. Wait a few minutes and try again.");
+  }
+  recent.push(now);
+  uploadSignatureRequests.set(userId, recent);
+}
 
 async function addProtectionBadges<T extends { id: number }>(players: T[]) {
   return Promise.all(players.map(async player => {
@@ -1156,6 +1176,7 @@ export const appRouter = router({
         const eliminated = await db.getPlayerById(input.eliminatedId);
         if (!game || !eliminated || eliminated.gameId !== input.gameId || eliminated.status !== "alive" || eliminated.id === player.id) throw new Error("Choose another alive player");
         if (!input.videoUrl || input.videoUrl === "pending-upload") throw new Error("Upload the elimination video before submitting");
+        if (!isValidEliminationVideoUrl(input.videoUrl, input.gameId)) throw new Error("Video URL is invalid or wasn't uploaded through this app");
         await db.expirePlayerPowerUps(input.gameId);
         const vendetta = await db.getActivePowerUpByName(player.id, "Vendetta");
         const openSeason = (await db.getActiveGamePowerUpsByName(input.gameId, "Open Season")).some(holder => {
@@ -1396,6 +1417,7 @@ export const appRouter = router({
       .input(z.object({ gameId: z.number() }))
       .mutation(async ({ ctx, input }) => {
         if (!await db.getPlayerInGame(input.gameId, ctx.user.id)) throw new Error("Not in this game");
+        checkUploadSignatureRateLimit(ctx.user.id);
         return getCloudinaryUploadSignature(`eliminations/${input.gameId}`);
       }),
   }),

@@ -14,8 +14,12 @@ type UploadSignature = {
   apiKey: string;
   timestamp: number;
   folder: string;
+  allowedFormats: string;
   signature: string;
 };
+
+const MAX_VIDEO_BYTES = 200 * 1024 * 1024; // 200MB
+const MAX_VIDEO_SECONDS = 180;
 
 // Uploads straight to Cloudinary using a server-issued signature — the video
 // never passes through our own API. On native, FormData can stream directly
@@ -33,6 +37,7 @@ async function uploadToCloudinary(video: SelectedVideo, signature: UploadSignatu
   formData.append("timestamp", String(signature.timestamp));
   formData.append("signature", signature.signature);
   formData.append("folder", signature.folder);
+  formData.append("allowed_formats", signature.allowedFormats);
 
   const uploadResp = await fetch(`https://api.cloudinary.com/v1_1/${signature.cloudName}/video/upload`, {
     method: "POST",
@@ -76,6 +81,14 @@ export default function EliminationUploadScreen() {
       : await ImagePicker.launchImageLibraryAsync({ mediaTypes: ["videos"], quality: 0.7 });
     if (result.canceled || !result.assets[0]) return;
     const asset = result.assets[0];
+    // Best-effort abuse guard -- fileSize/duration aren't populated on every
+    // platform, so this only rejects when the picker actually reports them.
+    if (asset.fileSize && asset.fileSize > MAX_VIDEO_BYTES) {
+      return Alert.alert("Video too large", "Please choose a video under 200MB.");
+    }
+    if (asset.duration && asset.duration / 1000 > MAX_VIDEO_SECONDS) {
+      return Alert.alert("Video too long", `Please choose a video under ${MAX_VIDEO_SECONDS / 60} minutes.`);
+    }
     setVideo({ uri: asset.uri, fileName: asset.fileName || `elimination-${Date.now()}.mp4`, mimeType: asset.mimeType || "video/mp4", duration: asset.duration });
   };
 
