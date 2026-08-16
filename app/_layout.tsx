@@ -83,11 +83,14 @@ export default function RootLayout() {
   // measurement exists there -- see react-native-safe-area-context's
   // InitialWindow.ts vs InitialWindow.native.ts). Passing no initialMetrics
   // in that case lets SafeAreaProvider's own web implementation measure the
-  // live document and keep responding to resizes/orientation changes,
-  // instead of being pinned to a fabricated 0x0 frame forever.
+  // live document on mount, instead of being pinned to a fabricated 0x0
+  // frame forever. Note that measurement only happens once per mount --
+  // it does not re-run on an in-place window resize/orientation change
+  // without a remount (a react-native-safe-area-context web limitation,
+  // not something this app controls).
   //
   // On native, initialWindowMetrics is populated before first render, so
-  // boost its real insets with a minimum 8px/12px top/bottom to avoid a
+  // boost its real insets with a minimum 16px/12px top/bottom to avoid a
   // first-paint flash on devices whose reported insets are smaller than
   // that; SafeAreaProvider still keeps measuring and updates from there.
   const providerInitialMetrics = initialWindowMetrics
