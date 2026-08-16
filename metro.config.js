@@ -5,12 +5,6 @@ const config = getDefaultConfig(__dirname);
 
 config.resolver = config.resolver || {};
 config.resolver.resolveRequest = (context, moduleName, platform) => {
-  if (platform === "web" && moduleName === "react-native-maps") {
-    return {
-      filePath: path.resolve(__dirname, "lib/react-native-maps-web-stub.js"),
-      type: "sourceFile",
-    };
-  }
   // Force the CJS build of @clerk/react's legacy entry point (reached via
   // @clerk/expo/legacy, which requires it internally) on every platform.
   // Its ESM (.mjs) build transitively pulls in @clerk/shared's raw
