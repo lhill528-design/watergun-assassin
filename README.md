@@ -168,4 +168,4 @@ Tests currently cover `server/power-up-rules.ts` (pure game-rule math),
 | Requests fail with 401 everywhere | `CLERK_SECRET_KEY` misconfigured, or `EXPO_PUBLIC_CLERK_PUBLISHABLE_KEY` is for a different Clerk instance |
 | Browser requests blocked by CORS in production | Add the origin to `CORS_ALLOWED_ORIGINS` on Railway |
 | Elimination upload rejected after a successful Cloudinary upload | `isValidEliminationVideoUrl` — check the URL matches `https://res.cloudinary.com/<CLOUDINARY_CLOUD_NAME>/video/upload/.../eliminations/<gameId>/...` |
-| `pnpm check` fails after a schema change | Re-run `pnpm db:push` so `drizzle/schema.ts`'s inferred types match |
+| `pnpm check` fails after a schema change | Fix the schema/query/application code itself -- `pnpm db:push` changes the live database and isn't a type-error fix. Generate and review the migration separately (`drizzle-kit generate`) before applying it |
