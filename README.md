@@ -78,10 +78,10 @@ reads it). At a glance:
 |---|---|---|
 | `DATABASE_URL` | Railway | TiDB Cloud connection string |
 | `CLERK_SECRET_KEY` | Railway | Verifies session tokens server-side |
-| `EXPO_PUBLIC_CLERK_PUBLISHABLE_KEY` | Vercel (build-time) + native builds | Clerk client SDK |
+| `EXPO_PUBLIC_CLERK_PUBLISHABLE_KEY` | Vercel (build-time) + EAS (build-time) | Clerk client SDK |
 | `OWNER_CLERK_ID` | Railway | Optional: force a specific Clerk user to super-admin |
 | `CLERK_AUTHORIZED_PARTIES` | Railway | Optional `azp` claim allowlist (see `server/_core/context.ts`) |
-| `EXPO_PUBLIC_API_BASE_URL` | Vercel (build-time) + native builds | Where the client sends API requests |
+| `EXPO_PUBLIC_API_BASE_URL` | Vercel (build-time) + EAS (build-time) | Where the client sends API requests |
 | `CORS_ALLOWED_ORIGINS` | Railway | Browser origins allowed to call the API in production |
 | `CLOUDINARY_CLOUD_NAME` / `CLOUDINARY_API_KEY` / `CLOUDINARY_API_SECRET` | Railway | Signs elimination-video uploads |
 
@@ -156,7 +156,11 @@ Tests currently cover `server/power-up-rules.ts` (pure game-rule math),
   Vercel-scoped env vars from the table above as build-time variables.
 - **Native (EAS):** `eas.json` defines `development` / `preview` /
   `production` / `production-apk` build profiles. Run `eas build` as usual;
-  `app.config.ts` defines the bundle ID, scheme, and permissions.
+  `app.config.ts` defines the bundle ID, scheme, and permissions. EAS builds
+  don't read your local `.env` or the Railway/Vercel dashboards -- the
+  `EXPO_PUBLIC_*` vars from the table above must also be configured as EAS
+  environment variables (`eas env:create`, or the EAS dashboard), or a
+  native build ships with those values empty.
 
 ---
 
