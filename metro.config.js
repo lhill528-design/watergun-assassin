@@ -11,13 +11,16 @@ config.resolver.resolveRequest = (context, moduleName, platform) => {
       type: "sourceFile",
     };
   }
-  // Force the CJS build of @clerk/react's legacy entry point on web. Its
-  // ESM (.mjs) build transitively pulls in @clerk/shared's raw
-  // `import.meta.env` reference, which is a hard SyntaxError once bundled
-  // into a non-`type="module"` script (Metro's web export output isn't a
-  // module). The .cjs file's own internal requires resolve as CJS too, so
-  // this doesn't just move the problem one hop down the tree.
-  if (platform === "web" && moduleName === "@clerk/react/legacy") {
+  // Force the CJS build of @clerk/react's legacy entry point (reached via
+  // @clerk/expo/legacy, which requires it internally) on every platform.
+  // Its ESM (.mjs) build transitively pulls in @clerk/shared's raw
+  // `import.meta.env` reference. On web that's a hard SyntaxError once
+  // bundled into a non-`type="module"` script (Metro's web export output
+  // isn't a module); on Android/iOS, Hermes doesn't support `import.meta`
+  // at all and crashes with "import.meta is not supported". The .cjs
+  // file's own internal requires resolve as CJS too, so this doesn't just
+  // move the problem one hop down the tree.
+  if (moduleName === "@clerk/react/legacy") {
     // require.resolve() on a deep path is blocked by the package's own
     // exports map (same restriction that caused the problem in the first
     // place) -- so derive the dist/ dir from the main entry instead.

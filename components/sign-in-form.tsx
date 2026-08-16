@@ -5,7 +5,13 @@ import { ActivityIndicator, Text, TextInput, TouchableOpacity, View } from "reac
 // long-documented custom-flow API, so pull those from the explicit legacy
 // entry point instead — same underlying ClerkProvider/context, just the
 // familiar { isLoaded, signIn, setActive } shape.
-import { useSignIn, useSignUp } from "@clerk/react/legacy";
+// Import from @clerk/expo/legacy (not @clerk/react/legacy directly) --
+// @clerk/expo's legacy.js is a plain CJS file that itself requires
+// "@clerk/react/legacy", so package-exports resolution picks @clerk/react's
+// "require" condition (the .cjs build) rather than the "import" condition's
+// .mjs build. See metro.config.js for why that distinction matters on both
+// web and native (Hermes).
+import { useSignIn, useSignUp } from "@clerk/expo/legacy";
 
 type Step = "email" | "code";
 type Mode = "sign-in" | "sign-up";

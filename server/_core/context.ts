@@ -52,7 +52,14 @@ export async function createContext(opts: CreateExpressContextOptions): Promise<
   const token = getBearerToken(opts.req);
   if (token) {
     try {
-      const claims = await verifyToken(token, { secretKey: ENV.clerkSecretKey });
+      const claims = await verifyToken(token, {
+        secretKey: ENV.clerkSecretKey,
+        // Omitted (not `[]`) when unset, since an empty array would reject
+        // every token instead of skipping the `azp` check.
+        ...(ENV.clerkAuthorizedParties.length > 0
+          ? { authorizedParties: ENV.clerkAuthorizedParties }
+          : {}),
+      });
       user = await resolveUser(claims.sub);
     } catch (error) {
       // Invalid/expired token — leave user null so public procedures still work.
