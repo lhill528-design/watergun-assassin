@@ -5,19 +5,12 @@ import { tokenCache as clerkTokenCache } from "@clerk/expo/token-cache";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { Stack } from "expo-router";
 import { StatusBar } from "expo-status-bar";
-import { useMemo, useState } from "react";
+import { useState } from "react";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
 import "react-native-reanimated";
-import { Platform } from "react-native";
 import "@/lib/_core/nativewind-pressable";
 import { ThemeProvider } from "@/lib/theme-provider";
-import {
-  SafeAreaFrameContext,
-  SafeAreaInsetsContext,
-  SafeAreaProvider,
-  initialWindowMetrics,
-} from "react-native-safe-area-context";
-import type { EdgeInsets, Rect } from "react-native-safe-area-context";
+import { SafeAreaProvider, initialWindowMetrics } from "react-native-safe-area-context";
 
 import { trpc, createTRPCClient } from "@/lib/trpc";
 import { GameProvider } from "@/lib/game-context";
@@ -25,9 +18,6 @@ import { usePushRegistration } from "@/lib/use-push-registration";
 import { useAuth } from "@/hooks/use-auth";
 
 const CLERK_PUBLISHABLE_KEY = process.env.EXPO_PUBLIC_CLERK_PUBLISHABLE_KEY ?? "";
-
-const DEFAULT_WEB_INSETS: EdgeInsets = { top: 0, right: 0, bottom: 0, left: 0 };
-const DEFAULT_WEB_FRAME: Rect = { x: 0, y: 0, width: 0, height: 0 };
 
 export const unstable_settings = {
   anchor: "(tabs)",
@@ -89,54 +79,35 @@ function AppShell() {
 }
 
 export default function RootLayout() {
-  const initialInsets = initialWindowMetrics?.insets ?? DEFAULT_WEB_INSETS;
-  const initialFrame = initialWindowMetrics?.frame ?? DEFAULT_WEB_FRAME;
-
-  // Insets/frame are fixed at the values react-native-safe-area-context
-  // detects on mount. There's no longer a parent container to push live
-  // updates in (that was Manus's preview iframe, gone now that this deploys
-  // standalone to Vercel), so these never need to change after mount.
-  const insets: EdgeInsets = initialInsets;
-  const frame: Rect = initialFrame;
-
-  // Ensure minimum 8px padding for top and bottom on mobile
-  const providerInitialMetrics = useMemo(() => {
-    const metrics = initialWindowMetrics ?? { insets: initialInsets, frame: initialFrame };
-    return {
-      ...metrics,
-      insets: {
-        ...metrics.insets,
-        top: Math.max(metrics.insets.top, 16),
-        bottom: Math.max(metrics.insets.bottom, 12),
-      },
-    };
-  }, [initialInsets, initialFrame]);
-
-  const content = (
-    <ClerkProvider publishableKey={CLERK_PUBLISHABLE_KEY} tokenCache={clerkTokenCache}>
-      <AppShell />
-    </ClerkProvider>
-  );
-
-  const shouldOverrideSafeArea = Platform.OS === "web";
-
-  if (shouldOverrideSafeArea) {
-    return (
-      <ThemeProvider>
-        <SafeAreaProvider initialMetrics={providerInitialMetrics}>
-          <SafeAreaFrameContext.Provider value={frame}>
-            <SafeAreaInsetsContext.Provider value={insets}>
-              {content}
-            </SafeAreaInsetsContext.Provider>
-          </SafeAreaFrameContext.Provider>
-        </SafeAreaProvider>
-      </ThemeProvider>
-    );
-  }
+  // initialWindowMetrics is always null on web (no synchronous native
+  // measurement exists there -- see react-native-safe-area-context's
+  // InitialWindow.ts vs InitialWindow.native.ts). Passing no initialMetrics
+  // in that case lets SafeAreaProvider's own web implementation measure the
+  // live document and keep responding to resizes/orientation changes,
+  // instead of being pinned to a fabricated 0x0 frame forever.
+  //
+  // On native, initialWindowMetrics is populated before first render, so
+  // boost its real insets with a minimum 8px/12px top/bottom to avoid a
+  // first-paint flash on devices whose reported insets are smaller than
+  // that; SafeAreaProvider still keeps measuring and updates from there.
+  const providerInitialMetrics = initialWindowMetrics
+    ? {
+        ...initialWindowMetrics,
+        insets: {
+          ...initialWindowMetrics.insets,
+          top: Math.max(initialWindowMetrics.insets.top, 16),
+          bottom: Math.max(initialWindowMetrics.insets.bottom, 12),
+        },
+      }
+    : undefined;
 
   return (
     <ThemeProvider>
-      <SafeAreaProvider initialMetrics={providerInitialMetrics}>{content}</SafeAreaProvider>
+      <SafeAreaProvider initialMetrics={providerInitialMetrics}>
+        <ClerkProvider publishableKey={CLERK_PUBLISHABLE_KEY} tokenCache={clerkTokenCache}>
+          <AppShell />
+        </ClerkProvider>
+      </SafeAreaProvider>
     </ThemeProvider>
   );
 }
