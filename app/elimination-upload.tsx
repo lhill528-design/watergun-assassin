@@ -14,6 +14,8 @@ type UploadSignature = {
   apiKey: string;
   timestamp: number;
   folder: string;
+  publicId: string;
+  overwrite: boolean;
   allowedFormats: string;
   signature: string;
 };
@@ -37,6 +39,8 @@ async function uploadToCloudinary(video: SelectedVideo, signature: UploadSignatu
   formData.append("timestamp", String(signature.timestamp));
   formData.append("signature", signature.signature);
   formData.append("folder", signature.folder);
+  formData.append("public_id", signature.publicId);
+  formData.append("overwrite", String(signature.overwrite));
   formData.append("allowed_formats", signature.allowedFormats);
 
   const uploadResp = await fetch(`https://api.cloudinary.com/v1_1/${signature.cloudName}/video/upload`, {

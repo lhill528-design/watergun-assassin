@@ -1,6 +1,7 @@
 // Cloudinary upload signing. Files are uploaded directly from the client to
 // Cloudinary's API (never routed through this server) — this just issues a
 // short-lived signature so the client's upload request is authorized.
+import { randomUUID } from "crypto";
 import { v2 as cloudinary } from "cloudinary";
 import { ENV } from "./_core/env";
 
@@ -16,6 +17,8 @@ export type CloudinaryUploadSignature = {
   apiKey: string;
   timestamp: number;
   folder: string;
+  publicId: string;
+  overwrite: boolean;
   allowedFormats: string;
   signature: string;
 };
@@ -34,10 +37,18 @@ export function getCloudinaryUploadSignature(folder: string): CloudinaryUploadSi
   }
 
   const timestamp = Math.round(Date.now() / 1000);
+  // A per-request random public_id (pinned server-side, not left for the
+  // client or Cloudinary to pick) plus overwrite:false means this signature
+  // can only ever create exactly one new asset. Without that, a signature
+  // is valid for an hour and -- since folder/allowed_formats don't pin an
+  // exact target -- could otherwise be replayed to upload many different
+  // files before it expires.
+  const publicId = randomUUID();
+  const overwrite = false;
   // Every param passed to the client's upload request that Cloudinary treats
   // as "to be signed" must appear here too, or the signature won't match.
   const signature = cloudinary.utils.api_sign_request(
-    { timestamp, folder, allowed_formats: ALLOWED_VIDEO_FORMATS },
+    { timestamp, folder, public_id: publicId, overwrite, allowed_formats: ALLOWED_VIDEO_FORMATS },
     ENV.cloudinaryApiSecret,
   );
 
@@ -46,6 +57,8 @@ export function getCloudinaryUploadSignature(folder: string): CloudinaryUploadSi
     apiKey: ENV.cloudinaryApiKey,
     timestamp,
     folder,
+    publicId,
+    overwrite,
     allowedFormats: ALLOWED_VIDEO_FORMATS,
     signature,
   };
