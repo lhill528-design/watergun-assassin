@@ -9,6 +9,11 @@ export const ENV = {
     .split(",")
     .map((p) => p.trim())
     .filter(Boolean),
+  // Browser origins allowed to call this API (see server/_core/index.ts).
+  corsAllowedOrigins: (process.env.CORS_ALLOWED_ORIGINS ?? "")
+    .split(",")
+    .map((o) => o.trim())
+    .filter(Boolean),
   isProduction: process.env.NODE_ENV === "production",
   cloudinaryCloudName: process.env.CLOUDINARY_CLOUD_NAME ?? "",
   cloudinaryApiKey: process.env.CLOUDINARY_API_KEY ?? "",

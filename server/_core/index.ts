@@ -9,18 +9,15 @@ import { ENV } from "./env";
 
 // CORS only matters for browser requests (native app fetch calls don't send
 // an Origin header, so this doesn't affect Android/iOS builds either way).
-// Localhost dev ports + any Vercel deployment (prod or preview) are allowed
-// by default; CORS_ALLOWED_ORIGINS adds any custom domain on top.
+// Localhost dev ports are allowed by default; every other origin -- including
+// Vercel preview/prod URLs -- must be explicitly listed in
+// CORS_ALLOWED_ORIGINS. A blanket "any *.vercel.app" allowance would let
+// anyone else's Vercel-hosted site send credentialed requests to this API.
 const DEV_ORIGINS = ["http://localhost:8081", "http://localhost:19006", "http://localhost:3000"];
 
 function isAllowedOrigin(origin: string): boolean {
   if (!ENV.isProduction && DEV_ORIGINS.includes(origin)) return true;
-  if (origin.endsWith(".vercel.app")) return true;
-  const extra = (process.env.CORS_ALLOWED_ORIGINS ?? "")
-    .split(",")
-    .map((o) => o.trim())
-    .filter(Boolean);
-  return extra.includes(origin);
+  return ENV.corsAllowedOrigins.includes(origin);
 }
 
 function isPortAvailable(port: number): Promise<boolean> {
