@@ -12,7 +12,6 @@ import { ActivityIndicator, Text, TextInput, TouchableOpacity, View } from "reac
 // .mjs build. See metro.config.js for why that distinction matters on both
 // web and native (Hermes).
 import { useSignIn, useSignUp } from "@clerk/expo/legacy";
-import { trpc } from "@/lib/trpc";
 import {
   describeVerifyOutcome,
   interpretSignInResult,
@@ -28,15 +27,30 @@ function firstErrorMessage(err: unknown, fallback: string): string {
   return errors?.[0]?.message ?? fallback;
 }
 
+interface SignInFormProps {
+  // Called right after a session is confirmed active -- either a fresh
+  // setActive() following OTP verification, or Clerk reporting one already
+  // exists on a retry. Pass the same auth.me query's own refetch (e.g.
+  // useAuth()'s `refresh`), not trpc.useUtils().auth.me.refetch(): that
+  // utils-based refetch runs through queryClient.refetchQueries(), which
+  // (unlike a query's own refetch()) skips queries that are currently
+  // `enabled: false` -- exactly auth.me's state before the parent screen's
+  // own useAuth() has seen isSignedIn flip. A query's own refetch() has no
+  // such check, so it fetches regardless, and because react-query's cache
+  // is shared per query key, that fetch's result updates every observer of
+  // auth.me (including the parent's), independent of isSignedIn's
+  // propagation timing across the legacy/modern Clerk hook boundary.
+  onSessionActive?: () => unknown;
+}
+
 /**
  * Passwordless email OTP sign-in. Tries an existing-user sign-in first; if
  * the email isn't registered, falls back to starting a sign-up — same "just
  * enter your email" UX either way, no separate register screen.
  */
-export function SignInForm() {
+export function SignInForm({ onSessionActive }: SignInFormProps) {
   const { isLoaded: signInLoaded, signIn, setActive: setActiveSignIn } = useSignIn();
   const { isLoaded: signUpLoaded, signUp, setActive: setActiveSignUp } = useSignUp();
-  const utils = trpc.useUtils();
 
   const [step, setStep] = useState<Step>("email");
   const [mode, setMode] = useState<Mode>("sign-in");
@@ -71,11 +85,11 @@ export function SignInForm() {
     } catch (err) {
       // Clerk already has an active session for this browser -- most often
       // because a previous sign-in actually succeeded and this screen just
-      // hasn't unmounted yet. Recheck auth.me instead of showing a raw
-      // "Session already exists" error for what is, from the user's
-      // perspective, already being signed in.
+      // hasn't unmounted yet. Recheck instead of showing a raw "Session
+      // already exists" error for what is, from the user's perspective,
+      // already being signed in.
       if (isSessionExistsError(err)) {
-        await utils.auth.me.invalidate();
+        await onSessionActive?.();
         return;
       }
 
@@ -98,7 +112,7 @@ export function SignInForm() {
     } finally {
       setSubmitting(false);
     }
-  }, [email, signInLoaded, signUpLoaded, signIn, signUp, utils]);
+  }, [email, signInLoaded, signUpLoaded, signIn, signUp, onSessionActive]);
 
   const verifyCode = useCallback(async () => {
     if (!signIn || !signUp) return;
@@ -112,12 +126,7 @@ export function SignInForm() {
         const outcome = interpretSignInResult(result);
         if (outcome.kind === "complete") {
           await setActiveSignIn({ session: outcome.sessionId });
-          // setActive() updates Clerk's own session state, but our auth.me
-          // query is gated on Clerk's isSignedIn flag flipping and refetching
-          // on its own -- explicitly invalidating here means the app
-          // transitions to signed-in immediately, rather than depending on
-          // that flag change propagating through on its own timing.
-          await utils.auth.me.invalidate();
+          await onSessionActive?.();
         } else {
           setError(describeVerifyOutcome(outcome));
         }
@@ -126,7 +135,7 @@ export function SignInForm() {
         const outcome = interpretSignUpResult(result);
         if (outcome.kind === "complete") {
           await setActiveSignUp({ session: outcome.sessionId });
-          await utils.auth.me.invalidate();
+          await onSessionActive?.();
         } else {
           setError(describeVerifyOutcome(outcome));
         }
@@ -136,7 +145,7 @@ export function SignInForm() {
     } finally {
       setSubmitting(false);
     }
-  }, [mode, code, signIn, signUp, setActiveSignIn, setActiveSignUp, utils]);
+  }, [mode, code, signIn, signUp, setActiveSignIn, setActiveSignUp, onSessionActive]);
 
   if (step === "code") {
     return (

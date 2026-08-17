@@ -41,4 +41,14 @@ describe("deriveAuthStatus", () => {
       deriveAuthStatus({ clerkLoaded: true, isSignedIn: true, userQueryStatus: "success", hasUser: true }),
     ).toEqual({ kind: "signed-in" });
   });
+
+  // The specific fix for the production bug: a successful, populated
+  // auth.me response is authoritative even if isSignedIn (read via a
+  // separate hook) hasn't caught up yet -- so a forced post-verify refetch
+  // can transition the UI without waiting on that other hook's timing.
+  it("is signed-in on a successful populated response even if isSignedIn hasn't flipped yet", () => {
+    expect(
+      deriveAuthStatus({ clerkLoaded: true, isSignedIn: false, userQueryStatus: "success", hasUser: true }),
+    ).toEqual({ kind: "signed-in" });
+  });
 });

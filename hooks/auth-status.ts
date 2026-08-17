@@ -28,9 +28,20 @@ export function deriveAuthStatus(input: {
   userQueryStatus: "pending" | "error" | "success";
   hasUser: boolean;
 }): AuthStatus {
+  // A successful, populated backend response is authoritative on its own --
+  // it could only happen with a valid bearer token, so it's trusted even if
+  // Clerk's client-side isSignedIn flag (read via a *different* hook,
+  // @clerk/expo's useAuth) hasn't reflected the same session change yet.
+  // This is what lets SignInForm force an auth.me refetch right after
+  // setActive() and transition the UI immediately, without depending on
+  // isSignedIn's propagation timing across that hook boundary -- the
+  // react-query cache updates for every observer of the same query key
+  // regardless of each observer's own `enabled` value, so this stays
+  // correct even if isSignedIn is slow (or, in the pathological case,
+  // never updates at all).
+  if (input.userQueryStatus === "success" && input.hasUser) return { kind: "signed-in" };
   if (!input.clerkLoaded) return { kind: "loading" };
   if (!input.isSignedIn) return { kind: "signed-out" };
   if (input.userQueryStatus === "error") return { kind: "backend-error" };
-  if (input.userQueryStatus === "pending" || !input.hasUser) return { kind: "provisioning" };
-  return { kind: "signed-in" };
+  return { kind: "provisioning" };
 }

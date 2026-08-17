@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { TRPCError } from "@trpc/server";
 import { systemRouter } from "./_core/systemRouter";
 import { publicProcedure, protectedProcedure, router } from "./_core/trpc";
 import * as db from "./db";
@@ -44,7 +45,22 @@ async function addProtectionBadges<T extends { id: number }>(players: T[]) {
 export const appRouter = router({
   system: systemRouter,
   auth: router({
-    me: publicProcedure.query((opts) => opts.ctx.user),
+    // A verified session whose backend user provisioning failed (DB down,
+    // Clerk API failure, etc.) must not look identical to "not signed in"
+    // -- see server/_core/context.ts. Surfacing it as a real query error
+    // here (instead of quietly returning null) is what lets the client
+    // distinguish "signed out" from "signed in, but the backend couldn't
+    // finish loading your account" and show a Retry option instead of the
+    // sign-in form again.
+    me: publicProcedure.query((opts) => {
+      if (opts.ctx.authError) {
+        throw new TRPCError({
+          code: "INTERNAL_SERVER_ERROR",
+          message: "Couldn't load your account. Please try again.",
+        });
+      }
+      return opts.ctx.user;
+    }),
     registerPushToken: protectedProcedure
       .input(z.object({ token: z.string(), platform: z.string().default("expo") }))
       .mutation(async ({ ctx, input }) => {

@@ -74,7 +74,7 @@ export default function HomeScreen() {
           <Text className="text-3xl font-bold text-foreground text-center">WATERGUN{"\n"}ASSASSIN</Text>
           <Text className="text-base text-muted text-center">Silent. Soak. Survive.</Text>
           <View className="w-full max-w-sm mt-4">
-            <SignInForm />
+            <SignInForm onSessionActive={refresh} />
           </View>
         </View>
       </ScreenContainer>

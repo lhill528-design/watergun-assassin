@@ -82,7 +82,7 @@ export default function ProfileScreen() {
           <Text className="text-4xl">👤</Text>
           <Text className="text-foreground text-xl font-bold">Sign In Required</Text>
           <View className="w-full max-w-sm mt-2">
-            <SignInForm />
+            <SignInForm onSessionActive={refresh} />
           </View>
         </View>
       </ScreenContainer>
