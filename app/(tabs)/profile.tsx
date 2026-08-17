@@ -2,7 +2,7 @@ import { Text, View, ScrollView, TouchableOpacity, Alert, TextInput } from "reac
 import { useRouter } from "expo-router";
 import { ScreenContainer } from "@/components/screen-container";
 import { SignInForm } from "@/components/sign-in-form";
-import { AuthBackendErrorState, AuthLoadingState } from "@/components/auth-status-views";
+import { AuthBackendErrorState, AuthLoadingState, AuthSyncExpiredState } from "@/components/auth-status-views";
 import { useAuth } from "@/hooks/use-auth";
 import { useGame } from "@/lib/game-context";
 import { trpc } from "@/lib/trpc";
@@ -71,6 +71,14 @@ export default function ProfileScreen() {
     return (
       <ScreenContainer className="p-6">
         <AuthBackendErrorState onRetry={() => refresh()} onSignOut={logout} />
+      </ScreenContainer>
+    );
+  }
+
+  if (status.kind === "sync-expired") {
+    return (
+      <ScreenContainer className="p-6">
+        <AuthSyncExpiredState onRetry={() => confirmSessionActivated()} onSignOut={logout} />
       </ScreenContainer>
     );
   }

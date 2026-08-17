@@ -7,7 +7,7 @@ describe("deriveAuthStatus", () => {
       deriveAuthStatus({
         clerkLoaded: false,
         isSignedIn: undefined,
-        sessionActivationPending: false,
+        sessionActivationState: "idle",
         userQueryStatus: "pending",
         hasUser: false,
       }),
@@ -19,7 +19,7 @@ describe("deriveAuthStatus", () => {
       deriveAuthStatus({
         clerkLoaded: true,
         isSignedIn: false,
-        sessionActivationPending: false,
+        sessionActivationState: "idle",
         userQueryStatus: "pending",
         hasUser: false,
       }),
@@ -31,7 +31,7 @@ describe("deriveAuthStatus", () => {
       deriveAuthStatus({
         clerkLoaded: true,
         isSignedIn: true,
-        sessionActivationPending: false,
+        sessionActivationState: "idle",
         userQueryStatus: "pending",
         hasUser: false,
       }),
@@ -47,7 +47,7 @@ describe("deriveAuthStatus", () => {
       deriveAuthStatus({
         clerkLoaded: true,
         isSignedIn: true,
-        sessionActivationPending: false,
+        sessionActivationState: "idle",
         userQueryStatus: "error",
         hasUser: false,
       }),
@@ -59,7 +59,7 @@ describe("deriveAuthStatus", () => {
       deriveAuthStatus({
         clerkLoaded: true,
         isSignedIn: true,
-        sessionActivationPending: false,
+        sessionActivationState: "idle",
         userQueryStatus: "success",
         hasUser: false,
       }),
@@ -71,7 +71,7 @@ describe("deriveAuthStatus", () => {
       deriveAuthStatus({
         clerkLoaded: true,
         isSignedIn: true,
-        sessionActivationPending: false,
+        sessionActivationState: "idle",
         userQueryStatus: "success",
         hasUser: true,
       }),
@@ -80,14 +80,15 @@ describe("deriveAuthStatus", () => {
 
   // The specific, narrowly-scoped fix for the production bug: a successful,
   // populated auth.me response only bridges the gap while
-  // sessionActivationPending is true (set by SignInForm right after a real
-  // setActive() call) -- not just because the cache happens to hold data.
+  // sessionActivationState is "pending" (set by SignInForm right after a
+  // real setActive() call) -- not just because the cache happens to hold
+  // data.
   it("is signed-in on a successful populated response while session activation is pending", () => {
     expect(
       deriveAuthStatus({
         clerkLoaded: true,
         isSignedIn: false,
-        sessionActivationPending: true,
+        sessionActivationState: "pending",
         userQueryStatus: "success",
         hasUser: true,
       }),
@@ -104,10 +105,55 @@ describe("deriveAuthStatus", () => {
       deriveAuthStatus({
         clerkLoaded: true,
         isSignedIn: false,
-        sessionActivationPending: false,
+        sessionActivationState: "idle",
         userQueryStatus: "success",
         hasUser: true,
       }),
     ).toEqual({ kind: "signed-out" });
+  });
+
+  // The follow-up fix: the bridge's own bounded window can run out before
+  // isSignedIn ever catches up (Clerk's client-side flag never flipping at
+  // all, not just slowly). That must not fall back to signed-out -- and
+  // critically, a still-successful, still-populated cached response must
+  // NOT be enough to reach signed-in either, even though the exact same
+  // response qualified while the state was "pending".
+  it("is sync-expired once the bridge's window has run out, even with the same successful cached response still present", () => {
+    expect(
+      deriveAuthStatus({
+        clerkLoaded: true,
+        isSignedIn: false,
+        sessionActivationState: "expired",
+        userQueryStatus: "success",
+        hasUser: true,
+      }),
+    ).toEqual({ kind: "sync-expired" });
+  });
+
+  it("is sync-expired even with no cached user data at all", () => {
+    expect(
+      deriveAuthStatus({
+        clerkLoaded: true,
+        isSignedIn: false,
+        sessionActivationState: "expired",
+        userQueryStatus: "pending",
+        hasUser: false,
+      }),
+    ).toEqual({ kind: "sync-expired" });
+  });
+
+  // Once Clerk does report signed-in, an "expired" bridge state is moot --
+  // the normal signed-in-branch rules (provisioning/backend-error/signed-in
+  // based on the user query) take over exactly as they would from "idle".
+  it("falls through to the normal signed-in rules once isSignedIn is true, regardless of a leftover expired state", () => {
+    expect(
+      deriveAuthStatus({
+        clerkLoaded: true,
+        isSignedIn: true,
+        sessionActivationState: "expired",
+        userQueryStatus: "success",
+        hasUser: true,
+      }),
+    ).toEqual({ kind: "signed-in" });
   });
 });
