@@ -25,23 +25,38 @@ export type AuthStatus =
 export function deriveAuthStatus(input: {
   clerkLoaded: boolean;
   isSignedIn: boolean | undefined;
+  // True only in the narrow window between a successful setActive() call
+  // (see hooks/use-auth.ts's confirmSessionActivated) and Clerk's own
+  // isSignedIn flag catching up to it -- set by SignInForm right after OTP
+  // verification succeeds, and cleared as soon as isSignedIn actually
+  // becomes true, or on logout. It is NEVER set just because auth.me's
+  // cache happens to hold a successful response; a stale cached user does
+  // not, on its own, make this true.
+  sessionActivationPending: boolean;
   userQueryStatus: "pending" | "error" | "success";
   hasUser: boolean;
 }): AuthStatus {
-  // A successful, populated backend response is authoritative on its own --
-  // it could only happen with a valid bearer token, so it's trusted even if
-  // Clerk's client-side isSignedIn flag (read via a *different* hook,
-  // @clerk/expo's useAuth) hasn't reflected the same session change yet.
-  // This is what lets SignInForm force an auth.me refetch right after
-  // setActive() and transition the UI immediately, without depending on
-  // isSignedIn's propagation timing across that hook boundary -- the
-  // react-query cache updates for every observer of the same query key
-  // regardless of each observer's own `enabled` value, so this stays
-  // correct even if isSignedIn is slow (or, in the pathological case,
-  // never updates at all).
-  if (input.userQueryStatus === "success" && input.hasUser) return { kind: "signed-in" };
   if (!input.clerkLoaded) return { kind: "loading" };
-  if (!input.isSignedIn) return { kind: "signed-out" };
+
+  if (!input.isSignedIn) {
+    // Once Clerk is loaded and explicitly reports no session, that's
+    // authoritative -- covers logout and session expiry, including
+    // whenever auth.me's cache still holds a previous user (logout is
+    // responsible for clearing that cache, but this check doesn't depend
+    // on that alone: it never trusts cached data here except inside the
+    // narrow, explicitly-managed pending window below).
+    if (input.sessionActivationPending && input.userQueryStatus === "success" && input.hasUser) {
+      // Bridges only the gap right after a real setActive() call, backed
+      // by independent, server-verified proof (a successful, populated
+      // auth.me response necessarily required a valid bearer token) --
+      // not by isSignedIn's propagation timing across the legacy/modern
+      // Clerk hook boundary.
+      return { kind: "signed-in" };
+    }
+    return { kind: "signed-out" };
+  }
+
   if (input.userQueryStatus === "error") return { kind: "backend-error" };
+  if (input.userQueryStatus === "success" && input.hasUser) return { kind: "signed-in" };
   return { kind: "provisioning" };
 }

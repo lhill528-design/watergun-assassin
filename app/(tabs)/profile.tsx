@@ -9,7 +9,7 @@ import { trpc } from "@/lib/trpc";
 import { useEffect, useState } from "react";
 
 export default function ProfileScreen() {
-  const { user, isAuthenticated, status, logout, refresh } = useAuth();
+  const { user, isAuthenticated, status, logout, refresh, confirmSessionActivated } = useAuth();
   const { activeGameId, setActiveGameId } = useGame();
   const router = useRouter();
   const [joinCode, setJoinCode] = useState("");
@@ -82,7 +82,7 @@ export default function ProfileScreen() {
           <Text className="text-4xl">👤</Text>
           <Text className="text-foreground text-xl font-bold">Sign In Required</Text>
           <View className="w-full max-w-sm mt-2">
-            <SignInForm onSessionActive={refresh} />
+            <SignInForm onSessionActive={confirmSessionActivated} />
           </View>
         </View>
       </ScreenContainer>

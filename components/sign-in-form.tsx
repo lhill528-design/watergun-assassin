@@ -30,16 +30,20 @@ function firstErrorMessage(err: unknown, fallback: string): string {
 interface SignInFormProps {
   // Called right after a session is confirmed active -- either a fresh
   // setActive() following OTP verification, or Clerk reporting one already
-  // exists on a retry. Pass the same auth.me query's own refetch (e.g.
-  // useAuth()'s `refresh`), not trpc.useUtils().auth.me.refetch(): that
-  // utils-based refetch runs through queryClient.refetchQueries(), which
-  // (unlike a query's own refetch()) skips queries that are currently
-  // `enabled: false` -- exactly auth.me's state before the parent screen's
-  // own useAuth() has seen isSignedIn flip. A query's own refetch() has no
-  // such check, so it fetches regardless, and because react-query's cache
-  // is shared per query key, that fetch's result updates every observer of
-  // auth.me (including the parent's), independent of isSignedIn's
-  // propagation timing across the legacy/modern Clerk hook boundary.
+  // exists on a retry. Pass useAuth()'s `confirmSessionActivated`, not
+  // `refresh` or trpc.useUtils().auth.me.refetch(): confirmSessionActivated
+  // opens a narrow, explicitly-scoped "session activation pending" window
+  // (see hooks/auth-status.ts) before forcing auth.me to refetch via the
+  // query's own observer-level refetch(). That distinction matters --
+  // trpc.useUtils().auth.me.refetch() runs through
+  // queryClient.refetchQueries(), which (unlike a query's own refetch())
+  // skips queries that are currently `enabled: false`, exactly auth.me's
+  // state before the parent screen's own useAuth() has seen isSignedIn
+  // flip -- and plain `refresh()` alone, without the pending window, would
+  // have no independent signal to distinguish "we just legitimately
+  // verified a session" from "the cache happens to still hold a stale
+  // user," which is what let a stale cached user override an explicit
+  // sign-out or session expiry.
   onSessionActive?: () => unknown;
 }
 
