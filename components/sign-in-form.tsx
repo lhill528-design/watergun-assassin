@@ -12,6 +12,13 @@ import { ActivityIndicator, Text, TextInput, TouchableOpacity, View } from "reac
 // .mjs build. See metro.config.js for why that distinction matters on both
 // web and native (Hermes).
 import { useSignIn, useSignUp } from "@clerk/expo/legacy";
+import { trpc } from "@/lib/trpc";
+import {
+  describeVerifyOutcome,
+  interpretSignInResult,
+  interpretSignUpResult,
+  isSessionExistsError,
+} from "@/components/sign-in-form-results";
 
 type Step = "email" | "code";
 type Mode = "sign-in" | "sign-up";
@@ -29,6 +36,7 @@ function firstErrorMessage(err: unknown, fallback: string): string {
 export function SignInForm() {
   const { isLoaded: signInLoaded, signIn, setActive: setActiveSignIn } = useSignIn();
   const { isLoaded: signUpLoaded, signUp, setActive: setActiveSignUp } = useSignUp();
+  const utils = trpc.useUtils();
 
   const [step, setStep] = useState<Step>("email");
   const [mode, setMode] = useState<Mode>("sign-in");
@@ -61,6 +69,16 @@ export function SignInForm() {
       setMode("sign-in");
       setStep("code");
     } catch (err) {
+      // Clerk already has an active session for this browser -- most often
+      // because a previous sign-in actually succeeded and this screen just
+      // hasn't unmounted yet. Recheck auth.me instead of showing a raw
+      // "Session already exists" error for what is, from the user's
+      // perspective, already being signed in.
+      if (isSessionExistsError(err)) {
+        await utils.auth.me.invalidate();
+        return;
+      }
+
       const notFound = (err as { errors?: Array<{ code?: string }> })?.errors?.some(
         (e) => e.code === "form_identifier_not_found",
       );
@@ -80,7 +98,7 @@ export function SignInForm() {
     } finally {
       setSubmitting(false);
     }
-  }, [email, signInLoaded, signUpLoaded, signIn, signUp]);
+  }, [email, signInLoaded, signUpLoaded, signIn, signUp, utils]);
 
   const verifyCode = useCallback(async () => {
     if (!signIn || !signUp) return;
@@ -91,17 +109,26 @@ export function SignInForm() {
     try {
       if (mode === "sign-in") {
         const result = await signIn.attemptFirstFactor({ strategy: "email_code", code: trimmedCode });
-        if (result.status === "complete") {
-          await setActiveSignIn({ session: result.createdSessionId });
+        const outcome = interpretSignInResult(result);
+        if (outcome.kind === "complete") {
+          await setActiveSignIn({ session: outcome.sessionId });
+          // setActive() updates Clerk's own session state, but our auth.me
+          // query is gated on Clerk's isSignedIn flag flipping and refetching
+          // on its own -- explicitly invalidating here means the app
+          // transitions to signed-in immediately, rather than depending on
+          // that flag change propagating through on its own timing.
+          await utils.auth.me.invalidate();
         } else {
-          setError("Sign-in incomplete. Try again.");
+          setError(describeVerifyOutcome(outcome));
         }
       } else {
         const result = await signUp.attemptEmailAddressVerification({ code: trimmedCode });
-        if (result.status === "complete") {
-          await setActiveSignUp({ session: result.createdSessionId });
+        const outcome = interpretSignUpResult(result);
+        if (outcome.kind === "complete") {
+          await setActiveSignUp({ session: outcome.sessionId });
+          await utils.auth.me.invalidate();
         } else {
-          setError("Sign-up incomplete. Try again.");
+          setError(describeVerifyOutcome(outcome));
         }
       }
     } catch (err) {
@@ -109,7 +136,7 @@ export function SignInForm() {
     } finally {
       setSubmitting(false);
     }
-  }, [mode, code, signIn, signUp, setActiveSignIn, setActiveSignUp]);
+  }, [mode, code, signIn, signUp, setActiveSignIn, setActiveSignUp, utils]);
 
   if (step === "code") {
     return (

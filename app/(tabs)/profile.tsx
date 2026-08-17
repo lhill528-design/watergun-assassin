@@ -2,13 +2,14 @@ import { Text, View, ScrollView, TouchableOpacity, Alert, TextInput } from "reac
 import { useRouter } from "expo-router";
 import { ScreenContainer } from "@/components/screen-container";
 import { SignInForm } from "@/components/sign-in-form";
+import { AuthBackendErrorState, AuthLoadingState } from "@/components/auth-status-views";
 import { useAuth } from "@/hooks/use-auth";
 import { useGame } from "@/lib/game-context";
 import { trpc } from "@/lib/trpc";
 import { useEffect, useState } from "react";
 
 export default function ProfileScreen() {
-  const { user, isAuthenticated, logout, refresh } = useAuth();
+  const { user, isAuthenticated, status, logout, refresh } = useAuth();
   const { activeGameId, setActiveGameId } = useGame();
   const router = useRouter();
   const [joinCode, setJoinCode] = useState("");
@@ -57,6 +58,22 @@ export default function ProfileScreen() {
   useEffect(() => {
     if (!myGamesQuery.isLoading && activeGameId && !myGames.some(game => game.id === activeGameId)) setActiveGameId(null);
   }, [activeGameId, myGames, myGamesQuery.isLoading, setActiveGameId]);
+
+  if (status.kind === "loading" || status.kind === "provisioning") {
+    return (
+      <ScreenContainer className="p-6">
+        <AuthLoadingState />
+      </ScreenContainer>
+    );
+  }
+
+  if (status.kind === "backend-error") {
+    return (
+      <ScreenContainer className="p-6">
+        <AuthBackendErrorState onRetry={() => refresh()} onSignOut={logout} />
+      </ScreenContainer>
+    );
+  }
 
   if (!isAuthenticated) {
     return (

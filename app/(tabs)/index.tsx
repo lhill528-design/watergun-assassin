@@ -2,6 +2,7 @@ import { ScrollView, Text, View, TouchableOpacity, Image } from "react-native";
 import { useRouter } from "expo-router";
 import { ScreenContainer } from "@/components/screen-container";
 import { SignInForm } from "@/components/sign-in-form";
+import { AuthBackendErrorState, AuthLoadingState } from "@/components/auth-status-views";
 import { useAuth } from "@/hooks/use-auth";
 import { useGame } from "@/lib/game-context";
 import { trpc } from "@/lib/trpc";
@@ -32,7 +33,7 @@ function CountdownTimer({ endTime, label, color }: { endTime: string | null; lab
 }
 
 export default function HomeScreen() {
-  const { user, isAuthenticated } = useAuth();
+  const { user, isAuthenticated, status, refresh, logout } = useAuth();
   const { activeGameId } = useGame();
   const router = useRouter();
 
@@ -48,6 +49,22 @@ export default function HomeScreen() {
   const game = gameQuery.data;
   const player = playerQuery.data;
   const targetProtection = player?.targetProtectionBadge;
+
+  if (status.kind === "loading" || status.kind === "provisioning") {
+    return (
+      <ScreenContainer className="p-6">
+        <AuthLoadingState />
+      </ScreenContainer>
+    );
+  }
+
+  if (status.kind === "backend-error") {
+    return (
+      <ScreenContainer className="p-6">
+        <AuthBackendErrorState onRetry={() => refresh()} onSignOut={logout} />
+      </ScreenContainer>
+    );
+  }
 
   if (!isAuthenticated) {
     return (
