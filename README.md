@@ -149,7 +149,9 @@ Tests currently cover `server/power-up-rules.ts` (pure game-rule math),
 ## Deployment
 
 - **Backend (Railway):** `railway.json` runs `pnpm run build:server`
-  (esbuild-bundles `server/_core/index.ts` to `dist/index.js`) and starts it
+  (esbuild-bundles `server/_core/index.ts` to `dist/index.mjs` -- the `.mjs`
+  extension is required so Node treats it as an ES module regardless of
+  Node version, since esbuild outputs `import`/`export` syntax) and starts it
   with `pnpm start`. Set the Railway-scoped env vars from the table above.
 - **Web (Vercel):** `vercel.json` runs `pnpm run build:web` (`expo export
   --platform web`) and serves `dist/client` as a static site. Set the
