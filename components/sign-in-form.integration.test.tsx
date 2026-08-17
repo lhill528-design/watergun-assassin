@@ -35,6 +35,13 @@ import { QueryClient, QueryClientProvider, useQuery, useQueryClient } from "@tan
 // prior test in the same file.
 afterEach(cleanup);
 
+// authMeShouldFail is a module-level flag (declared below, alongside the
+// trpc mock) so it defaults to false at the start of every test regardless
+// of what an earlier test in this file left it as.
+beforeEach(() => {
+  authMeShouldFail = false;
+});
+
 const clerkState = vi.hoisted(() => {
   let isSignedIn = false;
   const listeners = new Set<() => void>();
@@ -184,6 +191,20 @@ function TestHarness() {
       React.createElement("button", { onClick: () => logout() }, "Log Out"),
     );
   }
+  // Mirrors AuthSyncExpiredState's wiring in the real screens: Retry calls
+  // confirmSessionActivated() again (re-opens the bridge), Sign Out calls
+  // the real logout(). Rendered instead of SignInForm -- routing back to
+  // the sign-in form here is exactly the confusing session_exists loop
+  // this state exists to avoid.
+  if (status.kind === "sync-expired") {
+    return React.createElement(
+      "div",
+      null,
+      React.createElement("span", null, "SYNC EXPIRED"),
+      React.createElement("button", { onClick: () => confirmSessionActivated() }, "Retry"),
+      React.createElement("button", { onClick: () => logout() }, "Log Out"),
+    );
+  }
   return React.createElement(SignInForm, { onSessionActive: confirmSessionActivated });
 }
 
@@ -264,6 +285,35 @@ describe("SignInForm + useAuth integration", () => {
 
     expect(clerkState.isSignedIn).toBe(false); // confirms the isolation held
     await waitFor(() => expect(screen.getByText("SIGNED IN")).toBeTruthy());
+  });
+
+  // Correction from review of fa5311d: setActive() has already succeeded
+  // by the time onSessionActive() forces the auth.me refetch, so a failure
+  // in that forced fetch alone must NOT drop back to the sign-in form --
+  // retrying sign-in there is exactly the confusing session_exists loop
+  // the bridge exists to avoid, since Clerk still believes a session
+  // exists. It must show the sync-expired Retry/Sign-Out state instead.
+  it("a forced auth.me failure right after OTP verify shows Retry/Sign Out, not the sign-in form again", async () => {
+    clerkState.setIsSignedIn(false);
+    authMeFetchCount = 0;
+    authMeShouldFail = true;
+    backendUser = null;
+    const user = userEvent.setup();
+
+    mockSignInCreate.mockResolvedValue({
+      supportedFirstFactors: [{ strategy: "email_code", emailAddressId: "idn_3" }],
+    });
+    mockPrepareFirstFactor.mockResolvedValue({});
+    mockAttemptFirstFactor.mockResolvedValue({ status: "complete", createdSessionId: "sess_3" });
+    mockSetActiveSignIn.mockResolvedValue(undefined); // does NOT flip isSignedIn
+
+    renderHarness();
+    await requestAndEnterCode(user, "player3@example.com", "123456");
+    await user.click(screen.getByText("Verify & Sign In"));
+
+    await waitFor(() => expect(screen.getByText("SYNC EXPIRED")).toBeTruthy());
+    expect(screen.queryByLabelText("you@example.com")).toBeNull();
+    expect(screen.queryByText("SIGNED IN")).toBeNull();
   });
 
   // Rewritten per review: the previous version started already
@@ -457,7 +507,14 @@ describe("useAuth pending-bridge timeout", () => {
     expect(currentStatus()).toBe("sync-expired");
   });
 
-  it("a forced auth.me request that fails clears the pending state immediately instead of waiting out the timeout", async () => {
+  // Correction from review of fa5311d: setActive() has already succeeded
+  // by the time confirmSessionActivated forces the refetch, so a failure
+  // there must NOT fall back to "idle"/signed-out -- Clerk still believes
+  // a session exists, and signed-out would route back to the sign-in
+  // form, risking the same session_exists loop the bridge exists to
+  // avoid. It goes straight to "expired" instead, immediately rather than
+  // waiting out the timeout.
+  it("a forced auth.me request that fails transitions directly to sync-expired instead of back to idle", async () => {
     clerkState.setIsSignedIn(false);
     authMeShouldFail = true;
     authMeFetchCount = 0;
@@ -467,16 +524,71 @@ describe("useAuth pending-bridge timeout", () => {
     renderStatusHarness();
     await user.click(screen.getByText("Confirm"));
 
-    // No independent proof of a session ever arrived -- must not sit in
-    // "pending" waiting for a timeout that would only ever expire it the
-    // same way; it's cleared right away.
-    await waitFor(() => expect(currentStatus()).toBe("signed-out"));
+    await waitFor(() => expect(currentStatus()).toBe("sync-expired"));
 
-    // Confirms it was actually cleared (not silently still "pending"):
-    // advancing past the full bounded window must not flip it to
-    // sync-expired, since there is no active bridge window anymore.
+    // It's the real "expired" state, not a transient stop en route back to
+    // idle -- it doesn't drift away on its own, and the (already-fired)
+    // timer being cleared doesn't matter since there's nothing left for it
+    // to do.
     await vi.advanceTimersByTimeAsync(SESSION_ACTIVATION_TIMEOUT_MS);
-    expect(currentStatus()).toBe("signed-out");
+    expect(currentStatus()).toBe("sync-expired");
+  });
+
+  // Correction from review of fa5311d: previously only "pending" was
+  // normalized back to "idle" when isSignedIn caught up, so a bridge that
+  // had already expired stayed "expired" forever even after Clerk
+  // genuinely signed the user in -- surfacing a stale sync-expired screen
+  // on any later, real session expiry instead of the correct signed-out.
+  it("Clerk catching up after the bridge has already expired clears it back to idle, not stuck sync-expired", async () => {
+    clerkState.setIsSignedIn(false);
+    authMeShouldFail = false;
+    authMeFetchCount = 0;
+    backendUser = { id: 1, role: "user" };
+    const user = userEvent.setup({ delay: null });
+
+    renderStatusHarness();
+    await user.click(screen.getByText("Confirm"));
+    await waitFor(() => expect(currentStatus()).toBe("signed-in"));
+
+    await vi.advanceTimersByTimeAsync(SESSION_ACTIVATION_TIMEOUT_MS);
+    await waitFor(() => expect(currentStatus()).toBe("sync-expired"));
+
+    // Clerk's isSignedIn finally, genuinely catches up -- late, after the
+    // bridge already gave up on it.
+    clerkState.setIsSignedIn(true);
+
+    // Falls through to the normal signed-in-branch rules (userQueryStatus
+    // success + hasUser), proving the leftover "expired" state didn't
+    // block this -- and, more importantly per the next test, didn't just
+    // get shadowed by isSignedIn===true while still sitting in the cache.
+    await waitFor(() => expect(currentStatus()).toBe("signed-in"));
+  });
+
+  it("after a late Clerk catch-up, a later real session expiration produces signed-out, not a stale sync-expired", async () => {
+    clerkState.setIsSignedIn(false);
+    authMeShouldFail = false;
+    authMeFetchCount = 0;
+    backendUser = { id: 1, role: "user" };
+    const user = userEvent.setup({ delay: null });
+
+    renderStatusHarness();
+    await user.click(screen.getByText("Confirm"));
+    await waitFor(() => expect(currentStatus()).toBe("signed-in"));
+
+    await vi.advanceTimersByTimeAsync(SESSION_ACTIVATION_TIMEOUT_MS);
+    await waitFor(() => expect(currentStatus()).toBe("sync-expired"));
+
+    clerkState.setIsSignedIn(true); // late catch-up
+    await waitFor(() => expect(currentStatus()).toBe("signed-in"));
+
+    // A later, genuine session expiration -- unrelated to the bridge,
+    // which is long since normalized back to idle by now.
+    clerkState.setIsSignedIn(false);
+
+    // The regression this proves: without the idle-normalization fix,
+    // the leftover "expired" state would still be sitting in the cache
+    // and this would incorrectly read sync-expired instead of signed-out.
+    await waitFor(() => expect(currentStatus()).toBe("signed-out"));
   });
 
   it("logout clears the pending state and cached user even while the bridge is active", async () => {

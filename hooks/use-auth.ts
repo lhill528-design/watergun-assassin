@@ -86,11 +86,18 @@ export function useAuth() {
   });
   const sessionActivationState = stateQuery.data ?? "idle";
 
-  // Clerk caught up on its own -- the bridge isn't needed anymore. An
-  // effect (not a render-time write) so this doesn't run as a render side
-  // effect.
+  // Clerk caught up on its own -- the bridge isn't needed anymore, whether
+  // it caught up before the bounded window ran out ("pending") or only
+  // after ("expired"). Normalizing "expired" back to "idle" here too
+  // matters: isSignedIn is now authoritatively true, so deriveAuthStatus
+  // will already fall through to the normal signed-in-branch rules -- but
+  // leaving "expired" sitting in the cache would surface a stale
+  // sync-expired screen the next time isSignedIn genuinely goes false
+  // (e.g. a later, real session expiry), instead of the correct
+  // signed-out. An effect (not a render-time write) so this doesn't run as
+  // a render side effect.
   useEffect(() => {
-    if (isSignedIn && sessionActivationState === "pending") {
+    if (isSignedIn && sessionActivationState !== "idle") {
       clearSessionActivationTimer();
       queryClient.setQueryData(SESSION_ACTIVATION_STATE_KEY, "idle" satisfies SessionActivationState);
     }
@@ -121,12 +128,16 @@ export function useAuth() {
     armSessionActivationTimer(queryClient);
     const result = await meQuery.refetch();
     if (result.status === "error") {
-      // The forced fetch itself failed -- no independent proof of a valid
-      // session ever arrived, so there's nothing left for the bridge to
-      // wait out. Clear immediately rather than leaving "pending" to sit
-      // until the timer eventually expires it.
+      // The forced fetch itself failed. setActive() already succeeded
+      // though -- Clerk itself believes a session was created -- so this
+      // must NOT fall back to "idle": deriveAuthStatus would then read
+      // isSignedIn===false with nothing pending and render the sign-in
+      // form again, and retrying there risks the exact session_exists loop
+      // the bridge exists to avoid. Go straight to "expired" instead, the
+      // same explicit synchronization-error state a timeout reaches, which
+      // offers Retry/Sign Out rather than the sign-in form.
       clearSessionActivationTimer();
-      queryClient.setQueryData(SESSION_ACTIVATION_STATE_KEY, "idle" satisfies SessionActivationState);
+      queryClient.setQueryData(SESSION_ACTIVATION_STATE_KEY, "expired" satisfies SessionActivationState);
     }
   }, [queryClient, meQuery.refetch]);
 
