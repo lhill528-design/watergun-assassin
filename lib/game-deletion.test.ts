@@ -65,8 +65,35 @@ describe("requestGameDeletion", () => {
         expect.objectContaining({ text: "Cancel", style: "cancel" }),
         expect.objectContaining({ text: "Delete Permanently", style: "destructive" }),
       ]),
+      expect.objectContaining({ cancelable: false }),
     );
     expect(deleteGame).toHaveBeenCalledTimes(1);
+  });
+
+  // The correction this proves: on Android, Alert.alert's dialog can be
+  // dismissed (back button / tapping outside it) without either button's
+  // onPress ever firing. Without cancelable:false + onDismiss, the guard
+  // set at the top of requestGameDeletion would stay true forever,
+  // permanently disabling the delete button.
+  it("on native, dismissing the dialog without pressing a button still clears the in-progress flag", () => {
+    const deleteGame = vi.fn();
+    const onDeletingChange = vi.fn();
+    const alertNative = vi.fn((_title, _message, _buttons, dialogOptions) => {
+      // Simulates Android's back button / tap-outside dismissal, which
+      // invokes onDismiss rather than any button's onPress.
+      dialogOptions?.onDismiss?.();
+    });
+
+    requestGameDeletion({ gameName: "Summer Assassin", deleteGame, isDeleting: false, onDeletingChange, isWeb: false, alertNative });
+
+    expect(alertNative).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+      expect.objectContaining({ cancelable: false, onDismiss: expect.any(Function) }),
+    );
+    expect(deleteGame).not.toHaveBeenCalled();
+    expect(onDeletingChange).toHaveBeenLastCalledWith(false);
   });
 
   it("on native, pressing Cancel calls deleteGame zero times and clears the in-progress flag", () => {

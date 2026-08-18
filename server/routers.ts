@@ -6,6 +6,7 @@ import * as db from "./db";
 import { getCloudinaryUploadSignature, isValidEliminationVideoUrl } from "./storage";
 import { sendPushToUser, sendPushToUsers, registerPushToken } from "./push-service";
 import { MAP_CLAIM_METERS, MAP_DISCOVERY_METERS, ROULETTE_SPIN_COST, calculateKillAwards, derangedTargetPermutation, distanceMeters, isOpenSeasonSubmissionEligible, openSeasonWindow, pointFiveMilesAway, rouletteBalanceAfterOutcome } from "./power-up-rules";
+import { STANDARD_RULES, type StandardRulesGameType } from "./standard-rules";
 
 // Cloudinary signed uploads have no built-in per-user rate limit, so a
 // compromised/malicious client could otherwise mint unlimited signatures
@@ -1655,17 +1656,37 @@ export const appRouter = router({
         ruleText: z.string(),
         isStandard: z.boolean().default(false),
       }))
-      .mutation(async ({ input }) => {
+      .mutation(async ({ ctx, input }) => {
+        const game = await db.getGame(input.gameId);
+        if (!game || (game.adminId !== ctx.user.id && !ctx.user.isSuperAdmin)) throw new Error("Admin access required");
         const id = await db.createRule(input);
         return { id };
       }),
 
     update: protectedProcedure
       .input(z.object({ id: z.number(), isEnabled: z.boolean().optional(), ruleText: z.string().optional() }))
-      .mutation(async ({ input }) => {
+      .mutation(async ({ ctx, input }) => {
         const { id, ...data } = input;
+        const rule = await db.getRule(id);
+        if (!rule) throw new Error("Rule not found");
+        const game = await db.getGame(rule.gameId);
+        if (!game || (game.adminId !== ctx.user.id && !ctx.user.isSuperAdmin)) throw new Error("Admin access required");
         await db.updateRule(id, data);
         return { success: true };
+      }),
+
+    // One protected, transactional, idempotent bulk operation instead of
+    // the client firing one createRule mutation per standard rule with a
+    // forEach -- that could partially load the catalog on a failure
+    // partway through, and refetched rules.list once per rule instead of
+    // once overall.
+    seedStandard: protectedProcedure
+      .input(z.object({ gameId: z.number() }))
+      .mutation(async ({ ctx, input }) => {
+        const game = await db.getGame(input.gameId);
+        if (!game || (game.adminId !== ctx.user.id && !ctx.user.isSuperAdmin)) throw new Error("Admin access required");
+        const ruleTexts = STANDARD_RULES[game.gameType as StandardRulesGameType] ?? [];
+        return db.seedStandardRules(input.gameId, ruleTexts);
       }),
   }),
 

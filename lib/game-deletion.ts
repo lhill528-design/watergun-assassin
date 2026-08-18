@@ -7,7 +7,8 @@ import { Alert, Platform } from "react-native";
 // on web, confirming the delete could silently do nothing.
 
 type AlertButton = { text: string; style?: "cancel" | "destructive" | "default"; onPress?: () => void };
-type AlertFn = (title: string, message?: string, buttons?: AlertButton[]) => void;
+type AlertDialogOptions = { cancelable?: boolean; onDismiss?: () => void };
+type AlertFn = (title: string, message?: string, buttons?: AlertButton[], options?: AlertDialogOptions) => void;
 
 export function buildDeleteConfirmationMessage(gameName: string): string {
   return `Permanently delete “${gameName}”? Completed games should normally be preserved in Game History. This cannot be undone.`;
@@ -36,6 +37,12 @@ export interface RequestGameDeletionOptions {
 // had a chance to set anything. It flips back off on cancel (so a
 // mistaken tap doesn't lock the button) and, either way, once
 // deleteGame() settles.
+//
+// On Android, the confirmation dialog can also be dismissed without
+// either button firing (back button / tapping outside it) -- explicitly
+// non-cancelable, with an onDismiss fallback in case that's ever
+// overridden, so that path can't leave the guard (and the delete button)
+// stuck disabled either.
 export function requestGameDeletion(options: RequestGameDeletionOptions): void {
   if (options.isDeleting) return;
 
@@ -67,8 +74,13 @@ export function requestGameDeletion(options: RequestGameDeletionOptions): void {
     return;
   }
 
-  alertNative("Final confirmation", message, [
-    { text: "Cancel", style: "cancel", onPress: () => options.onDeletingChange(false) },
-    { text: "Delete Permanently", style: "destructive", onPress: () => void performDelete() },
-  ]);
+  alertNative(
+    "Final confirmation",
+    message,
+    [
+      { text: "Cancel", style: "cancel", onPress: () => options.onDeletingChange(false) },
+      { text: "Delete Permanently", style: "destructive", onPress: () => void performDelete() },
+    ],
+    { cancelable: false, onDismiss: () => options.onDeletingChange(false) },
+  );
 }

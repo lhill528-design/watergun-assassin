@@ -109,6 +109,24 @@ describe("CreateGameScreen", () => {
     expect(screen.getByText(/Game created/i)).toBeTruthy();
   });
 
+  // Correction: the submitting guard used to only ever get cleared from
+  // onError -- onSuccess just navigated away and trusted the screen to
+  // unmount. If that route transition were ever interrupted (or, as here,
+  // simply doesn't unmount the component), the Create button must not be
+  // left permanently disabled.
+  it("clears the submitting guard on success, before navigating -- the button isn't left stuck disabled", () => {
+    render(React.createElement(CreateGameScreen));
+    typeGameName("Summer Assassin");
+    fireEvent.click(screen.getByText("Create Game"));
+
+    expect((screen.getByText("Creating...").closest("button") as HTMLButtonElement).disabled).toBe(true);
+
+    act(() => trpcState.lastMutationOptions?.onSuccess?.({ gameId: 77 }));
+
+    const button = screen.getByRole("button", { name: /Create Game/ });
+    expect((button as HTMLButtonElement).disabled).toBe(false);
+  });
+
   it("repeated clicks before the request settles call the mutation only once", () => {
     render(React.createElement(CreateGameScreen));
     typeGameName("Summer Assassin");

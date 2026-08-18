@@ -1,15 +1,17 @@
-import { Text, View, ScrollView, TouchableOpacity, TextInput, Alert } from "react-native";
+import { Text, View, ScrollView, TouchableOpacity, TextInput, Alert, Platform } from "react-native";
 import { useRouter } from "expo-router";
 import { ScreenContainer } from "@/components/screen-container";
 import { useGame } from "@/lib/game-context";
 import { trpc } from "@/lib/trpc";
-import { useState } from "react";
+import { requestConfirmedAction } from "@/lib/confirm-then-run";
+import { useRef, useState } from "react";
 
 
 
 export default function AdminPowerUpsScreen() {
   const { activeGameId } = useGame();
   const router = useRouter();
+  const utils = trpc.useUtils();
   const [showAdd, setShowAdd] = useState(false);
   const [newName, setNewName] = useState("");
   const [newEmoji, setNewEmoji] = useState("⚡");
@@ -18,13 +20,33 @@ export default function AdminPowerUpsScreen() {
   const [newUsageFee, setNewUsageFee] = useState("0");
   const [newDuration, setNewDuration] = useState("");
   const [newCategory, setNewCategory] = useState<"offensive" | "defensive" | "utility" | "special" | "chaos">("utility");
+  const [seedMessage, setSeedMessage] = useState<{ kind: "success" | "error"; text: string } | null>(null);
+  const [isSeeding, setIsSeeding] = useState(false);
+  // A ref (not just the isSeeding state above) so the guard is checked
+  // synchronously -- a second tap that lands before React re-renders the
+  // disabled button still can't slip through and open a second
+  // confirmation dialog.
+  const isSeedingRef = useRef(false);
+  const setSeeding = (seeding: boolean) => {
+    isSeedingRef.current = seeding;
+    setIsSeeding(seeding);
+  };
 
   const powerUpsQuery = trpc.powerUp.list.useQuery({ gameId: activeGameId! }, { enabled: !!activeGameId });
   const createPowerUp = trpc.powerUp.create.useMutation({ onSuccess: () => { powerUpsQuery.refetch(); setShowAdd(false); resetForm(); } });
   const updatePowerUp = trpc.powerUp.update.useMutation({ onSuccess: () => powerUpsQuery.refetch() });
   const seedAllPowerUps = trpc.powerUp.seedAll.useMutation({
-    onSuccess: (data) => { powerUpsQuery.refetch(); Alert.alert("Done!", `Loaded ${data.count} power-ups from the full catalog.`); },
-    onError: (err) => Alert.alert("Error", err.message),
+    onSuccess: (data) => {
+      utils.powerUp.list.invalidate({ gameId: activeGameId! });
+      setSeedMessage({ kind: "success", text: `Loaded ${data.count} power-ups from the full catalog.` });
+    },
+    onError: (err) => {
+      setSeedMessage({ kind: "error", text: err.message });
+      // Supplemental only on native, where Alert.alert's callbacks are
+      // reliable -- the inline message above is what actually drives the
+      // UI on every platform.
+      if (Platform.OS !== "web") Alert.alert("Error", err.message);
+    },
   });
   const pendingFeesQuery = trpc.powerUp.pendingFees.useQuery({ gameId: activeGameId! }, { enabled: !!activeGameId });
   const resolveFee = trpc.powerUp.resolveFee.useMutation({
@@ -37,15 +59,16 @@ export default function AdminPowerUpsScreen() {
   const resetForm = () => { setNewName(""); setNewEmoji("⚡"); setNewEffect(""); setNewCost("100"); setNewUsageFee("0"); setNewDuration(""); };
 
   const handleLoadDefaults = () => {
-    Alert.alert("Load All 44 Power-Ups", "This will add the complete spreadsheet catalog to your game shop. You can toggle individual ones on/off after.", [
-      { text: "Cancel", style: "cancel" },
-      {
-        text: "Load All",
-        onPress: () => {
-          seedAllPowerUps.mutate({ gameId: activeGameId! });
-        },
-      },
-    ]);
+    if (!activeGameId) return;
+    setSeedMessage(null);
+    requestConfirmedAction({
+      title: "Load All 44 Power-Ups",
+      message: "This will add the complete spreadsheet catalog to your game shop. You can toggle individual ones on/off after.",
+      confirmLabel: "Load All",
+      isRunning: isSeedingRef.current,
+      onRunningChange: setSeeding,
+      run: () => seedAllPowerUps.mutateAsync({ gameId: activeGameId }),
+    });
   };
 
   const handleCreate = () => {
@@ -80,8 +103,9 @@ export default function AdminPowerUpsScreen() {
           <TouchableOpacity
             className="flex-1 bg-primary/20 border border-primary rounded-xl p-3 items-center"
             onPress={handleLoadDefaults}
+            disabled={isSeeding}
           >
-            <Text className="text-primary font-bold text-sm">{seedAllPowerUps.isPending ? "Loading..." : "📦 Load All 44"}</Text>
+            <Text className="text-primary font-bold text-sm">{isSeeding ? "Loading..." : "📦 Load All 44"}</Text>
           </TouchableOpacity>
           <TouchableOpacity
             className="flex-1 bg-surface border border-border rounded-xl p-3 items-center"
@@ -90,6 +114,11 @@ export default function AdminPowerUpsScreen() {
             <Text className="text-foreground font-bold text-sm">{showAdd ? "Cancel" : "+ Custom"}</Text>
           </TouchableOpacity>
         </View>
+        {seedMessage && (
+          <View className={`rounded-xl p-3 mb-4 border ${seedMessage.kind === "success" ? "bg-success/20 border-success" : "bg-error/20 border-error"}`}>
+            <Text className={`text-sm text-center ${seedMessage.kind === "success" ? "text-success" : "text-error"}`}>{seedMessage.text}</Text>
+          </View>
+        )}
 
         {/* Add Custom Form */}
         {showAdd && (

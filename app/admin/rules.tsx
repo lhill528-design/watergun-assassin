@@ -1,82 +1,66 @@
-import { Text, View, ScrollView, TouchableOpacity, TextInput, Alert, FlatList } from "react-native";
+import { Text, View, ScrollView, TouchableOpacity, TextInput, Alert, Platform } from "react-native";
 import { useRouter } from "expo-router";
 import { ScreenContainer } from "@/components/screen-container";
 import { useGame } from "@/lib/game-context";
 import { trpc } from "@/lib/trpc";
-import { useState } from "react";
-
-const STANDARD_RULES: Record<string, string[]> = {
-  last_man_standing: [
-    "Players are eliminated when hit with a water gun",
-    "Safe object must be held (not just carried) to be immune",
-    "No eliminations inside homes or workplaces",
-    "No eliminations while target is driving",
-    "Video evidence required for all eliminations",
-    "Eliminated players cannot reveal their assassin",
-    "No water balloons or super soakers - pistols only",
-    "Players must update location every 4 hours during active rounds",
-  ],
-  highest_points: [
-    "Points awarded per elimination: 100",
-    "Bonus points for creative eliminations: 50",
-    "Points deducted for false claims: -50",
-    "Safe object must be held to be immune",
-    "Video evidence required for all eliminations",
-    "No eliminations inside homes or workplaces",
-    "Players can be eliminated multiple times",
-    "Players respawn after 2 hours",
-  ],
-  most_eliminations: [
-    "Only confirmed kills count toward total",
-    "Video evidence required for all eliminations",
-    "Safe object must be held to be immune",
-    "No eliminations inside homes or workplaces",
-    "No eliminations while target is driving",
-    "Players respawn after 1 hour",
-    "Ties broken by fewer deaths",
-  ],
-  teams: [
-    "Teams of 2 players each",
-    "Both team members must be eliminated to be out",
-    "Partners can revive each other once per round",
-    "Safe object applies to both team members",
-    "Video evidence required for all eliminations",
-    "No eliminations inside homes or workplaces",
-    "Team communication is encouraged",
-  ],
-};
+import { requestConfirmedAction } from "@/lib/confirm-then-run";
+import { useRef, useState } from "react";
 
 export default function AdminRulesScreen() {
   const { activeGameId } = useGame();
   const router = useRouter();
+  const utils = trpc.useUtils();
   const [newRule, setNewRule] = useState("");
+  const [seedMessage, setSeedMessage] = useState<{ kind: "success" | "error"; text: string } | null>(null);
+  const [isSeeding, setIsSeeding] = useState(false);
+  // A ref (not just the isSeeding state above) so the guard is checked
+  // synchronously -- a second tap that lands before React re-renders the
+  // disabled button still can't slip through and open a second
+  // confirmation dialog.
+  const isSeedingRef = useRef(false);
+  const setSeeding = (seeding: boolean) => {
+    isSeedingRef.current = seeding;
+    setIsSeeding(seeding);
+  };
 
   const gameQuery = trpc.game.get.useQuery({ gameId: activeGameId! }, { enabled: !!activeGameId });
   const rulesQuery = trpc.rules.list.useQuery({ gameId: activeGameId! }, { enabled: !!activeGameId });
   const createRule = trpc.rules.create.useMutation({ onSuccess: () => { rulesQuery.refetch(); setNewRule(""); } });
   const updateRule = trpc.rules.update.useMutation({ onSuccess: () => rulesQuery.refetch() });
+  const seedStandardRules = trpc.rules.seedStandard.useMutation({
+    onSuccess: (data) => {
+      utils.rules.list.invalidate({ gameId: activeGameId! });
+      const skippedNote = data.skipped ? ` (${data.skipped} already loaded)` : "";
+      setSeedMessage({
+        kind: "success",
+        text: data.created > 0
+          ? `Added ${data.created} standard rule${data.created === 1 ? "" : "s"}${skippedNote}.`
+          : `Standard rules are already loaded${skippedNote}.`,
+      });
+    },
+    onError: (err) => {
+      setSeedMessage({ kind: "error", text: err.message });
+      // Supplemental only on native, where Alert.alert's callbacks are
+      // reliable -- the inline message above is what actually drives the
+      // UI on every platform.
+      if (Platform.OS !== "web") Alert.alert("Error", err.message);
+    },
+  });
 
   const game = gameQuery.data;
   const rules = rulesQuery.data || [];
 
   const handleAddStandardRules = () => {
-    if (!game?.gameType) return;
-    const standardRules = STANDARD_RULES[game.gameType] || [];
-    Alert.alert(
-      "Add Standard Rules",
-      `Add ${standardRules.length} standard rules for ${game.gameType.replace(/_/g, " ")}?`,
-      [
-        { text: "Cancel", style: "cancel" },
-        {
-          text: "Add All",
-          onPress: () => {
-            standardRules.forEach((rule) => {
-              createRule.mutate({ gameId: activeGameId!, ruleText: rule, isStandard: true });
-            });
-          },
-        },
-      ]
-    );
+    if (!activeGameId) return;
+    setSeedMessage(null);
+    requestConfirmedAction({
+      title: "Add Standard Rules",
+      message: `Add the standard rules for ${game?.gameType?.replace(/_/g, " ") || "this game type"}? Rules already loaded won't be duplicated.`,
+      confirmLabel: "Add All",
+      isRunning: isSeedingRef.current,
+      onRunningChange: setSeeding,
+      run: () => seedStandardRules.mutateAsync({ gameId: activeGameId }),
+    });
   };
 
   const handleAddCustomRule = () => {
@@ -101,10 +85,16 @@ export default function AdminRulesScreen() {
         <TouchableOpacity
           className="bg-primary/20 border border-primary rounded-xl p-4 mb-4 items-center"
           onPress={handleAddStandardRules}
+          disabled={isSeeding}
         >
-          <Text className="text-primary font-bold">📋 Load Standard Rules</Text>
+          <Text className="text-primary font-bold">{isSeeding ? "Loading..." : "📋 Load Standard Rules"}</Text>
           <Text className="text-primary/70 text-xs mt-1">For {game?.gameType?.replace(/_/g, " ") || "game type"}</Text>
         </TouchableOpacity>
+        {seedMessage && (
+          <View className={`rounded-xl p-3 mb-4 border ${seedMessage.kind === "success" ? "bg-success/20 border-success" : "bg-error/20 border-error"}`}>
+            <Text className={`text-sm text-center ${seedMessage.kind === "success" ? "text-success" : "text-error"}`}>{seedMessage.text}</Text>
+          </View>
+        )}
 
         {/* Add Custom Rule */}
         <View className="mb-4">

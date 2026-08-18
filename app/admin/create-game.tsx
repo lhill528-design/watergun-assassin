@@ -44,6 +44,12 @@ export default function CreateGameScreen() {
 
   const createMutation = trpc.game.create.useMutation({
     onSuccess: (data) => {
+      // Cleared before navigating (not left for the route change to make
+      // moot) -- if router.replace() were ever interrupted or this screen
+      // stayed mounted for any reason, the Create button must not be
+      // left permanently disabled by a guard nothing else was going to
+      // clear.
+      setSubmitting(false);
       setJustCreated(true);
       handleGameCreated({
         gameId: data.gameId,

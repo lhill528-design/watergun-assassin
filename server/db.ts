@@ -811,10 +811,42 @@ export async function getGameRules(gameId: number) {
   return db.select().from(gameRules).where(eq(gameRules.gameId, gameId));
 }
 
+export async function getRule(id: number) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const result = await db.select().from(gameRules).where(eq(gameRules.id, id)).limit(1);
+  return result[0];
+}
+
 export async function updateRule(id: number, data: Partial<typeof gameRules.$inferInsert>) {
   const db = await getDb();
   if (!db) throw new Error("Database not available");
   await db.update(gameRules).set(data).where(eq(gameRules.id, id));
+}
+
+// Loads the given rule texts as standard rules for a game, skipping any
+// that already exist (by exact text match) rather than duplicating them --
+// calling this again after rules were already loaded is a no-op for those
+// rules. The read-then-insert sequence runs inside one transaction so a
+// failure partway through can't leave the standard-rule set half-loaded.
+export async function seedStandardRules(
+  gameId: number,
+  ruleTexts: string[],
+): Promise<{ created: number; skipped: number; total: number }> {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+  return db.transaction(async (tx) => {
+    const existing = await tx.select({ ruleText: gameRules.ruleText }).from(gameRules).where(eq(gameRules.gameId, gameId));
+    const existingTexts = new Set(existing.map((row) => row.ruleText));
+    let created = 0;
+    for (const ruleText of ruleTexts) {
+      if (existingTexts.has(ruleText)) continue;
+      await tx.insert(gameRules).values({ gameId, ruleText, isStandard: true, isEnabled: true });
+      created++;
+      existingTexts.add(ruleText); // guards against duplicates within ruleTexts itself
+    }
+    return { created, skipped: ruleTexts.length - created, total: ruleTexts.length };
+  });
 }
 
 // ===== KILL FEED QUERIES =====
