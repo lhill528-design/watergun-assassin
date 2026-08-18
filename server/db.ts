@@ -1,18 +1,91 @@
 import { eq, and, desc, asc, sql, isNull } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/mysql2";
+import { createPool, type Pool, type PoolOptions } from "mysql2/promise";
 import { InsertUser, users, games, gamePlayers, powerUps, eliminations, achievements, playerAchievements, playerPowerUps, powerUpUsageFees, gameRules, killFeed, mapPowerUps, mapPowerUpGuesses, teams, bounties, notifications, rouletteOutcomes, duels, chatMessages } from "../drizzle/schema";
 import { ENV } from "./_core/env";
 
 const SUPER_ADMIN_EMAILS = ["lhill528@gmail.com", "lhill29@comcast.net"];
 
-let _db: ReturnType<typeof drizzle> | null = null;
+export interface DatabaseConnectionConfig {
+  host: string;
+  port: number;
+  user: string;
+  password: string;
+  database: string;
+}
+
+// Manual parsing (rather than handing the raw string straight to mysql2)
+// so host/port/user/password/database are all explicit values under our
+// control before TLS options -- which the connection string itself cannot
+// express safely -- get merged in. `new URL()` leaves username/password as
+// still percent-encoded exactly as written in the string, so they're
+// decoded here rather than left for mysql2 to receive un-decoded.
+export function parseDatabaseUrl(databaseUrl: string): DatabaseConnectionConfig {
+  const url = new URL(databaseUrl);
+  const database = decodeURIComponent(url.pathname.replace(/^\//, ""));
+  if (!database) {
+    throw new Error("DATABASE_URL is missing a database name");
+  }
+  return {
+    host: url.hostname,
+    port: url.port ? Number(url.port) : 3306,
+    user: decodeURIComponent(url.username),
+    password: decodeURIComponent(url.password),
+    database,
+  };
+}
+
+// TLS is fixed here, not sourced from the URL's own query string (e.g. a
+// `ssl-mode=...` param) -- TiDB's proxy returns a generic
+// ER_UNKNOWN_ERROR/1105 for plain, non-TLS mysql2 connections, and this is
+// the exact explicit configuration confirmed to work in production
+// diagnosis. rejectUnauthorized must never be false: that would accept any
+// certificate, defeating the point of requiring TLS at all.
+export function buildPoolOptions(databaseUrl: string): PoolOptions {
+  const config = parseDatabaseUrl(databaseUrl);
+  return {
+    host: config.host,
+    port: config.port,
+    user: config.user,
+    password: config.password,
+    database: config.database,
+    ssl: {
+      minVersion: "TLSv1.2",
+      rejectUnauthorized: true,
+    },
+  };
+}
+
+function createDatabasePool(databaseUrl: string): Pool {
+  return createPool(buildPoolOptions(databaseUrl));
+}
+
+// Named (rather than inlining `drizzle(createDatabasePool(...))` at the
+// call site) so `_db`'s type can be inferred from this specific call --
+// passing a mysql2/promise Pool in, as opposed to letting drizzle() infer
+// its default (callback-style) client type from a bare connection string
+// -- which is exactly the client shape drizzle-orm/mysql2 requires here.
+function createDrizzleClient(databaseUrl: string) {
+  return drizzle(createDatabasePool(databaseUrl));
+}
+
+// Never includes the error's own message -- a driver error can echo back
+// connection details (e.g. a malformed-URL TypeError includes the
+// offending string verbatim), so only a fixed stage label and the error's
+// class name are logged.
+function logConnectionFailure(stage: string, error: unknown): void {
+  const errorClass = error instanceof Error ? error.constructor.name : typeof error;
+  console.warn(`[Database] connection failed (stage=${stage}, errorClass=${errorClass})`);
+}
+
+let _db: ReturnType<typeof createDrizzleClient> | null = null;
 
 export async function getDb() {
   if (!_db && process.env.DATABASE_URL) {
     try {
-      _db = drizzle(process.env.DATABASE_URL);
+      _db = createDrizzleClient(process.env.DATABASE_URL);
     } catch (error) {
-      console.warn("[Database] Failed to connect:", error);
+      logConnectionFailure("connection-init", error);
       _db = null;
     }
   }
