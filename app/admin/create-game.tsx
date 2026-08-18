@@ -1,9 +1,10 @@
-import { Text, View, ScrollView, TouchableOpacity, TextInput, Alert } from "react-native";
+import { Text, View, ScrollView, TouchableOpacity, TextInput, Alert, Platform } from "react-native";
 import { useRouter } from "expo-router";
 import { ScreenContainer } from "@/components/screen-container";
 import { useGame } from "@/lib/game-context";
 import { trpc } from "@/lib/trpc";
-import { useState } from "react";
+import { requestGameCreation, handleGameCreated } from "@/lib/game-creation";
+import { useRef, useState } from "react";
 
 const GAME_TYPES = [
   { key: "last_man_standing", label: "Last Man Standing", desc: "Rounds until one player remains", icon: "👑" },
@@ -15,6 +16,7 @@ const GAME_TYPES = [
 export default function CreateGameScreen() {
   const router = useRouter();
   const { setActiveGameId } = useGame();
+  const utils = trpc.useUtils();
   const [name, setName] = useState("");
   const [gameType, setGameType] = useState<typeof GAME_TYPES[number]["key"]>("last_man_standing");
   const [entryFee, setEntryFee] = useState("0");
@@ -27,33 +29,51 @@ export default function CreateGameScreen() {
   const [startingPoints, setStartingPoints] = useState("100");
   const [eliminationPoints, setEliminationPoints] = useState("100");
   const [locationPingInterval, setLocationPingInterval] = useState("15");
+  const [formError, setFormError] = useState<string | null>(null);
+  const [justCreated, setJustCreated] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  // A ref (not just the isSubmitting state above) so the guard is checked
+  // synchronously -- a second tap that lands before React re-renders the
+  // disabled button still can't slip through and call mutate() again.
+  const isSubmittingRef = useRef(false);
+
+  const setSubmitting = (submitting: boolean) => {
+    isSubmittingRef.current = submitting;
+    setIsSubmitting(submitting);
+  };
 
   const createMutation = trpc.game.create.useMutation({
     onSuccess: (data) => {
-      setActiveGameId(data.gameId);
-      Alert.alert("Game Created!", "Your game has been created. Set up rules and power-ups next.", [
-        { text: "Go to Setup", onPress: () => router.push("/admin/game-setup" as any) },
-        { text: "Done", onPress: () => router.back() },
-      ]);
+      setJustCreated(true);
+      handleGameCreated({
+        gameId: data.gameId,
+        setActiveGameId,
+        invalidateMyGames: () => utils.game.myGames.invalidate(),
+        invalidateAdminGames: () => utils.game.adminGames.invalidate(),
+        navigateToGameSetup: () => router.replace("/admin/game-setup" as any),
+      });
     },
-    onError: (err) => Alert.alert("Error", err.message),
+    onError: (err) => {
+      setSubmitting(false);
+      setFormError(err.message);
+      // Supplemental only on native, where Alert.alert's callbacks are
+      // reliable -- inline formError above is what actually drives the UI
+      // on every platform.
+      if (Platform.OS !== "web") Alert.alert("Error", err.message);
+    },
   });
 
   const handleCreate = () => {
-    if (!name.trim()) { Alert.alert("Error", "Game name is required"); return; }
-    createMutation.mutate({
-      name: name.trim(),
-      gameType,
-      entryFee: parseInt(entryFee) || 0,
-      roundLength: parseInt(roundLength) || 72,
-      safeObject: safeObject || undefined,
-      targetAssignment,
-      endCondition: endCondition || undefined,
-      showLocationsDuringPurge: showLocations,
-      inheritTarget,
-      startingPoints: parseInt(startingPoints) || 0,
-      eliminationPoints: parseInt(eliminationPoints) || 100,
-      locationPingInterval: parseInt(locationPingInterval) || 15,
+    setFormError(null);
+    requestGameCreation({
+      values: {
+        name, gameType, entryFee, roundLength, safeObject, targetAssignment,
+        endCondition, showLocations, inheritTarget, startingPoints, eliminationPoints, locationPingInterval,
+      },
+      isSubmitting: isSubmittingRef.current,
+      onSubmittingChange: setSubmitting,
+      createGame: (input) => createMutation.mutate(input),
+      onValidationError: setFormError,
     });
   };
 
@@ -67,6 +87,17 @@ export default function CreateGameScreen() {
           </TouchableOpacity>
           <Text className="text-xl font-bold text-foreground">➕ Create New Game</Text>
         </View>
+
+        {justCreated && (
+          <View className="bg-success/20 border border-success rounded-xl p-3 mb-4">
+            <Text className="text-success text-sm text-center font-semibold">Game created! Taking you to setup…</Text>
+          </View>
+        )}
+        {formError && (
+          <View className="bg-error/20 border border-error rounded-xl p-3 mb-4">
+            <Text className="text-error text-sm text-center">{formError}</Text>
+          </View>
+        )}
 
         {/* Game Name */}
         <View className="mb-4">
@@ -249,10 +280,10 @@ export default function CreateGameScreen() {
         <TouchableOpacity
           className="bg-primary py-4 rounded-xl items-center"
           onPress={handleCreate}
-          disabled={createMutation.isPending}
+          disabled={isSubmitting}
         >
           <Text className="text-background font-bold text-base">
-            {createMutation.isPending ? "Creating..." : "Create Game"}
+            {isSubmitting ? "Creating..." : "Create Game"}
           </Text>
         </TouchableOpacity>
       </ScrollView>

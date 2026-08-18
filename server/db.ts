@@ -151,13 +151,30 @@ export async function updateUserDisplayName(userId: number, displayName: string 
 
 // ===== GAME QUERIES =====
 
-export async function createGame(data: typeof games.$inferInsert) {
+// Creates the game and adds its admin as the game's first player in a
+// single transaction. These used to be two separate calls (createGame()
+// then joinGame()) issued back to back from the game.create mutation; if
+// the second one failed for any reason, the first had already committed,
+// leaving an orphaned game row with no players and no way for the admin
+// who "created" it to ever see it again as theirs. Committing or rolling
+// back both together closes that gap.
+export async function createGameWithAdmin(
+  data: typeof games.$inferInsert,
+): Promise<{ gameId: number; playerId: number }> {
   const db = await getDb();
   if (!db) throw new Error("Database not available");
   // Generate a unique join code
   const joinCode = Math.random().toString(36).substring(2, 8).toUpperCase();
-  const result = await db.insert(games).values({ ...data, joinCode });
-  return result[0].insertId;
+  return db.transaction(async (tx) => {
+    const gameResult = await tx.insert(games).values({ ...data, joinCode });
+    const gameId = gameResult[0].insertId;
+    const playerResult = await tx.insert(gamePlayers).values({
+      gameId,
+      userId: data.adminId,
+      points: data.startingPoints || 0,
+    });
+    return { gameId, playerId: playerResult[0].insertId };
+  });
 }
 
 export async function getGame(gameId: number) {

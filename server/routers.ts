@@ -94,8 +94,7 @@ export const appRouter = router({
         locationPingInterval: z.number().default(15),
       }))
       .mutation(async ({ ctx, input }) => {
-        const gameId = await db.createGame({ ...input, adminId: ctx.user.id });
-        await db.joinGame({ gameId, userId: ctx.user.id });
+        const { gameId } = await db.createGameWithAdmin({ ...input, adminId: ctx.user.id });
         return { gameId };
       }),
 
