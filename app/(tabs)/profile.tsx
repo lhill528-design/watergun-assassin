@@ -6,6 +6,7 @@ import { AuthBackendErrorState, AuthLoadingState, AuthSyncExpiredState } from "@
 import { useAuth } from "@/hooks/use-auth";
 import { useGame } from "@/lib/game-context";
 import { trpc } from "@/lib/trpc";
+import { requestSignOut } from "@/lib/sign-out";
 import { useEffect, useState } from "react";
 
 export default function ProfileScreen() {
@@ -14,6 +15,7 @@ export default function ProfileScreen() {
   const router = useRouter();
   const [joinCode, setJoinCode] = useState("");
   const [displayName, setDisplayName] = useState(user?.displayName || "");
+  const [signingOut, setSigningOut] = useState(false);
 
   useEffect(() => {
     setDisplayName(user?.displayName || "");
@@ -259,14 +261,10 @@ export default function ProfileScreen() {
 
           <TouchableOpacity
             className="bg-surface border border-error rounded-xl p-4 items-center"
-            onPress={() => {
-              Alert.alert("Logout", "Are you sure?", [
-                { text: "Cancel", style: "cancel" },
-                { text: "Logout", style: "destructive", onPress: logout },
-              ]);
-            }}
+            disabled={signingOut}
+            onPress={() => requestSignOut({ logout, isSigningOut: signingOut, onSigningOutChange: setSigningOut })}
           >
-            <Text className="text-error font-bold">Sign Out</Text>
+            <Text className="text-error font-bold">{signingOut ? "Signing Out…" : "Sign Out"}</Text>
           </TouchableOpacity>
         </View>
       </ScrollView>
