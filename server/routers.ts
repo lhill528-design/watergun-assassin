@@ -7,6 +7,7 @@ import { getCloudinaryUploadSignature, isValidEliminationVideoUrl } from "./stor
 import { sendPushToUser, sendPushToUsers, registerPushToken } from "./push-service";
 import { MAP_CLAIM_METERS, MAP_DISCOVERY_METERS, ROULETTE_SPIN_COST, calculateKillAwards, derangedTargetPermutation, distanceMeters, isOpenSeasonSubmissionEligible, openSeasonWindow, pointFiveMilesAway, rouletteBalanceAfterOutcome } from "./power-up-rules";
 import { STANDARD_RULES, type StandardRulesGameType } from "./standard-rules";
+import { ACHIEVEMENT_CATALOG } from "./standard-achievements";
 
 // Cloudinary signed uploads have no built-in per-user rate limit, so a
 // compromised/malicious client could otherwise mint unlimited signatures
@@ -165,6 +166,9 @@ export const appRouter = router({
       .mutation(async ({ input, ctx }) => {
         const game = await db.getGame(input.gameId);
         if (!game || (game.adminId !== ctx.user.id && !ctx.user.isSuperAdmin)) throw new Error("Admin access required");
+        if (game.deletedAt) throw new Error("This game has been deleted");
+        if (game.status === "completed") throw new Error("This game has already ended");
+        if (game.purgeActive) throw new Error("A purge is already active");
         const endTime = new Date(Date.now() + input.durationMinutes * 60000);
         await db.pausePurgeSensitivePowerUps(input.gameId);
         await db.updateGame(input.gameId, { purgeActive: true, purgeEndTime: endTime });
@@ -189,6 +193,7 @@ export const appRouter = router({
       .mutation(async ({ input, ctx }) => {
         const game = await db.getGame(input.gameId);
         if (!game || (game.adminId !== ctx.user.id && !ctx.user.isSuperAdmin)) throw new Error("Admin access required");
+        if (!game.purgeActive) throw new Error("No purge is currently active");
         await db.updateGame(input.gameId, { purgeActive: false, purgeEndTime: null });
         await db.resumePurgeSensitivePowerUps(input.gameId);
         await db.createKillFeedEvent({ gameId: input.gameId, eventType: "purge_end", message: "🕊️ Purge has ended. Normal rules resume." });
@@ -220,12 +225,13 @@ export const appRouter = router({
         const game = await db.getGame(input.gameId);
         if (!game) throw new Error("Game not found");
         if (game.adminId !== ctx.user.id && !ctx.user.isSuperAdmin) throw new Error("Admin access required");
-        const newRound = (game.currentRound || 0) + 1;
-        const roundEnd = new Date(Date.now() + (game.roundLength || 72) * 3600000);
+        // The round number, target promotions, and the game's own
+        // currentRound/roundEndTime/status all commit together (or not at
+        // all) -- see startRoundAtomic. Wildcard reassignment below is a
+        // separate, independent power-up-inventory side effect, not part
+        // of that core state.
+        const { currentRound } = await db.startRoundAtomic(input.gameId);
         const roundPlayers = await db.getGamePlayers(input.gameId);
-        for (const player of roundPlayers) {
-          if (player.nextRoundTargetId) await db.updatePlayer(player.id, { targetId: player.nextRoundTargetId, nextRoundTargetId: null });
-        }
         const wildcards = await db.getActiveGamePowerUpsByName(input.gameId, "Wildcard");
         for (const wildcard of wildcards) {
           const owner = roundPlayers.find(player => player.id === wildcard.gamePlayerId);
@@ -241,8 +247,7 @@ export const appRouter = router({
           await db.updatePlayer(selectedHunter.id, { targetId: oldTarget });
           await db.consumePlayerPowerUp(wildcard.id);
         }
-        await db.updateGame(input.gameId, { currentRound: newRound, roundEndTime: roundEnd, status: "active" });
-        await db.createKillFeedEvent({ gameId: input.gameId, eventType: "round_start", message: `🎯 Round ${newRound} has begun!` });
+        await db.createKillFeedEvent({ gameId: input.gameId, eventType: "round_start", message: `🎯 Round ${currentRound} has begun!` });
         return { success: true };
       }),
 
@@ -251,10 +256,33 @@ export const appRouter = router({
       .mutation(async ({ input, ctx }) => {
         const game = await db.getGame(input.gameId);
         if (!game || (game.adminId !== ctx.user.id && !ctx.user.isSuperAdmin)) throw new Error("Admin access required");
+        if (game.roundEndTime == null) throw new Error("No round is currently active");
         for (const vendetta of await db.getActiveGamePowerUpsByName(input.gameId, "Vendetta")) await db.consumePlayerPowerUp(vendetta.id);
         await db.updateGame(input.gameId, { roundEndTime: null });
         await db.createKillFeedEvent({ gameId: input.gameId, eventType: "round_end", message: `🏁 Round ${game?.currentRound || 0} has ended!` });
         return { success: true };
+      }),
+
+    // Backing the admin "Auto-Assign All Targets" / "Clear All Targets"
+    // buttons (app/admin/targets.tsx). Both used to be client-side loops
+    // firing one player.update mutation per player -- a failure partway
+    // through could leave targets half-assigned/half-cleared, and Clear
+    // sent targetId: 0 (a real, if nonsensical, player id) instead of
+    // NULL. See db.assignTargetsAtomic / clearTargetsAtomic.
+    assignTargets: protectedProcedure
+      .input(z.object({ gameId: z.number() }))
+      .mutation(async ({ input, ctx }) => {
+        const game = await db.getGame(input.gameId);
+        if (!game || (game.adminId !== ctx.user.id && !ctx.user.isSuperAdmin)) throw new Error("Admin access required");
+        return db.assignTargetsAtomic(input.gameId);
+      }),
+
+    clearTargets: protectedProcedure
+      .input(z.object({ gameId: z.number() }))
+      .mutation(async ({ input, ctx }) => {
+        const game = await db.getGame(input.gameId);
+        if (!game || (game.adminId !== ctx.user.id && !ctx.user.isSuperAdmin)) throw new Error("Admin access required");
+        return db.clearTargetsAtomic(input.gameId);
       }),
 
     endGame: protectedProcedure
@@ -477,6 +505,13 @@ export const appRouter = router({
         };
       }),
 
+    // Audited: every current caller of this (app/admin/players.tsx's mark
+    // paid/safe/eliminate/remove-safe actions) is an admin-only action --
+    // there's no legitimate player self-service field going through this
+    // procedure (updateLocation/disableLocation below are the
+    // self-service ones, and already scope themselves to the calling
+    // player via getPlayerInGame). It previously had no authorization
+    // check at all.
     update: protectedProcedure
       .input(z.object({
         playerId: z.number(),
@@ -488,8 +523,12 @@ export const appRouter = router({
         teamId: z.number().optional(),
         currentSafeObject: z.string().optional(),
       }))
-      .mutation(async ({ input }) => {
+      .mutation(async ({ ctx, input }) => {
         const { playerId, ...data } = input;
+        const player = await db.getPlayerById(playerId);
+        if (!player) throw new Error("Player not found");
+        const game = await db.getGame(player.gameId);
+        if (!game || (game.adminId !== ctx.user.id && !ctx.user.isSuperAdmin)) throw new Error("Admin access required");
         await db.updatePlayer(playerId, data);
         return { success: true };
       }),
@@ -1542,14 +1581,22 @@ export const appRouter = router({
         pointsValue: z.number().default(0),
         condition: z.string().optional(),
       }))
-      .mutation(async ({ input }) => {
+      .mutation(async ({ input, ctx }) => {
+        const game = await db.getGame(input.gameId);
+        if (!game || (game.adminId !== ctx.user.id && !ctx.user.isSuperAdmin)) throw new Error("Admin access required");
         const id = await db.createAchievement(input);
         return { id };
       }),
 
     award: protectedProcedure
       .input(z.object({ gamePlayerId: z.number(), achievementId: z.number(), gameId: z.number() }))
-      .mutation(async ({ input }) => {
+      .mutation(async ({ input, ctx }) => {
+        const game = await db.getGame(input.gameId);
+        if (!game || (game.adminId !== ctx.user.id && !ctx.user.isSuperAdmin)) throw new Error("Admin access required");
+        const player = await db.getPlayerById(input.gamePlayerId);
+        if (!player || player.gameId !== input.gameId) throw new Error("Player not found in this game");
+        const gameAchievements = await db.getGameAchievements(input.gameId);
+        if (!gameAchievements.some(achievement => achievement.id === input.achievementId)) throw new Error("Achievement not found in this game");
         await db.awardAchievement(input.gamePlayerId, input.achievementId);
         await db.createKillFeedEvent({ gameId: input.gameId, eventType: "achievement_earned", actorId: input.gamePlayerId, message: "🏅 Achievement unlocked!" });
         return { success: true };
@@ -1565,71 +1612,10 @@ export const appRouter = router({
 
     seedAll: protectedProcedure
       .input(z.object({ gameId: z.number() }))
-      .mutation(async ({ input }) => {
-        const achievements = [
-          // === COMBAT ACHIEVEMENTS ===
-          { name: "First Blood", description: "Get your 1st elimination", emoji: "🩸", pointsValue: 50, condition: "lifetime_eliminations >= 1", achievementType: "combat", category: "Lifetime" },
-          { name: "Public Menace", description: "Get 15 eliminations", emoji: "😈", pointsValue: 200, condition: "lifetime_eliminations >= 15", achievementType: "combat", category: "Lifetime" },
-          { name: "Living Legend", description: "Get 25 eliminations", emoji: "🏆", pointsValue: 500, condition: "lifetime_eliminations >= 25", achievementType: "combat", category: "Lifetime" },
-          { name: "Elimination God", description: "Get 50 eliminations", emoji: "💀", pointsValue: 750, condition: "lifetime_eliminations >= 50", achievementType: "combat", category: "Lifetime" },
-          { name: "Wet Bandit", description: "Get 1st elimination of the game", emoji: "🔫", pointsValue: 150, condition: "game_first_elimination", achievementType: "combat", category: "Game" },
-          { name: "Predator", description: "Get 5 eliminations in one game", emoji: "🦅", pointsValue: 250, condition: "game_eliminations >= 5", achievementType: "combat", category: "Game" },
-          { name: "Apex Predator", description: "Get 10 eliminations in one game", emoji: "🦁", pointsValue: 500, condition: "game_eliminations >= 10", achievementType: "combat", category: "Game" },
-          { name: "Sharpsquirter", description: "Get the 1st elimination of the round", emoji: "💧", pointsValue: 150, condition: "round_first_elimination", achievementType: "combat", category: "Round" },
-          { name: "Serial Soaker", description: "Get 3 eliminations in one round", emoji: "🌊", pointsValue: 250, condition: "round_eliminations >= 3", achievementType: "combat", category: "Round" },
-          { name: "Drip Queen", description: "Get 5 eliminations in one round", emoji: "👑", pointsValue: 500, condition: "round_eliminations >= 5", achievementType: "combat", category: "Round" },
-          { name: "Cat Burglar", description: "Use 1 theft power-up in one game", emoji: "🐱", pointsValue: 200, condition: "game_theft_powerups >= 1", achievementType: "combat", category: "Game" },
-          { name: "Master Thief", description: "Use 3 theft power-ups in one game", emoji: "🥷", pointsValue: 300, condition: "game_theft_powerups >= 3", achievementType: "combat", category: "Game" },
-          { name: "Crime Boss", description: "Use 10+ power-ups in one game", emoji: "🤵", pointsValue: 500, condition: "game_powerups_used >= 10", achievementType: "combat", category: "Game" },
-          { name: "Hit List", description: "Place a bounty on active player in one game", emoji: "📋", pointsValue: 200, condition: "game_bounties_placed >= 1", achievementType: "combat", category: "Game" },
-          { name: "Bounty Broker", description: "Place 5 bounties on active player in one game", emoji: "💰", pointsValue: 300, condition: "game_bounties_placed >= 5", achievementType: "combat", category: "Game" },
-          { name: "Crime Syndicate", description: "Place 10+ bounties on active player in one game", emoji: "🏦", pointsValue: 500, condition: "game_bounties_placed >= 10", achievementType: "combat", category: "Game" },
-          { name: "Tracker", description: "Collect 1 bounty in one game", emoji: "🎯", pointsValue: 150, condition: "game_bounties_collected >= 1", achievementType: "combat", category: "Game" },
-          { name: "Bounty Hunter", description: "Collect 5 bounties in one game", emoji: "🏹", pointsValue: 400, condition: "game_bounties_collected >= 5", achievementType: "combat", category: "Game" },
-          { name: "Legend Hunter", description: "Collect 10+ bounties in one game", emoji: "⚔️", pointsValue: 650, condition: "game_bounties_collected >= 10", achievementType: "combat", category: "Game" },
-          { name: "Killing Spree", description: "Get 3 eliminations without dying in one game", emoji: "🔥", pointsValue: 250, condition: "game_kill_streak >= 3", achievementType: "combat", category: "Game" },
-          { name: "Rampage", description: "Get 5 eliminations without dying in one game", emoji: "💥", pointsValue: 500, condition: "game_kill_streak >= 5", achievementType: "combat", category: "Game" },
-          { name: "One Man Army", description: "Get 10+ eliminations in one game without dying", emoji: "🪖", pointsValue: 750, condition: "game_kill_streak >= 10", achievementType: "combat", category: "Game" },
-          { name: "No Mercy", description: "Eliminate 3 players during open season or a purge", emoji: "😤", pointsValue: 250, condition: "purge_eliminations >= 3", achievementType: "combat", category: "Game" },
-          { name: "Grudge Match", description: "Eliminate 5 players during open season or a purge", emoji: "😡", pointsValue: 500, condition: "purge_eliminations >= 5", achievementType: "combat", category: "Game" },
-          { name: "Uno Reverse", description: "Eliminate any of your previous or current hunters during a purge", emoji: "🔄", pointsValue: 150, condition: "purge_hunter_elimination", achievementType: "combat", category: "Game" },
-          // === SURVIVAL ACHIEVEMENTS ===
-          { name: "Dry as a Bone", description: "Survive 3 consecutive rounds", emoji: "🦴", pointsValue: 75, condition: "consecutive_rounds_survived >= 3", achievementType: "survival", category: "Game" },
-          { name: "Untouchable", description: "Survive 5 consecutive rounds", emoji: "🛡️", pointsValue: 125, condition: "consecutive_rounds_survived >= 5", achievementType: "survival", category: "Game" },
-          { name: "Shell", description: "Use 3 defensive power-ups", emoji: "🐢", pointsValue: 75, condition: "game_defensive_powerups >= 3", achievementType: "survival", category: "Game" },
-          { name: "Bunker", description: "Use 10 defensive power-ups", emoji: "🏰", pointsValue: 250, condition: "game_defensive_powerups >= 10", achievementType: "survival", category: "Game" },
-          { name: "Fortress", description: "Use 25 defensive power-ups", emoji: "🗼", pointsValue: 500, condition: "game_defensive_powerups >= 25", achievementType: "survival", category: "Game" },
-          { name: "The Comeback Kid", description: "Get eliminated, revive and get an elimination in one round", emoji: "🔁", pointsValue: 250, condition: "round_revive_then_eliminate", achievementType: "survival", category: "Round" },
-          { name: "Apparition", description: "Vanish from map 5x in one game", emoji: "👻", pointsValue: 75, condition: "game_vanish_count >= 5", achievementType: "survival", category: "Game" },
-          { name: "Ghost Story", description: "Vanish from map 10x in one game", emoji: "🌫️", pointsValue: 150, condition: "game_vanish_count >= 10", achievementType: "survival", category: "Game" },
-          { name: "Urban Legend", description: "Vanish 25x in one game", emoji: "🕸️", pointsValue: 300, condition: "game_vanish_count >= 25", achievementType: "survival", category: "Game" },
-          { name: "On the Run", description: "Survive one bounty", emoji: "🏃", pointsValue: 100, condition: "game_bounties_survived >= 1", achievementType: "survival", category: "Game" },
-          { name: "Public Enemy", description: "Survive 3 bounties", emoji: "🚨", pointsValue: 300, condition: "game_bounties_survived >= 3", achievementType: "survival", category: "Game" },
-          { name: "Most Wanted", description: "Survive 5 bounties", emoji: "🎪", pointsValue: 500, condition: "game_bounties_survived >= 5", achievementType: "survival", category: "Game" },
-          { name: "Bulletproof", description: "Survive 3 open seasons or purges", emoji: "🔒", pointsValue: 175, condition: "purges_survived >= 3", achievementType: "survival", category: "Game" },
-          { name: "Above the Law", description: "Survive 5 open seasons or purges", emoji: "⚖️", pointsValue: 400, condition: "purges_survived >= 5", achievementType: "survival", category: "Game" },
-          { name: "Not Today Satan", description: "Survive 8 open seasons or purges", emoji: "😇", pointsValue: 750, condition: "purges_survived >= 8", achievementType: "survival", category: "Game" },
-          // === CHAOS ACHIEVEMENTS ===
-          { name: "Shopaholic", description: "Purchase 5 power-ups", emoji: "🛍️", pointsValue: 100, condition: "game_powerups_purchased >= 5", achievementType: "chaos", category: "Game" },
-          { name: "Big Spender", description: "Purchase 10 power-ups", emoji: "💸", pointsValue: 250, condition: "game_powerups_purchased >= 10", achievementType: "chaos", category: "Game" },
-          { name: "Hoarder", description: "Purchase 15+ power-ups", emoji: "📦", pointsValue: 500, condition: "game_powerups_purchased >= 15", achievementType: "chaos", category: "Game" },
-          { name: "Risk Taker", description: "Spin roulette wheel 1x", emoji: "🎲", pointsValue: 75, condition: "game_roulette_spins >= 1", achievementType: "chaos", category: "Game" },
-          { name: "High Roller", description: "Spin roulette wheel 5x", emoji: "🎰", pointsValue: 150, condition: "game_roulette_spins >= 5", achievementType: "chaos", category: "Game" },
-          { name: "Gambling Addict", description: "Spin roulette wheel 10x", emoji: "🃏", pointsValue: 450, condition: "game_roulette_spins >= 10", achievementType: "chaos", category: "Game" },
-          { name: "Instigator", description: "Use 2 chaos power-ups", emoji: "😏", pointsValue: 200, condition: "game_chaos_powerups >= 2", achievementType: "chaos", category: "Game" },
-          { name: "Loose Cannon", description: "Use 5 chaos power-ups", emoji: "💣", pointsValue: 450, condition: "game_chaos_powerups >= 5", achievementType: "chaos", category: "Game" },
-          { name: "Anarchist", description: "Use 10 chaos power-ups", emoji: "🔥", pointsValue: 650, condition: "game_chaos_powerups >= 10", achievementType: "chaos", category: "Game" },
-          { name: "Good Samaritan", description: "Gift 1 power-up", emoji: "🎁", pointsValue: 125, condition: "game_powerups_gifted >= 1", achievementType: "chaos", category: "Game" },
-          { name: "Donor", description: "Gift 5 power-ups", emoji: "🤝", pointsValue: 375, condition: "game_powerups_gifted >= 5", achievementType: "chaos", category: "Game" },
-          { name: "Sugar Mama", description: "Gift 10 power-ups", emoji: "🍬", pointsValue: 750, condition: "game_powerups_gifted >= 10", achievementType: "chaos", category: "Game" },
-        ];
-
-        let created = 0;
-        for (const a of achievements) {
-          await db.createAchievement({ gameId: input.gameId, ...a });
-          created++;
-        }
-        return { created };
+      .mutation(async ({ input, ctx }) => {
+        const game = await db.getGame(input.gameId);
+        if (!game || (game.adminId !== ctx.user.id && !ctx.user.isSuperAdmin)) throw new Error("Admin access required");
+        return db.seedAchievements(input.gameId, ACHIEVEMENT_CATALOG);
       }),
   }),
 
@@ -1712,6 +1698,15 @@ export const appRouter = router({
       .mutation(async ({ input, ctx }) => {
         const game = await db.getGame(input.gameId);
         if (!game || (game.adminId !== ctx.user.id && !ctx.user.isSuperAdmin)) throw new Error("Admin access required");
+        const latitude = Number(input.latitude);
+        const longitude = Number(input.longitude);
+        if (!Number.isFinite(latitude) || latitude < -90 || latitude > 90) throw new Error("Latitude must be a number between -90 and 90");
+        if (!Number.isFinite(longitude) || longitude < -180 || longitude > 180) throw new Error("Longitude must be a number between -180 and 180");
+        const catalog = await db.getGamePowerUps(input.gameId);
+        const powerUp = catalog.find(candidate => candidate.id === input.powerUpId);
+        if (!powerUp) throw new Error("Selected power-up not found");
+        if (powerUp.gameId !== input.gameId) throw new Error("Selected power-up does not belong to this game");
+        if (!powerUp.isEnabled) throw new Error("Selected power-up is disabled");
         const id = await db.createMapPowerUp(input);
         return { id };
       }),

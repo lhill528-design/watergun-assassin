@@ -1,32 +1,72 @@
-import { Text, View, ScrollView, TouchableOpacity, TextInput, Alert } from "react-native";
+import { Text, View, ScrollView, TouchableOpacity, TextInput, Alert, Platform } from "react-native";
 import { useRouter } from "expo-router";
 import { ScreenContainer } from "@/components/screen-container";
 import { useGame } from "@/lib/game-context";
 import { trpc } from "@/lib/trpc";
-import { useState } from "react";
+import { requestConfirmedAction } from "@/lib/confirm-then-run";
+import { useRef, useState } from "react";
 
 export default function RoundControlScreen() {
   const { activeGameId } = useGame();
   const router = useRouter();
+  const utils = trpc.useUtils();
   const [purgeDuration, setPurgeDuration] = useState("60");
   const [purgeSchedule, setPurgeSchedule] = useState("");
+  const [resultMessage, setResultMessage] = useState<{ kind: "success" | "error"; text: string } | null>(null);
+
+  // One shared guard across every round-control action -- only one of
+  // these makes sense to run at a time (you wouldn't Start Round while
+  // Ending Purge is still in flight), so a single ref-backed lock blocks
+  // any of them from firing while another is running. `actingLabel`
+  // records which one, purely so its own button can show "..." instead of
+  // just being disabled like the others.
+  const isActingRef = useRef(false);
+  const [isActing, setIsActing] = useState(false);
+  const [actingLabel, setActingLabel] = useState<string | null>(null);
+  const setActing = (acting: boolean) => { isActingRef.current = acting; setIsActing(acting); };
 
   const gameQuery = trpc.game.get.useQuery({ gameId: activeGameId! }, { enabled: !!activeGameId });
-  const startRound = trpc.game.startRound.useMutation({ onSuccess: () => { gameQuery.refetch(); Alert.alert("Round Started!"); } });
-  const endRound = trpc.game.endRound.useMutation({ onSuccess: () => { gameQuery.refetch(); Alert.alert("Round Ended!"); } });
-  const startPurge = trpc.game.startPurge.useMutation({ onSuccess: () => { gameQuery.refetch(); Alert.alert("Purge Activated!"); } });
-  const endPurge = trpc.game.endPurge.useMutation({ onSuccess: () => { gameQuery.refetch(); Alert.alert("Purge Ended!"); } });
-  const schedulePurge = trpc.game.schedulePurge.useMutation({ onSuccess: () => { gameQuery.refetch(); Alert.alert("Purge Schedule Updated"); }, onError: error => Alert.alert("Could not schedule", error.message) });
-  const endGame = trpc.game.endGame.useMutation({ onSuccess: () => { gameQuery.refetch(); Alert.alert("Game Over!"); } });
-  const updateGame = trpc.game.update.useMutation({ onSuccess: () => gameQuery.refetch() });
+  const invalidateGame = () => utils.game.get.invalidate({ gameId: activeGameId! });
+  const onActionError = (err: { message: string }) => {
+    setResultMessage({ kind: "error", text: err.message });
+    if (Platform.OS !== "web") Alert.alert("Error", err.message);
+  };
+
+  const startRound = trpc.game.startRound.useMutation({
+    onSuccess: () => { invalidateGame(); setResultMessage({ kind: "success", text: "Round started!" }); },
+    onError: onActionError,
+  });
+  const endRound = trpc.game.endRound.useMutation({
+    onSuccess: () => { invalidateGame(); setResultMessage({ kind: "success", text: "Round ended!" }); },
+    onError: onActionError,
+  });
+  const startPurge = trpc.game.startPurge.useMutation({
+    onSuccess: () => { invalidateGame(); setResultMessage({ kind: "success", text: "Purge activated!" }); },
+    onError: onActionError,
+  });
+  const endPurge = trpc.game.endPurge.useMutation({
+    onSuccess: () => { invalidateGame(); setResultMessage({ kind: "success", text: "Purge ended!" }); },
+    onError: onActionError,
+  });
+  const schedulePurge = trpc.game.schedulePurge.useMutation({
+    onSuccess: () => { invalidateGame(); setResultMessage({ kind: "success", text: "Purge schedule updated." }); },
+    onError: (error) => { setResultMessage({ kind: "error", text: error.message }); if (Platform.OS !== "web") Alert.alert("Could not schedule", error.message); },
+  });
+  const endGame = trpc.game.endGame.useMutation({
+    onSuccess: () => { invalidateGame(); setResultMessage({ kind: "success", text: "Game over!" }); },
+    onError: onActionError,
+  });
+  const updateGame = trpc.game.update.useMutation({
+    onSuccess: () => { invalidateGame(); setResultMessage({ kind: "success", text: "Game status updated." }); },
+    onError: onActionError,
+  });
 
   const game = gameQuery.data;
 
-  const confirmAction = (title: string, message: string, onConfirm: () => void) => {
-    Alert.alert(title, message, [
-      { text: "Cancel", style: "cancel" },
-      { text: "Confirm", style: "destructive", onPress: onConfirm },
-    ]);
+  const runAction = (label: string, title: string, message: string, confirmLabel: string, run: () => Promise<unknown>) => {
+    setResultMessage(null);
+    setActingLabel(label);
+    requestConfirmedAction({ title, message, confirmLabel, isRunning: isActingRef.current, onRunningChange: setActing, run });
   };
 
   return (
@@ -60,22 +100,30 @@ export default function RoundControlScreen() {
           </View>
         </View>
 
+        {resultMessage && (
+          <View className={`rounded-xl p-3 mb-4 border ${resultMessage.kind === "success" ? "bg-success/20 border-success" : "bg-error/20 border-error"}`}>
+            <Text className={`text-sm text-center ${resultMessage.kind === "success" ? "text-success" : "text-error"}`}>{resultMessage.text}</Text>
+          </View>
+        )}
+
         {/* Round Controls */}
         <Text className="text-sm font-bold text-foreground mb-3">🎯 Round Management</Text>
         <View className="gap-3 mb-6">
           <TouchableOpacity
             className="bg-success/20 border border-success rounded-xl p-4 items-center"
-            onPress={() => confirmAction("Start Round", `Start Round ${(game?.currentRound || 0) + 1}?`, () => startRound.mutate({ gameId: activeGameId! }))}
+            onPress={() => runAction("startRound", "Start Round", `Start Round ${(game?.currentRound || 0) + 1}?`, "Confirm", () => startRound.mutateAsync({ gameId: activeGameId! }))}
+            disabled={isActing}
           >
-            <Text className="text-success font-bold text-base">▶️ Start New Round</Text>
+            <Text className="text-success font-bold text-base">{isActing && actingLabel === "startRound" ? "Starting..." : "▶️ Start New Round"}</Text>
             <Text className="text-success/70 text-xs mt-1">Begins Round {(game?.currentRound || 0) + 1}</Text>
           </TouchableOpacity>
 
           <TouchableOpacity
             className="bg-warning/20 border border-warning rounded-xl p-4 items-center"
-            onPress={() => confirmAction("End Round", "End the current round early?", () => endRound.mutate({ gameId: activeGameId! }))}
+            onPress={() => runAction("endRound", "End Round", "End the current round early?", "Confirm", () => endRound.mutateAsync({ gameId: activeGameId! }))}
+            disabled={isActing}
           >
-            <Text className="text-warning font-bold text-base">⏹️ End Round Early</Text>
+            <Text className="text-warning font-bold text-base">{isActing && actingLabel === "endRound" ? "Ending..." : "⏹️ End Round Early"}</Text>
           </TouchableOpacity>
         </View>
 
@@ -97,18 +145,20 @@ export default function RoundControlScreen() {
               </View>
               <TouchableOpacity
                 className="bg-error/20 border border-error rounded-xl p-4 items-center"
-                onPress={() => confirmAction("Start Purge", `Activate ${purgeDuration} minute purge? All players can be eliminated by anyone!`, () => startPurge.mutate({ gameId: activeGameId!, durationMinutes: parseInt(purgeDuration) || 60 }))}
+                onPress={() => runAction("startPurge", "Start Purge", `Activate ${purgeDuration} minute purge? All players can be eliminated by anyone!`, "Confirm", () => startPurge.mutateAsync({ gameId: activeGameId!, durationMinutes: parseInt(purgeDuration) || 60 }))}
+                disabled={isActing}
               >
-                <Text className="text-error font-bold text-base">⚠️ ACTIVATE PURGE</Text>
+                <Text className="text-error font-bold text-base">{isActing && actingLabel === "startPurge" ? "Activating..." : "⚠️ ACTIVATE PURGE"}</Text>
                 <Text className="text-error/70 text-xs mt-1">All players become targets</Text>
               </TouchableOpacity>
             </View>
           ) : (
             <TouchableOpacity
               className="bg-success/20 border border-success rounded-xl p-4 items-center"
-              onPress={() => confirmAction("End Purge", "End the purge and return to normal play?", () => endPurge.mutate({ gameId: activeGameId! }))}
+              onPress={() => runAction("endPurge", "End Purge", "End the purge and return to normal play?", "Confirm", () => endPurge.mutateAsync({ gameId: activeGameId! }))}
+              disabled={isActing}
             >
-              <Text className="text-success font-bold text-base">🕊️ End Purge</Text>
+              <Text className="text-success font-bold text-base">{isActing && actingLabel === "endPurge" ? "Ending..." : "🕊️ End Purge"}</Text>
               <Text className="text-success/70 text-xs mt-1">Return to normal rules</Text>
             </TouchableOpacity>
           )}
@@ -120,7 +170,8 @@ export default function RoundControlScreen() {
           {game?.status === "paused" && (
             <TouchableOpacity
               className="bg-success/20 border border-success rounded-xl p-4 items-center"
-              onPress={() => updateGame.mutate({ gameId: activeGameId!, status: "active" })}
+              onPress={() => { if (!isActingRef.current) updateGame.mutate({ gameId: activeGameId!, status: "active" }); }}
+              disabled={isActing}
             >
               <Text className="text-success font-bold">▶️ Resume Game</Text>
             </TouchableOpacity>
@@ -128,16 +179,18 @@ export default function RoundControlScreen() {
           {game?.status === "active" && (
             <TouchableOpacity
               className="bg-warning/20 border border-warning rounded-xl p-4 items-center"
-              onPress={() => confirmAction("Pause Game", "Pause the game?", () => updateGame.mutate({ gameId: activeGameId!, status: "paused" }))}
+              onPress={() => runAction("pauseGame", "Pause Game", "Pause the game?", "Confirm", () => updateGame.mutateAsync({ gameId: activeGameId!, status: "paused" }))}
+              disabled={isActing}
             >
-              <Text className="text-warning font-bold">⏸️ Pause Game</Text>
+              <Text className="text-warning font-bold">{isActing && actingLabel === "pauseGame" ? "Pausing..." : "⏸️ Pause Game"}</Text>
             </TouchableOpacity>
           )}
           <TouchableOpacity
             className="bg-error/20 border border-error rounded-xl p-4 items-center"
-            onPress={() => confirmAction("End Game", "This will end the game permanently. Are you sure?", () => endGame.mutate({ gameId: activeGameId! }))}
+            onPress={() => runAction("endGame", "End Game", "This will end the game permanently. Are you sure?", "Confirm", () => endGame.mutateAsync({ gameId: activeGameId! }))}
+            disabled={isActing}
           >
-            <Text className="text-error font-bold">🏁 End Game</Text>
+            <Text className="text-error font-bold">{isActing && actingLabel === "endGame" ? "Ending..." : "🏁 End Game"}</Text>
             <Text className="text-error/70 text-xs mt-1">Cannot be undone</Text>
           </TouchableOpacity>
         </View>

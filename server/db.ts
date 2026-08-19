@@ -3,6 +3,7 @@ import { drizzle } from "drizzle-orm/mysql2";
 import { createPool, type Pool, type PoolOptions } from "mysql2/promise";
 import { InsertUser, users, games, gamePlayers, powerUps, eliminations, achievements, playerAchievements, playerPowerUps, powerUpUsageFees, gameRules, killFeed, mapPowerUps, mapPowerUpGuesses, teams, bounties, notifications, rouletteOutcomes, duels, chatMessages } from "../drizzle/schema";
 import { ENV } from "./_core/env";
+import { circularTargetChain, isValidOneToOneTargetAssignment } from "./power-up-rules";
 
 const SUPER_ADMIN_EMAILS = ["lhill528@gmail.com", "lhill29@comcast.net"];
 
@@ -243,6 +244,47 @@ export async function updateGame(gameId: number, data: Partial<typeof games.$inf
   await db.update(games).set(data).where(eq(games.id, gameId));
 }
 
+// The core round-start state -- locking the game row, re-validating every
+// precondition against that locked read (not a value read earlier by the
+// caller), promoting queued nextRoundTargetId picks, and advancing
+// currentRound/roundEndTime -- all happen in one transaction, so a
+// failure partway through can't leave some players promoted to their new
+// target while the game row still shows the old round. Wildcard
+// reassignment and notifications are handled by the caller afterward:
+// they're independent power-up-inventory side effects, not part of the
+// round/target state this function is responsible for keeping consistent.
+export async function startRoundAtomic(gameId: number): Promise<{ currentRound: number; roundEndTime: Date }> {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+  return db.transaction(async (tx) => {
+    const gameRows = await tx.select().from(games).where(eq(games.id, gameId)).for("update");
+    const game = gameRows[0];
+    if (!game) throw new Error("Game not found");
+    if (game.deletedAt) throw new Error("This game has been deleted");
+    if (game.status === "completed") throw new Error("This game has already ended");
+    if (game.roundEndTime != null) throw new Error("A round is already active");
+
+    const players = await tx.select().from(gamePlayers).where(eq(gamePlayers.gameId, gameId));
+    const alivePlayers = players.filter((player) => player.status === "alive");
+    if (alivePlayers.length < 2) throw new Error("Need at least 2 alive players to start a round");
+    if (!isValidOneToOneTargetAssignment(alivePlayers.map((player) => ({ id: player.id, targetId: player.targetId })))) {
+      throw new Error("Assign valid one-to-one targets to all alive players before starting a round");
+    }
+
+    const currentRound = (game.currentRound || 0) + 1;
+    const roundEndTime = new Date(Date.now() + (game.roundLength || 72) * 3600000);
+
+    for (const player of players) {
+      if (player.nextRoundTargetId) {
+        await tx.update(gamePlayers).set({ targetId: player.nextRoundTargetId, nextRoundTargetId: null }).where(eq(gamePlayers.id, player.id));
+      }
+    }
+    await tx.update(games).set({ currentRound, roundEndTime, status: "active" }).where(eq(games.id, gameId));
+
+    return { currentRound, roundEndTime };
+  });
+}
+
 // ===== PLAYER QUERIES =====
 
 export async function joinGame(data: typeof gamePlayers.$inferInsert) {
@@ -283,6 +325,44 @@ export async function updatePlayer(playerId: number, data: Partial<typeof gamePl
   const db = await getDb();
   if (!db) throw new Error("Database not available");
   await db.update(gamePlayers).set(data).where(eq(gamePlayers.id, playerId));
+}
+
+// Replaces the client-side shuffle-and-fire-one-mutation-per-player that
+// used to back the admin "Auto-Assign All Targets" button: that could
+// partially assign targets if any individual player.update() call in the
+// forEach failed, and computed the chain from a client-side Math.random()
+// shuffle instead of a lock-consistent read of who's actually alive.
+// Locking the alive rows first (FOR UPDATE) means a concurrent status
+// change (e.g. an elimination approval) can't land mid-assignment and
+// leave the chain referencing a no-longer-alive player.
+export async function assignTargetsAtomic(gameId: number): Promise<{ affected: number }> {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+  return db.transaction(async (tx) => {
+    const alivePlayers = await tx
+      .select({ id: gamePlayers.id })
+      .from(gamePlayers)
+      .where(and(eq(gamePlayers.gameId, gameId), eq(gamePlayers.status, "alive")))
+      .for("update");
+    const chain = circularTargetChain(alivePlayers.map((player) => player.id));
+    for (const { playerId, targetId } of chain) {
+      await tx.update(gamePlayers).set({ targetId }).where(eq(gamePlayers.id, playerId));
+    }
+    return { affected: chain.length };
+  });
+}
+
+// Clears targetId for every player in the game (not just alive ones,
+// matching the previous client behavior) using a real NULL, not the
+// sentinel 0 the old client code sent.
+export async function clearTargetsAtomic(gameId: number): Promise<{ affected: number }> {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+  return db.transaction(async (tx) => {
+    const players = await tx.select({ id: gamePlayers.id }).from(gamePlayers).where(eq(gamePlayers.gameId, gameId)).for("update");
+    await tx.update(gamePlayers).set({ targetId: null }).where(eq(gamePlayers.gameId, gameId));
+    return { affected: players.length };
+  });
 }
 
 export async function repairTargetChainAfterRevive(gameId: number, revivedPlayerId: number) {
@@ -908,6 +988,31 @@ export async function getPlayerAchievements(gamePlayerId: number) {
   const db = await getDb();
   if (!db) return [];
   return db.select().from(playerAchievements).where(eq(playerAchievements.gamePlayerId, gamePlayerId));
+}
+
+// Mirrors seedStandardRules below: one protected, transactional,
+// idempotent bulk insert (skipping achievements that already exist for
+// this game by exact name match) instead of the client firing one
+// achievement.create mutation per achievement with a forEach, which
+// duplicated the entire catalog on every repeated click.
+export async function seedAchievements(
+  gameId: number,
+  defs: Array<{ name: string; description?: string; emoji?: string; pointsValue: number; condition?: string; achievementType?: string; category?: string }>,
+): Promise<{ created: number; skipped: number; total: number }> {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+  return db.transaction(async (tx) => {
+    const existing = await tx.select({ name: achievements.name }).from(achievements).where(eq(achievements.gameId, gameId));
+    const existingNames = new Set(existing.map((row) => row.name));
+    let created = 0;
+    for (const def of defs) {
+      if (existingNames.has(def.name)) continue;
+      await tx.insert(achievements).values({ gameId, ...def });
+      created++;
+      existingNames.add(def.name); // guards against duplicates within defs itself
+    }
+    return { created, skipped: defs.length - created, total: defs.length };
+  });
 }
 
 // ===== RULES QUERIES =====

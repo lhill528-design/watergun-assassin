@@ -1,19 +1,55 @@
-import { Text, View, ScrollView, TouchableOpacity, Alert, TextInput } from "react-native";
-import { useState } from "react";
+import { Text, View, ScrollView, TouchableOpacity, Alert, TextInput, Platform } from "react-native";
+import { useRef, useState } from "react";
 import { useRouter } from "expo-router";
 import { ScreenContainer } from "@/components/screen-container";
 import { useGame } from "@/lib/game-context";
 import { trpc } from "@/lib/trpc";
+import { requestConfirmedAction } from "@/lib/confirm-then-run";
 
 export default function AdminTargetsScreen() {
   const { activeGameId } = useGame();
   const router = useRouter();
+  const utils = trpc.useUtils();
   const [searchQuery, setSearchQuery] = useState("");
+  const [message, setMessage] = useState<{ kind: "success" | "error"; text: string } | null>(null);
+
+  // Separate ref-backed guards -- assigning and clearing are different
+  // operations, and each is checked synchronously (not via
+  // mutation.isPending's async re-render) so a rapid second tap on either
+  // button can't fire a second mutation.
+  const isAssigningRef = useRef(false);
+  const [isAssigning, setIsAssigning] = useState(false);
+  const setAssigning = (assigning: boolean) => { isAssigningRef.current = assigning; setIsAssigning(assigning); };
+  const isClearingRef = useRef(false);
+  const [isClearing, setIsClearing] = useState(false);
+  const setClearing = (clearing: boolean) => { isClearingRef.current = clearing; setIsClearing(clearing); };
 
   const gameQuery = trpc.game.get.useQuery({ gameId: activeGameId! }, { enabled: !!activeGameId });
   const playersQuery = trpc.player.list.useQuery({ gameId: activeGameId! }, { enabled: !!activeGameId });
-  const updatePlayer = trpc.player.update.useMutation({ onSuccess: () => playersQuery.refetch() });
   const updateGame = trpc.game.update.useMutation({ onSuccess: () => gameQuery.refetch() });
+  const assignTargets = trpc.game.assignTargets.useMutation({
+    onSuccess: (data) => {
+      utils.player.list.invalidate({ gameId: activeGameId! });
+      setMessage({ kind: "success", text: `Assigned targets for ${data.affected} player${data.affected === 1 ? "" : "s"} in a circular chain.` });
+    },
+    onError: (err) => {
+      setMessage({ kind: "error", text: err.message });
+      // Supplemental only on native, where Alert.alert's callbacks are
+      // reliable -- the inline message above is what actually drives the
+      // UI on every platform.
+      if (Platform.OS !== "web") Alert.alert("Error", err.message);
+    },
+  });
+  const clearTargets = trpc.game.clearTargets.useMutation({
+    onSuccess: (data) => {
+      utils.player.list.invalidate({ gameId: activeGameId! });
+      setMessage({ kind: "success", text: `Cleared targets for ${data.affected} player${data.affected === 1 ? "" : "s"}.` });
+    },
+    onError: (err) => {
+      setMessage({ kind: "error", text: err.message });
+      if (Platform.OS !== "web") Alert.alert("Error", err.message);
+    },
+  });
 
   const game = gameQuery.data;
   const players = playersQuery.data || [];
@@ -29,40 +65,31 @@ export default function AdminTargetsScreen() {
     : alivePlayers;
 
   const handleAutoAssign = () => {
+    setMessage(null);
     if (alivePlayers.length < 2) {
-      Alert.alert("Error", "Need at least 2 alive players to assign targets");
+      setMessage({ kind: "error", text: "Need at least 2 alive players to assign targets" });
       return;
     }
-    Alert.alert("Auto-Assign Targets", `Randomly assign targets for ${alivePlayers.length} alive players?`, [
-      { text: "Cancel", style: "cancel" },
-      {
-        text: "Assign",
-        onPress: () => {
-          // Create circular target chain
-          const shuffled = [...alivePlayers].sort(() => Math.random() - 0.5);
-          shuffled.forEach((player, index) => {
-            const targetIndex = (index + 1) % shuffled.length;
-            updatePlayer.mutate({ playerId: player.id, targetId: shuffled[targetIndex].id });
-          });
-          Alert.alert("Done!", "Targets have been assigned in a circular chain.");
-        },
-      },
-    ]);
+    requestConfirmedAction({
+      title: "Auto-Assign Targets",
+      message: `Randomly assign targets for ${alivePlayers.length} alive players?`,
+      confirmLabel: "Assign",
+      isRunning: isAssigningRef.current,
+      onRunningChange: setAssigning,
+      run: () => assignTargets.mutateAsync({ gameId: activeGameId! }),
+    });
   };
 
   const handleClearTargets = () => {
-    Alert.alert("Clear All Targets", "Remove all target assignments?", [
-      { text: "Cancel", style: "cancel" },
-      {
-        text: "Clear",
-        style: "destructive",
-        onPress: () => {
-          players.forEach((p) => {
-            updatePlayer.mutate({ playerId: p.id, targetId: 0 });
-          });
-        },
-      },
-    ]);
+    setMessage(null);
+    requestConfirmedAction({
+      title: "Clear All Targets",
+      message: "Remove all target assignments?",
+      confirmLabel: "Clear",
+      isRunning: isClearingRef.current,
+      onRunningChange: setClearing,
+      run: () => clearTargets.mutateAsync({ gameId: activeGameId! }),
+    });
   };
 
   return (
@@ -94,20 +121,28 @@ export default function AdminTargetsScreen() {
           </TouchableOpacity>
         </View>
 
+        {message && (
+          <View className={`rounded-xl p-3 mb-4 border ${message.kind === "success" ? "bg-success/20 border-success" : "bg-error/20 border-error"}`}>
+            <Text className={`text-sm text-center ${message.kind === "success" ? "text-success" : "text-error"}`}>{message.text}</Text>
+          </View>
+        )}
+
         {/* Actions */}
         <View className="gap-3 mb-6">
           <TouchableOpacity
             className="bg-primary/20 border border-primary rounded-xl p-4 items-center"
             onPress={handleAutoAssign}
+            disabled={isAssigning}
           >
-            <Text className="text-primary font-bold">🔄 Auto-Assign All Targets</Text>
+            <Text className="text-primary font-bold">{isAssigning ? "Assigning..." : "🔄 Auto-Assign All Targets"}</Text>
             <Text className="text-primary/70 text-xs mt-1">Creates circular target chain</Text>
           </TouchableOpacity>
           <TouchableOpacity
             className="bg-error/20 border border-error rounded-xl p-4 items-center"
             onPress={handleClearTargets}
+            disabled={isClearing}
           >
-            <Text className="text-error font-bold">🗑️ Clear All Targets</Text>
+            <Text className="text-error font-bold">{isClearing ? "Clearing..." : "🗑️ Clear All Targets"}</Text>
           </TouchableOpacity>
         </View>
 

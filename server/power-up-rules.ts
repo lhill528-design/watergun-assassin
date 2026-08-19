@@ -67,6 +67,40 @@ export function derangedTargetPermutation(players: Array<{ id: number; targetId:
   throw new Error("No valid one-to-one target reassignment is possible");
 }
 
+// Auto-assign, unlike derangedTargetPermutation above (which reassigns
+// existing targets for something like Freaky Friday and specifically
+// avoids anyone keeping their current target), builds a fresh circular
+// chain from scratch: shuffle the alive players, then each targets the
+// next one in the shuffled order, wrapping around. Two players is enough
+// (each targets the other); derangedTargetPermutation's >=3 requirement
+// doesn't apply here since there's no existing assignment to avoid.
+export function circularTargetChain(playerIds: number[]): Array<{ playerId: number; targetId: number }> {
+  if (playerIds.length < 2) throw new Error("Need at least 2 alive players to assign targets");
+  const shuffled = [...playerIds];
+  for (let i = shuffled.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+  }
+  return shuffled.map((playerId, index) => ({ playerId, targetId: shuffled[(index + 1) % shuffled.length] }));
+}
+
+// Used to gate starting a round: every alive player must have exactly one
+// target, targeting another alive player, nobody targeting themselves,
+// and every alive player targeted by exactly one other alive player (a
+// bijection over the alive set) -- not just "everyone has *a* target".
+export function isValidOneToOneTargetAssignment(alivePlayers: Array<{ id: number; targetId: number | null }>): boolean {
+  if (alivePlayers.length < 2) return false;
+  const aliveIds = new Set(alivePlayers.map(player => player.id));
+  const targetedCounts = new Map<number, number>();
+  for (const player of alivePlayers) {
+    if (player.targetId == null) return false;
+    if (player.targetId === player.id) return false;
+    if (!aliveIds.has(player.targetId)) return false;
+    targetedCounts.set(player.targetId, (targetedCounts.get(player.targetId) ?? 0) + 1);
+  }
+  return alivePlayers.every(player => targetedCounts.get(player.id) === 1);
+}
+
 export function calculateKillAwards(args: {
   basePoints: number;
   jackpot: boolean;

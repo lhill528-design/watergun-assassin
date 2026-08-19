@@ -1,14 +1,12 @@
-import React, { useState } from "react";
+import React, { useRef, useState } from "react";
 import {
   View,
   Text,
   ScrollView,
   TouchableOpacity,
   TextInput,
-  Alert,
   ActivityIndicator,
   Switch,
-  FlatList,
   StyleSheet,
 } from "react-native";
 import { ScreenContainer } from "@/components/screen-container";
@@ -35,6 +33,14 @@ const DEFAULT_FORM: MapPowerUpForm = {
   address: "",
 };
 
+function isValidLatitude(value: number): boolean {
+  return Number.isFinite(value) && value >= -90 && value <= 90;
+}
+
+function isValidLongitude(value: number): boolean {
+  return Number.isFinite(value) && value >= -180 && value <= 180;
+}
+
 export default function AdminMapPowerUpsScreen() {
   const router = useRouter();
   const { activeGameId } = useGame();
@@ -43,10 +49,22 @@ export default function AdminMapPowerUpsScreen() {
   const [loadingLocation, setLoadingLocation] = useState(false);
   const [addressSearch, setAddressSearch] = useState("");
   const [searchingAddress, setSearchingAddress] = useState(false);
+  // All validation, geocoding, backend, and success messages surface
+  // through this instead of Alert.alert -- on web, a failed mutation
+  // previously showed nothing at all (the Alert.alert calls the client
+  // relied on to report both success and failure).
+  const [formError, setFormError] = useState<string | null>(null);
+  const [formSuccess, setFormSuccess] = useState<string | null>(null);
+  // A ref (not just createMutation.isPending, which only flips after
+  // react-query's own async state update) so a rapid second submit can't
+  // slip through before the first request's disabled state has rendered.
+  const isSubmittingRef = useRef(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
 
   const gameId = activeGameId ?? 0;
+  const utils = trpc.useUtils();
 
-  const { data: mapPowerUps, refetch } = trpc.mapPowerUp.list.useQuery(
+  const { data: mapPowerUps } = trpc.mapPowerUp.list.useQuery(
     { gameId },
     { enabled: gameId > 0 }
   );
@@ -56,22 +74,15 @@ export default function AdminMapPowerUpsScreen() {
     { enabled: gameId > 0 }
   );
 
-  const createMutation = trpc.mapPowerUp.create.useMutation({
-    onSuccess: () => {
-      Alert.alert("✅ Success", "Map power-up placed successfully!");
-      setForm(DEFAULT_FORM);
-      setShowForm(false);
-      refetch();
-    },
-    onError: (err) => Alert.alert("Error", err.message),
-  });
+  const createMutation = trpc.mapPowerUp.create.useMutation();
 
   const handleUseCurrentLocation = async () => {
+    setFormError(null);
     setLoadingLocation(true);
     try {
       const { status } = await Location.requestForegroundPermissionsAsync();
       if (status !== "granted") {
-        Alert.alert("Permission Denied", "Location permission is required to place power-ups.");
+        setFormError("Location permission is required to place power-ups.");
         return;
       }
       const loc = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.High });
@@ -89,8 +100,8 @@ export default function AdminMapPowerUpsScreen() {
         const addr = [geo.streetNumber, geo.street, geo.city, geo.region].filter(Boolean).join(", ");
         setForm((f) => ({ ...f, address: addr }));
       }
-    } catch (err) {
-      Alert.alert("Error", "Could not get current location.");
+    } catch {
+      setFormError("Could not get current location.");
     } finally {
       setLoadingLocation(false);
     }
@@ -98,44 +109,76 @@ export default function AdminMapPowerUpsScreen() {
 
   const handleFindAddress = async () => {
     if (!addressSearch.trim()) return;
+    setFormError(null);
     setSearchingAddress(true);
     try {
       const results = await Location.geocodeAsync(addressSearch.trim());
       if (!results.length) {
-        Alert.alert("Not found", "Couldn't find that address. Try being more specific.");
+        setFormError("Couldn't find that address. Try being more specific.");
         return;
       }
       const { latitude, longitude } = results[0];
       setForm((f) => ({ ...f, latitude: latitude.toFixed(6), longitude: longitude.toFixed(6), address: addressSearch.trim() }));
     } catch {
-      Alert.alert("Search failed", "Couldn't look up that address right now.");
+      setFormError("Couldn't look up that address right now.");
     } finally {
       setSearchingAddress(false);
     }
   };
 
-  const handleSubmit = () => {
+  const handleSubmit = async () => {
+    if (isSubmittingRef.current) return;
+    setFormError(null);
+    setFormSuccess(null);
+
     if (!form.powerUpId) {
-      Alert.alert("Error", "Please select a power-up.");
+      setFormError("Please select a power-up.");
       return;
     }
     if (!form.latitude || !form.longitude) {
-      Alert.alert("Error", "Please set a location for this power-up.");
+      setFormError("Please set a location for this power-up.");
+      return;
+    }
+    const latitude = Number(form.latitude);
+    const longitude = Number(form.longitude);
+    if (!isValidLatitude(latitude)) {
+      setFormError("Latitude must be a number between -90 and 90.");
+      return;
+    }
+    if (!isValidLongitude(longitude)) {
+      setFormError("Longitude must be a number between -180 and 180.");
       return;
     }
     if (!form.isVisible && !form.clue.trim()) {
-      Alert.alert("Error", "Hidden power-ups must have a clue for players.");
+      setFormError("Hidden power-ups must have a clue for players.");
       return;
     }
 
-    createMutation.mutate({
-      gameId,
-      powerUpId: form.powerUpId!,
-      latitude: form.latitude,
-      longitude: form.longitude,
-      isVisible: form.isVisible,
-      clue: form.clue.trim() || undefined,
-    });
+    isSubmittingRef.current = true;
+    setIsSubmitting(true);
+    try {
+      await createMutation.mutateAsync({
+        gameId,
+        powerUpId: form.powerUpId,
+        latitude: form.latitude,
+        longitude: form.longitude,
+        isVisible: form.isVisible,
+        clue: form.clue.trim() || undefined,
+      });
+      utils.mapPowerUp.list.invalidate({ gameId });
+      // Reset only after the mutation is confirmed successful -- resetting
+      // eagerly (the old onSuccess-only path) would be fine, but doing it
+      // here keeps the reset strictly tied to a real success, not a
+      // request that's merely been sent.
+      setForm(DEFAULT_FORM);
+      setShowForm(false);
+      setFormSuccess("Map power-up placed successfully!");
+    } catch (err) {
+      setFormError(err instanceof Error ? err.message : "Could not place the power-up.");
+    } finally {
+      isSubmittingRef.current = false;
+      setIsSubmitting(false);
+    }
   };
 
   const selectedPowerUp = powerUps?.find((p) => p.id === form.powerUpId);
@@ -154,11 +197,17 @@ export default function AdminMapPowerUpsScreen() {
           </Text>
         </View>
 
+        {formSuccess && !showForm && (
+          <View style={styles.successBanner}>
+            <Text style={styles.successBannerText}>✅ {formSuccess}</Text>
+          </View>
+        )}
+
         {/* Place New Button */}
         {!showForm && (
           <TouchableOpacity
             style={styles.addBtn}
-            onPress={() => setShowForm(true)}
+            onPress={() => { setFormSuccess(null); setFormError(null); setShowForm(true); }}
           >
             <Text style={styles.addBtnText}>+ Place New Power-Up</Text>
           </TouchableOpacity>
@@ -168,6 +217,12 @@ export default function AdminMapPowerUpsScreen() {
         {showForm && (
           <View style={styles.formCard}>
             <Text style={styles.formTitle}>New Map Power-Up</Text>
+
+            {formError && (
+              <View style={styles.errorBanner}>
+                <Text style={styles.errorBannerText}>{formError}</Text>
+              </View>
+            )}
 
             {/* Power-Up Selector */}
             <Text style={styles.label}>Select Power-Up *</Text>
@@ -297,16 +352,16 @@ export default function AdminMapPowerUpsScreen() {
             <View style={styles.formBtns}>
               <TouchableOpacity
                 style={styles.cancelBtn}
-                onPress={() => { setForm(DEFAULT_FORM); setShowForm(false); }}
+                onPress={() => { setForm(DEFAULT_FORM); setShowForm(false); setFormError(null); }}
               >
                 <Text style={styles.cancelBtnText}>Cancel</Text>
               </TouchableOpacity>
               <TouchableOpacity
-                style={[styles.submitBtn, createMutation.isPending && { opacity: 0.6 }]}
+                style={[styles.submitBtn, isSubmitting && { opacity: 0.6 }]}
                 onPress={handleSubmit}
-                disabled={createMutation.isPending}
+                disabled={isSubmitting}
               >
-                {createMutation.isPending ? (
+                {isSubmitting ? (
                   <ActivityIndicator color="#000" size="small" />
                 ) : (
                   <Text style={styles.submitBtnText}>Place Power-Up</Text>
@@ -368,6 +423,17 @@ const styles = StyleSheet.create({
   backBtnText: { color: "#FF1493", fontSize: 16, fontWeight: "600" },
   title: { fontSize: 24, fontWeight: "800", color: "#fff", marginBottom: 6 },
   subtitle: { fontSize: 13, color: "#888", lineHeight: 18 },
+  successBanner: {
+    marginHorizontal: 20, marginBottom: 12,
+    backgroundColor: "#0f2a1a", borderRadius: 10, padding: 12,
+    borderWidth: 1, borderColor: "#00FF88",
+  },
+  successBannerText: { color: "#00FF88", fontSize: 13, fontWeight: "600" },
+  errorBanner: {
+    backgroundColor: "#2a0f14", borderRadius: 10, padding: 12, marginBottom: 12,
+    borderWidth: 1, borderColor: "#FF3333",
+  },
+  errorBannerText: { color: "#FF6B6B", fontSize: 13, fontWeight: "600" },
   addBtn: {
     marginHorizontal: 20, marginBottom: 16,
     backgroundColor: "#FF1493", borderRadius: 12, padding: 14,
