@@ -309,12 +309,15 @@ export async function startRoundAtomic(gameId: number): Promise<StartRoundResult
     // round advance, target promotions, and every Wildcard swap/
     // consumption/return -- or none of it does.
     //
-    // Each Wildcard is looked up against a single static snapshot of
-    // post-promotion targets (postPromotionTargetById), matching this
-    // logic's previous behavior: it never re-read state between
-    // iterations, so one Wildcard's swap in a batch has no effect on how
-    // another Wildcard in the same batch is evaluated.
-    const postPromotionTargetById = new Map<number, number | null>(
+    // Wildcards are processed in ascending inventory-id order against an
+    // evolving target map, updated after every valid swap. Evaluating
+    // every Wildcard against one static post-promotion snapshot let a
+    // later Wildcard in the same batch pick a "hunter" based on an
+    // assignment an earlier Wildcard had already overwritten -- two
+    // Wildcards choosing the same target could each apply a swap that was
+    // individually valid against the stale snapshot but jointly produced a
+    // duplicate target or a self-target.
+    const currentTargetById = new Map<number, number | null>(
       players.map((player) => [player.id, player.nextRoundTargetId ?? player.targetId]),
     );
     const statusById = new Map<number, string>(players.map((player) => [player.id, player.status]));
@@ -323,9 +326,9 @@ export async function startRoundAtomic(gameId: number): Promise<StartRoundResult
     const catalogRows = await tx.select().from(powerUps).where(eq(powerUps.gameId, gameId));
     const catalogNameById = new Map(catalogRows.map((entry) => [entry.id, entry.name]));
     const now = Date.now();
-    const wildcards = activeInventory.filter(
-      (item) => (!item.expiresAt || item.expiresAt.getTime() > now) && catalogNameById.get(item.powerUpId) === "Wildcard",
-    );
+    const wildcards = activeInventory
+      .filter((item) => (!item.expiresAt || item.expiresAt.getTime() > now) && catalogNameById.get(item.powerUpId) === "Wildcard")
+      .sort((a, b) => a.id - b.id);
 
     const wildcardReturns: Array<{ ownerUserId: number }> = [];
 
@@ -334,9 +337,9 @@ export async function startRoundAtomic(gameId: number): Promise<StartRoundResult
       const owner = players.find((player) => player.id === ownerId);
       const selectedId = wildcard.targetPlayerId;
       const selected = selectedId != null ? players.find((player) => player.id === selectedId) : undefined;
-      const ownerTargetId = postPromotionTargetById.get(ownerId) ?? null;
+      const ownerTargetId = currentTargetById.get(ownerId) ?? null;
       const selectedHunter = selected
-        ? players.find((player) => player.id !== ownerId && postPromotionTargetById.get(player.id) === selected.id && statusById.get(player.id) === "alive")
+        ? players.find((player) => player.id !== ownerId && currentTargetById.get(player.id) === selected.id && statusById.get(player.id) === "alive")
         : undefined;
 
       const invalid = !owner || statusById.get(ownerId) !== "alive" || !selected || statusById.get(selected.id) !== "alive"
@@ -353,6 +356,22 @@ export async function startRoundAtomic(gameId: number): Promise<StartRoundResult
       await tx.update(gamePlayers).set({ targetId: selected.id }).where(eq(gamePlayers.id, ownerId));
       await tx.update(gamePlayers).set({ targetId: ownerTargetId }).where(eq(gamePlayers.id, selectedHunter.id));
       await tx.update(playerPowerUps).set({ status: "consumed", isActive: false, expiresAt: new Date() }).where(eq(playerPowerUps.id, wildcard.id));
+
+      currentTargetById.set(ownerId, selected.id);
+      currentTargetById.set(selectedHunter.id, ownerTargetId);
+    }
+
+    // Every individual Wildcard swap preserves the one-to-one invariant
+    // against the evolving map at the moment it's applied, but re-check
+    // the final assignment as a hard backstop before committing: if
+    // anything above ever violates it, the whole round start -- round
+    // advance, target promotions, and every Wildcard write -- rolls back
+    // rather than landing a broken target chain.
+    const finalAssignment = players
+      .filter((player) => statusById.get(player.id) === "alive")
+      .map((player) => ({ id: player.id, targetId: currentTargetById.get(player.id) ?? null }));
+    if (!isValidOneToOneTargetAssignment(finalAssignment)) {
+      throw new Error("Wildcard processing produced an invalid target assignment");
     }
 
     return { currentRound, roundEndTime, wildcardReturns };

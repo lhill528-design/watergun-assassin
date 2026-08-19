@@ -164,6 +164,18 @@ function validCycleOfFive(): FakePlayer[] {
   ];
 }
 
+// 1 -> 2 -> ... -> 8 -> 1, large enough to fit two independent Wildcard
+// swaps that don't share any players.
+function validCycleOfEight(): FakePlayer[] {
+  return Array.from({ length: 8 }, (_, i) => ({
+    id: i + 1,
+    userId: 300 + i + 1,
+    status: "alive" as const,
+    targetId: ((i + 1) % 8) + 1,
+    nextRoundTargetId: null,
+  }));
+}
+
 describe("startRoundAtomic", () => {
   beforeEach(() => {
     process.env.DATABASE_URL = FIXTURE_DATABASE_URL;
@@ -420,5 +432,135 @@ describe("startRoundAtomic", () => {
     expect(committedGame.roundEndTime).toBeNull();
     expect(committedPlayers.map((p) => p.targetId)).toEqual([2, 3, 4, 5, 1]); // unchanged
     expect(committedPowerUps[0].status).toBe("active"); // unchanged
+  });
+
+  // --- Correction: process Wildcards against an evolving target map, not
+  // a single static post-promotion snapshot ---
+
+  it("processes two Wildcards that both choose the same selected player, in ascending id order, still producing a valid one-to-one chain", async () => {
+    committedPlayers = validCycleOfEight(); // 1->2->3->4->5->6->7->8->1
+    committedPowerUps = [
+      // Processed second by id, but listed first here to prove ordering
+      // is driven by ascending inventory id, not array/insertion order.
+      {
+        id: 502,
+        gameId: 1,
+        gamePlayerId: 5, // owner: player 5, whose effective target is player 6
+        powerUpId: 1,
+        status: "active",
+        isActive: true,
+        expiresAt: null,
+        targetPlayerId: 4, // same selected player as wildcard 501
+        activationData: null,
+        activatedRound: null,
+      },
+      {
+        id: 501,
+        gameId: 1,
+        gamePlayerId: 1, // owner: player 1, whose effective target is player 2
+        powerUpId: 1,
+        status: "active",
+        isActive: true,
+        expiresAt: null,
+        targetPlayerId: 4, // owner wants to hunt player 4
+        activationData: null,
+        activatedRound: null,
+      },
+    ];
+
+    const result = await startRoundAtomic(1);
+
+    expect(result.currentRound).toBe(1);
+    // Wildcard 501 runs first: owner 1 -> 4 (hunter of 4 was player 3, so
+    // 3 inherits 1's old target, 2). At that point player 1 is the new
+    // hunter of player 4.
+    // Wildcard 502 runs second, re-reading the *evolving* map: owner 5's
+    // target (4) is now hunted by player 1 (not player 3, the stale
+    // snapshot value) -- so 5 -> 4 and 1 (the current hunter of 4)
+    // inherits 5's old target, 6. Nothing self-targets or duplicates.
+    const byId = new Map(committedPlayers.map((p) => [p.id, p.targetId]));
+    expect(byId.get(1)).toBe(6);
+    expect(byId.get(2)).toBe(3);
+    expect(byId.get(3)).toBe(2);
+    expect(byId.get(4)).toBe(5);
+    expect(byId.get(5)).toBe(4);
+    expect(byId.get(6)).toBe(7);
+    expect(byId.get(7)).toBe(8);
+    expect(byId.get(8)).toBe(1);
+
+    const targets = committedPlayers.map((p) => p.targetId);
+    expect(new Set(targets).size).toBe(targets.length); // no duplicates
+    committedPlayers.forEach((p) => expect(p.targetId).not.toBe(p.id)); // no self-targets
+
+    expect(result.wildcardReturns).toEqual([]);
+    expect(committedPowerUps.find((w) => w.id === 501)!.status).toBe("consumed");
+    expect(committedPowerUps.find((w) => w.id === 502)!.status).toBe("consumed");
+  });
+
+  it("applies multiple independent valid Wildcards without ever creating a self-target or duplicate target", async () => {
+    committedPlayers = validCycleOfEight();
+    committedPowerUps = [
+      {
+        id: 601,
+        gameId: 1,
+        gamePlayerId: 1, // owner 1 (target 2) picks player 4
+        powerUpId: 1,
+        status: "active",
+        isActive: true,
+        expiresAt: null,
+        targetPlayerId: 4,
+        activationData: null,
+        activatedRound: null,
+      },
+      {
+        id: 602,
+        gameId: 1,
+        gamePlayerId: 5, // owner 5 (target 6), disjoint from the first swap, picks player 8
+        powerUpId: 1,
+        status: "active",
+        isActive: true,
+        expiresAt: null,
+        targetPlayerId: 8,
+        activationData: null,
+        activatedRound: null,
+      },
+    ];
+
+    const result = await startRoundAtomic(1);
+
+    expect(result.currentRound).toBe(1);
+    expect(result.wildcardReturns).toEqual([]);
+    const targets = committedPlayers.map((p) => p.targetId);
+    expect(new Set(targets).size).toBe(targets.length); // no duplicate targets
+    committedPlayers.forEach((p) => expect(p.targetId).not.toBe(p.id)); // no self-targets
+    expect(committedPowerUps.find((w) => w.id === 601)!.status).toBe("consumed");
+    expect(committedPowerUps.find((w) => w.id === 602)!.status).toBe("consumed");
+  });
+
+  it("rolls back the round, every target, and Wildcard inventory state if Wildcard processing would violate the final one-to-one invariant", async () => {
+    committedPlayers = validCycleOfFive(); // 1->2->3->4->5->1
+    committedPowerUps = [
+      {
+        id: 701,
+        gameId: 1,
+        gamePlayerId: 1, // owner: player 1
+        powerUpId: 1,
+        status: "active",
+        isActive: true,
+        expiresAt: null,
+        targetPlayerId: 1, // owner selects itself -- would self-target once applied
+        activationData: null,
+        activatedRound: null,
+      },
+    ];
+    const snapshotPlayers = committedPlayers.map((p) => ({ ...p }));
+    const snapshotPowerUps = committedPowerUps.map((w) => ({ ...w }));
+
+    await expect(startRoundAtomic(1)).rejects.toThrow();
+
+    expect(committedGame.currentRound).toBe(0);
+    expect(committedGame.roundEndTime).toBeNull();
+    expect(committedPlayers).toEqual(snapshotPlayers); // every target untouched
+    expect(committedPowerUps).toEqual(snapshotPowerUps); // Wildcard inventory state untouched
   });
 });
