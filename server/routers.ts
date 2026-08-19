@@ -225,27 +225,16 @@ export const appRouter = router({
         const game = await db.getGame(input.gameId);
         if (!game) throw new Error("Game not found");
         if (game.adminId !== ctx.user.id && !ctx.user.isSuperAdmin) throw new Error("Admin access required");
-        // The round number, target promotions, and the game's own
-        // currentRound/roundEndTime/status all commit together (or not at
-        // all) -- see startRoundAtomic. Wildcard reassignment below is a
-        // separate, independent power-up-inventory side effect, not part
-        // of that core state.
-        const { currentRound } = await db.startRoundAtomic(input.gameId);
-        const roundPlayers = await db.getGamePlayers(input.gameId);
-        const wildcards = await db.getActiveGamePowerUpsByName(input.gameId, "Wildcard");
-        for (const wildcard of wildcards) {
-          const owner = roundPlayers.find(player => player.id === wildcard.gamePlayerId);
-          const selected = roundPlayers.find(player => player.id === wildcard.targetPlayerId);
-          const selectedHunter = selected ? roundPlayers.find(player => player.id !== owner?.id && player.targetId === selected.id && player.status === "alive") : undefined;
-          if (!owner || owner.status !== "alive" || !selected || selected.status !== "alive" || !selectedHunter || !owner.targetId || owner.targetId === selectedHunter.id) {
-            await db.returnPowerUpToInventory(wildcard.id);
-            if (owner) await db.createNotification({ userId: owner.userId, gameId: input.gameId, type: "power_up_used", title: "Wildcard Returned", body: "Your selected target was no longer valid at round start. Choose again for a later round." });
-            continue;
-          }
-          const oldTarget = owner.targetId;
-          await db.updatePlayer(owner.id, { targetId: selected.id });
-          await db.updatePlayer(selectedHunter.id, { targetId: oldTarget });
-          await db.consumePlayerPowerUp(wildcard.id);
+        // The round number, target promotions, and every Wildcard swap/
+        // consumption/return all commit together inside startRoundAtomic
+        // -- a failure anywhere in there (e.g. consuming a Wildcard)
+        // can't leave the game already in an active round with a
+        // half-applied target chain. Only notification delivery below --
+        // external I/O, not state this transaction is responsible for --
+        // happens afterward, driven by what the transaction actually did.
+        const { currentRound, wildcardReturns } = await db.startRoundAtomic(input.gameId);
+        for (const { ownerUserId } of wildcardReturns) {
+          await db.createNotification({ userId: ownerUserId, gameId: input.gameId, type: "power_up_used", title: "Wildcard Returned", body: "Your selected target was no longer valid at round start. Choose again for a later round." });
         }
         await db.createKillFeedEvent({ gameId: input.gameId, eventType: "round_start", message: `🎯 Round ${currentRound} has begun!` });
         return { success: true };

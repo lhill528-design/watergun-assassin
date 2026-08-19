@@ -167,6 +167,33 @@ describe("AdminTargetsScreen: Auto-Assign All Targets", () => {
     expect(trpcState.assignMutateAsync).not.toHaveBeenCalled();
     confirmSpy.mockRestore();
   });
+
+  // Correction from review: Assign and Clear used to guard themselves
+  // independently, so a Clear click could slip through while an Assign
+  // mutation (which rewrites the same players' targetId) was still in
+  // flight, and vice versa. Both buttons now share one ref-backed lock.
+  it("the shared guard blocks Clear from starting while Assign is still in flight, and disables both buttons", async () => {
+    let resolveAssign!: (value: unknown) => void;
+    trpcState.assignMutateAsync.mockReturnValue(new Promise((resolve) => { resolveAssign = resolve; }));
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+    render(React.createElement(AdminTargetsScreen));
+
+    fireEvent.click(screen.getByText(/Auto-Assign All Targets/));
+    expect(trpcState.assignMutateAsync).toHaveBeenCalledTimes(1);
+
+    // Assign is still pending -- Clear must not fire, and both buttons
+    // must read as disabled.
+    fireEvent.click(screen.getByText(/Clear All Targets/));
+    expect(trpcState.clearMutateAsync).not.toHaveBeenCalled();
+    expect((screen.getByText(/Assigning\.\.\./).closest("button") as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByText(/Clear All Targets/).closest("button") as HTMLButtonElement).disabled).toBe(true);
+
+    await act(async () => {
+      resolveAssign({ affected: 2 });
+      await Promise.resolve();
+    });
+    confirmSpy.mockRestore();
+  });
 });
 
 describe("AdminTargetsScreen: Clear All Targets", () => {
@@ -207,5 +234,25 @@ describe("AdminTargetsScreen: Clear All Targets", () => {
 
     expect(alertState.alert).toHaveBeenCalledTimes(1);
     expect(trpcState.clearMutateAsync).toHaveBeenCalledTimes(1);
+  });
+
+  it("the shared guard blocks Assign from starting while Clear is still in flight", async () => {
+    let resolveClear!: (value: unknown) => void;
+    trpcState.clearMutateAsync.mockReturnValue(new Promise((resolve) => { resolveClear = resolve; }));
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+    render(React.createElement(AdminTargetsScreen));
+
+    fireEvent.click(screen.getByText(/Clear All Targets/));
+    expect(trpcState.clearMutateAsync).toHaveBeenCalledTimes(1);
+
+    // Clear is still pending -- Assign must not fire.
+    fireEvent.click(screen.getByText(/Auto-Assign All Targets/));
+    expect(trpcState.assignMutateAsync).not.toHaveBeenCalled();
+
+    await act(async () => {
+      resolveClear({ affected: 2 });
+      await Promise.resolve();
+    });
+    confirmSpy.mockRestore();
   });
 });

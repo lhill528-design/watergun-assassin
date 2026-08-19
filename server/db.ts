@@ -253,7 +253,18 @@ export async function updateGame(gameId: number, data: Partial<typeof games.$inf
 // reassignment and notifications are handled by the caller afterward:
 // they're independent power-up-inventory side effects, not part of the
 // round/target state this function is responsible for keeping consistent.
-export async function startRoundAtomic(gameId: number): Promise<{ currentRound: number; roundEndTime: Date }> {
+export interface StartRoundResult {
+  currentRound: number;
+  roundEndTime: Date;
+  // Wildcards returned to inventory because their selected target was no
+  // longer valid at round start -- the caller sends notifications for
+  // these *after* this transaction commits (external I/O has no place
+  // inside it), driven by exactly what actually happened here rather than
+  // re-deriving it from a second, separate read afterward.
+  wildcardReturns: Array<{ ownerUserId: number }>;
+}
+
+export async function startRoundAtomic(gameId: number): Promise<StartRoundResult> {
   const db = await getDb();
   if (!db) throw new Error("Database not available");
   return db.transaction(async (tx) => {
@@ -267,7 +278,15 @@ export async function startRoundAtomic(gameId: number): Promise<{ currentRound: 
     const players = await tx.select().from(gamePlayers).where(eq(gamePlayers.gameId, gameId));
     const alivePlayers = players.filter((player) => player.status === "alive");
     if (alivePlayers.length < 2) throw new Error("Need at least 2 alive players to start a round");
-    if (!isValidOneToOneTargetAssignment(alivePlayers.map((player) => ({ id: player.id, targetId: player.targetId })))) {
+
+    // Validate the assignment that will actually be in effect once queued
+    // nextRoundTargetId picks (e.g. from Wildcard) are applied below --
+    // not just whatever's sitting in targetId right now. A chain that's
+    // valid today can become invalid once a queued pick lands, and that
+    // has to be caught before anything commits, not discovered after a
+    // stale validation already let the promotion through.
+    const effectiveAssignment = alivePlayers.map((player) => ({ id: player.id, targetId: player.nextRoundTargetId ?? player.targetId }));
+    if (!isValidOneToOneTargetAssignment(effectiveAssignment)) {
       throw new Error("Assign valid one-to-one targets to all alive players before starting a round");
     }
 
@@ -281,7 +300,62 @@ export async function startRoundAtomic(gameId: number): Promise<{ currentRound: 
     }
     await tx.update(games).set({ currentRound, roundEndTime, status: "active" }).where(eq(games.id, gameId));
 
-    return { currentRound, roundEndTime };
+    // Wildcard reassignment, evaluated against the round's newly-promoted
+    // targets -- this used to run as a separate step only after
+    // startRoundAtomic had already committed, so a failure consuming a
+    // Wildcard (or anything else in that follow-up loop) could leave the
+    // game already in an active round with a half-applied target chain.
+    // Now it's part of the same transaction: either all of it lands --
+    // round advance, target promotions, and every Wildcard swap/
+    // consumption/return -- or none of it does.
+    //
+    // Each Wildcard is looked up against a single static snapshot of
+    // post-promotion targets (postPromotionTargetById), matching this
+    // logic's previous behavior: it never re-read state between
+    // iterations, so one Wildcard's swap in a batch has no effect on how
+    // another Wildcard in the same batch is evaluated.
+    const postPromotionTargetById = new Map<number, number | null>(
+      players.map((player) => [player.id, player.nextRoundTargetId ?? player.targetId]),
+    );
+    const statusById = new Map<number, string>(players.map((player) => [player.id, player.status]));
+
+    const activeInventory = await tx.select().from(playerPowerUps).where(and(eq(playerPowerUps.gameId, gameId), eq(playerPowerUps.isActive, true)));
+    const catalogRows = await tx.select().from(powerUps).where(eq(powerUps.gameId, gameId));
+    const catalogNameById = new Map(catalogRows.map((entry) => [entry.id, entry.name]));
+    const now = Date.now();
+    const wildcards = activeInventory.filter(
+      (item) => (!item.expiresAt || item.expiresAt.getTime() > now) && catalogNameById.get(item.powerUpId) === "Wildcard",
+    );
+
+    const wildcardReturns: Array<{ ownerUserId: number }> = [];
+
+    for (const wildcard of wildcards) {
+      const ownerId = wildcard.gamePlayerId;
+      const owner = players.find((player) => player.id === ownerId);
+      const selectedId = wildcard.targetPlayerId;
+      const selected = selectedId != null ? players.find((player) => player.id === selectedId) : undefined;
+      const ownerTargetId = postPromotionTargetById.get(ownerId) ?? null;
+      const selectedHunter = selected
+        ? players.find((player) => player.id !== ownerId && postPromotionTargetById.get(player.id) === selected.id && statusById.get(player.id) === "alive")
+        : undefined;
+
+      const invalid = !owner || statusById.get(ownerId) !== "alive" || !selected || statusById.get(selected.id) !== "alive"
+        || !selectedHunter || !ownerTargetId || ownerTargetId === selectedHunter.id;
+
+      if (invalid) {
+        await tx.update(playerPowerUps).set({
+          status: "inventory", isActive: false, activatedAt: null, expiresAt: null, targetPlayerId: null, activationData: null, activatedRound: null,
+        }).where(eq(playerPowerUps.id, wildcard.id));
+        if (owner) wildcardReturns.push({ ownerUserId: owner.userId });
+        continue;
+      }
+
+      await tx.update(gamePlayers).set({ targetId: selected.id }).where(eq(gamePlayers.id, ownerId));
+      await tx.update(gamePlayers).set({ targetId: ownerTargetId }).where(eq(gamePlayers.id, selectedHunter.id));
+      await tx.update(playerPowerUps).set({ status: "consumed", isActive: false, expiresAt: new Date() }).where(eq(playerPowerUps.id, wildcard.id));
+    }
+
+    return { currentRound, roundEndTime, wildcardReturns };
   });
 }
 
@@ -1002,6 +1076,14 @@ export async function seedAchievements(
   const db = await getDb();
   if (!db) throw new Error("Database not available");
   return db.transaction(async (tx) => {
+    // Locking the game row first (achievements don't have a row of their
+    // own to lock before any exist) serializes concurrent seed requests
+    // for the same game -- without this, two requests could both read "no
+    // achievements exist yet" before either committed and both insert the
+    // full catalog.
+    const gameRows = await tx.select({ id: games.id }).from(games).where(eq(games.id, gameId)).for("update");
+    if (!gameRows[0]) throw new Error("Game not found");
+
     const existing = await tx.select({ name: achievements.name }).from(achievements).where(eq(achievements.gameId, gameId));
     const existingNames = new Set(existing.map((row) => row.name));
     let created = 0;

@@ -85,7 +85,7 @@ describe("game.startRound preconditions", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockGetGame.mockResolvedValue(BASE_GAME);
-    mockStartRoundAtomic.mockResolvedValue({ currentRound: 1, roundEndTime: new Date() });
+    mockStartRoundAtomic.mockResolvedValue({ currentRound: 1, roundEndTime: new Date(), wildcardReturns: [] });
     mockGetGamePlayers.mockResolvedValue([]);
     mockGetActiveGamePowerUpsByName.mockResolvedValue([]);
   });
@@ -109,6 +109,20 @@ describe("game.startRound preconditions", () => {
     const caller = appRouter.createCaller(makeCtx(7));
     await expect(caller.game.startRound({ gameId: 1 })).rejects.toThrow("already active");
     expect(mockCreateKillFeedEvent).not.toHaveBeenCalled();
+  });
+
+  // Wildcard swaps/consumption/returns now happen inside startRoundAtomic
+  // itself -- the router's only remaining job for them is sending
+  // notifications afterward, driven by what the transaction reports it
+  // actually did (not by re-deriving it from a second, separate read).
+  it("sends a Wildcard Returned notification for each owner startRoundAtomic reports, after the transaction has already committed", async () => {
+    mockStartRoundAtomic.mockResolvedValue({ currentRound: 1, roundEndTime: new Date(), wildcardReturns: [{ ownerUserId: 42 }, { ownerUserId: 43 }] });
+    const caller = appRouter.createCaller(makeCtx(7));
+    await caller.game.startRound({ gameId: 1 });
+
+    expect(mockCreateNotification).toHaveBeenCalledTimes(2);
+    expect(mockCreateNotification).toHaveBeenCalledWith(expect.objectContaining({ userId: 42, title: "Wildcard Returned" }));
+    expect(mockCreateNotification).toHaveBeenCalledWith(expect.objectContaining({ userId: 43, title: "Wildcard Returned" }));
   });
 });
 

@@ -13,16 +13,21 @@ export default function AdminTargetsScreen() {
   const [searchQuery, setSearchQuery] = useState("");
   const [message, setMessage] = useState<{ kind: "success" | "error"; text: string } | null>(null);
 
-  // Separate ref-backed guards -- assigning and clearing are different
-  // operations, and each is checked synchronously (not via
+  // One shared ref-backed guard for both actions -- assigning and
+  // clearing targets on the same game should never run concurrently (they
+  // both rewrite the same players' targetId), so a tap on either button
+  // while the other's confirmation dialog or mutation is still in flight
+  // must not start anything. Checked synchronously (not via
   // mutation.isPending's async re-render) so a rapid second tap on either
-  // button can't fire a second mutation.
-  const isAssigningRef = useRef(false);
-  const [isAssigning, setIsAssigning] = useState(false);
-  const setAssigning = (assigning: boolean) => { isAssigningRef.current = assigning; setIsAssigning(assigning); };
-  const isClearingRef = useRef(false);
-  const [isClearing, setIsClearing] = useState(false);
-  const setClearing = (clearing: boolean) => { isClearingRef.current = clearing; setIsClearing(clearing); };
+  // button can't slip through.
+  const isBusyRef = useRef(false);
+  const [busyAction, setBusyAction] = useState<"assigning" | "clearing" | null>(null);
+  const setBusy = (action: "assigning" | "clearing" | null) => {
+    isBusyRef.current = action !== null;
+    setBusyAction(action);
+  };
+  const isAssigning = busyAction === "assigning";
+  const isClearing = busyAction === "clearing";
 
   const gameQuery = trpc.game.get.useQuery({ gameId: activeGameId! }, { enabled: !!activeGameId });
   const playersQuery = trpc.player.list.useQuery({ gameId: activeGameId! }, { enabled: !!activeGameId });
@@ -74,8 +79,8 @@ export default function AdminTargetsScreen() {
       title: "Auto-Assign Targets",
       message: `Randomly assign targets for ${alivePlayers.length} alive players?`,
       confirmLabel: "Assign",
-      isRunning: isAssigningRef.current,
-      onRunningChange: setAssigning,
+      isRunning: isBusyRef.current,
+      onRunningChange: (running) => setBusy(running ? "assigning" : null),
       run: () => assignTargets.mutateAsync({ gameId: activeGameId! }),
     });
   };
@@ -86,8 +91,8 @@ export default function AdminTargetsScreen() {
       title: "Clear All Targets",
       message: "Remove all target assignments?",
       confirmLabel: "Clear",
-      isRunning: isClearingRef.current,
-      onRunningChange: setClearing,
+      isRunning: isBusyRef.current,
+      onRunningChange: (running) => setBusy(running ? "clearing" : null),
       run: () => clearTargets.mutateAsync({ gameId: activeGameId! }),
     });
   };
@@ -132,7 +137,7 @@ export default function AdminTargetsScreen() {
           <TouchableOpacity
             className="bg-primary/20 border border-primary rounded-xl p-4 items-center"
             onPress={handleAutoAssign}
-            disabled={isAssigning}
+            disabled={isAssigning || isClearing}
           >
             <Text className="text-primary font-bold">{isAssigning ? "Assigning..." : "🔄 Auto-Assign All Targets"}</Text>
             <Text className="text-primary/70 text-xs mt-1">Creates circular target chain</Text>
@@ -140,7 +145,7 @@ export default function AdminTargetsScreen() {
           <TouchableOpacity
             className="bg-error/20 border border-error rounded-xl p-4 items-center"
             onPress={handleClearTargets}
-            disabled={isClearing}
+            disabled={isAssigning || isClearing}
           >
             <Text className="text-error font-bold">{isClearing ? "Clearing..." : "🗑️ Clear All Targets"}</Text>
           </TouchableOpacity>
