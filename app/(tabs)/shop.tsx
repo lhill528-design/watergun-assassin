@@ -1,10 +1,11 @@
-import { Text, View, ScrollView, TouchableOpacity, Alert, TextInput } from "react-native";
+import { Text, View, ScrollView, TouchableOpacity, Alert, TextInput, Platform } from "react-native";
 import { useRouter } from "expo-router";
 import { ScreenContainer } from "@/components/screen-container";
 import { useGame } from "@/lib/game-context";
 import { trpc } from "@/lib/trpc";
 import { useAuth } from "@/hooks/use-auth";
-import { useState } from "react";
+import { requestConfirmedAction } from "@/lib/confirm-then-run";
+import { useRef, useState } from "react";
 import * as Location from "expo-location";
 
 const CATEGORIES = [
@@ -35,6 +36,45 @@ export default function ShopScreen() {
   const [decoyModes, setDecoyModes] = useState<Record<number, "automatic" | "manual">>({});
   const [decoyAddresses, setDecoyAddresses] = useState<Record<number, string>>({});
   const [geocodingSanctuary, setGeocodingSanctuary] = useState<number | null>(null);
+  const utils = trpc.useUtils();
+
+  // Purchase guard: a single, global lock (not per-item) -- rapid clicks
+  // on the same button, or on a different catalog item while one
+  // purchase is already in flight, must not fire a second mutation. A
+  // ref (not just the state below) so the check is synchronous, seeing
+  // the up-to-date value even before a re-render lands.
+  const isPurchasingRef = useRef(false);
+  const [isPurchasing, setIsPurchasing] = useState(false);
+  const [purchasingPowerUpId, setPurchasingPowerUpId] = useState<number | null>(null);
+  const setPurchasing = (purchasing: boolean) => {
+    isPurchasingRef.current = purchasing;
+    setIsPurchasing(purchasing);
+  };
+  const [purchaseMessage, setPurchaseMessage] = useState<{ kind: "success" | "error"; text: string } | null>(null);
+
+  // Activation guard: same shape, entirely separate from the purchase
+  // guard above -- activating one inventory item must not be blocked by
+  // (or block) an in-flight purchase, and vice versa.
+  const isActivatingRef = useRef(false);
+  const [isActivating, setIsActivating] = useState(false);
+  const [activatingItemId, setActivatingItemId] = useState<number | null>(null);
+  const setActivating = (activating: boolean) => {
+    isActivatingRef.current = activating;
+    setIsActivating(activating);
+  };
+  const [activationMessage, setActivationMessage] = useState<{ kind: "success" | "error"; text: string } | null>(null);
+  // Per-item validation errors (target/gift/stake/address/safe-object) --
+  // keyed by inventory item id so each item's own inline message doesn't
+  // clobber another item's.
+  const [itemErrors, setItemErrors] = useState<Record<number, string>>({});
+  const setItemError = (itemId: number, message: string | null) => {
+    setItemErrors((current) => {
+      const next = { ...current };
+      if (message) next[itemId] = message;
+      else delete next[itemId];
+      return next;
+    });
+  };
 
   const powerUpsQuery = trpc.powerUp.list.useQuery(
     { gameId: activeGameId! },
@@ -57,31 +97,35 @@ export default function ShopScreen() {
     { enabled: !!activeGameId && isAuthenticated }
   );
   const purchaseMutation = trpc.powerUp.purchase.useMutation({
-    onSuccess: () => {
-      playerQuery.refetch();
-      inventoryQuery.refetch();
-      Alert.alert("Purchased!", "The power-up is in your inventory. Its timer starts only when you activate it.");
+    onSuccess: (data) => {
+      utils.player.me.invalidate({ gameId: activeGameId! });
+      utils.powerUp.inventory.invalidate({ gameId: activeGameId! });
+      setPurchaseMessage({ kind: "success", text: `Purchased for ${data.cost} pts. It's in your inventory -- activate it when ready.` });
     },
-    onError: (err) => Alert.alert("Error", err.message),
+    onError: (err) => {
+      setPurchaseMessage({ kind: "error", text: err.message });
+      // Supplemental only on native, where Alert.alert's callbacks are
+      // reliable -- the inline message above is what actually drives the
+      // UI on every platform.
+      if (Platform.OS !== "web") Alert.alert("Error", err.message);
+    },
   });
   const activateMutation = trpc.powerUp.activate.useMutation({
-    onSuccess: async (_result, variables) => {
-      const activatedName = inventoryQuery.data?.find(item => item.id === variables.inventoryId)?.powerUp?.name;
-      inventoryQuery.refetch();
-      playerQuery.refetch();
-      playersQuery.refetch();
-      const reconResult = await reconQuery.refetch();
-      if (activatedName === "Recon" && reconResult.data) {
-        const report = reconResult.data;
-        const powerUps = report.activePowerUps.length
-          ? report.activePowerUps.map((p: any) => `${p.emoji || "⚡"} ${p.name || "Power-up"} (${p.status === "inventory" ? "unused" : p.status === "pending_payment" ? "awaiting fee" : p.status})`).join("\n")
-          : "No active or unused power-ups.";
-        Alert.alert(`Recon: ${report.targetName}`, `Points: ${report.points}\n\nActive & unused power-ups:\n${powerUps}`);
-        return;
-      }
-      Alert.alert("Activated!", "The power-up is now in effect. Any cash fee was added to the admin's collection queue.");
+    onSuccess: () => {
+      // Recon's own report is the persistent "🔍 Recon: ..." banner
+      // rendered below from reconQuery.data -- invalidating it here makes
+      // that banner show the fresh report on its own, reactively, with no
+      // Alert (and no special-casing by power-up name) required.
+      utils.powerUp.inventory.invalidate({ gameId: activeGameId! });
+      utils.player.me.invalidate({ gameId: activeGameId! });
+      utils.player.list.invalidate({ gameId: activeGameId! });
+      utils.player.reconTarget.invalidate({ gameId: activeGameId! });
+      setActivationMessage({ kind: "success", text: "Activated! Any cash fee was added to the admin's collection queue." });
     },
-    onError: (err) => Alert.alert("Unable to activate", err.message),
+    onError: (err) => {
+      setActivationMessage({ kind: "error", text: err.message });
+      if (Platform.OS !== "web") Alert.alert("Unable to activate", err.message);
+    },
   });
 
   const powerUps = powerUpsQuery.data || [];
@@ -99,36 +143,51 @@ export default function ShopScreen() {
     : powerUps.filter(p => p.isEnabled && p.name !== "Roulette" && p.category === selectedCategory);
 
   const handlePurchase = (powerUpId: number, name: string, cost: number) => {
-    Alert.alert(
-      "Purchase Power-Up",
-      `Buy ${name} for ${cost} points?`,
-      [
-        { text: "Cancel", style: "cancel" },
-        { text: "Buy", onPress: () => purchaseMutation.mutate({ gameId: activeGameId!, powerUpId }) },
-      ]
-    );
+    setPurchaseMessage(null);
+    setPurchasingPowerUpId(powerUpId);
+    requestConfirmedAction({
+      title: "Purchase Power-Up",
+      message: `Buy ${name} for ${cost} points?`,
+      confirmLabel: "Buy",
+      isRunning: isPurchasingRef.current,
+      onRunningChange: setPurchasing,
+      run: () => purchaseMutation.mutateAsync({ gameId: activeGameId!, powerUpId }),
+    });
   };
 
   const handleActivate = async (item: any) => {
+    // Blocks re-entry for the whole rest of this function, including the
+    // async geocoding below -- a second tap landing before any dialog
+    // even exists yet must not start a second, parallel attempt.
+    if (isActivatingRef.current) return;
+    setItemError(item.id, null);
+    setActivationMessage(null);
+
     const targetPlayerId = selectedTargets[item.id];
     if (TARGETED_POWER_UPS.has(item.powerUp?.name) && !targetPlayerId) {
-      Alert.alert("Choose a target", "Select a player before activating this power-up.");
+      setItemError(item.id, "Select a player before activating this power-up.");
       return;
     }
     const giftInventoryId = selectedGifts[item.id];
     if (item.powerUp?.name === "Care Package" && !giftInventoryId) {
-      Alert.alert("Choose a gift", "Select another unused inventory item to give away.");
+      setItemError(item.id, "Select another unused inventory item to give away.");
       return;
     }
     if (item.powerUp?.name === "Sniper's Duel" && !giftInventoryId) {
-      Alert.alert("Choose your stake", "Select an unused power-up to stake in the duel.");
+      setItemError(item.id, "Select an unused power-up to stake in the duel.");
       return;
     }
     const safeObject = safeObjects[item.id]?.trim();
     if (item.powerUp?.name === "Monkey Wrench" && !safeObject) {
-      Alert.alert("Enter a safe object", "Choose the replacement safe object before activating.");
+      setItemError(item.id, "Choose the replacement safe object before activating.");
       return;
     }
+
+    // Past this point we're either geocoding or about to show the
+    // confirmation dialog -- lock now.
+    setActivating(true);
+    setActivatingItemId(item.id);
+
     let sanctuaryCoords: { zoneLatitude: string; zoneLongitude: string } | undefined;
     if (item.powerUp?.name === "Sanctuary") {
       const address = sanctuaryAddresses[item.id]?.trim();
@@ -137,12 +196,14 @@ export default function ShopScreen() {
         try {
           const results = await Location.geocodeAsync(address);
           if (!results.length) {
-            Alert.alert("Address not found", "Couldn't find that address. Try being more specific, or leave it blank to use your current location.");
+            setItemError(item.id, "Couldn't find that address. Try being more specific, or leave it blank to use your current location.");
+            setActivating(false);
             return;
           }
           sanctuaryCoords = { zoneLatitude: results[0].latitude.toFixed(6), zoneLongitude: results[0].longitude.toFixed(6) };
         } catch {
-          Alert.alert("Search failed", "Couldn't look up that address right now.");
+          setItemError(item.id, "Couldn't look up that address right now.");
+          setActivating(false);
           return;
         } finally {
           setGeocodingSanctuary(null);
@@ -154,12 +215,12 @@ export default function ShopScreen() {
       const mode = decoyModes[item.id] || "automatic";
       if (mode === "manual") {
         const address = decoyAddresses[item.id]?.trim();
-        if (!address) { Alert.alert("Enter your location", "Manual Decoy needs the address where you will be."); return; }
+        if (!address) { setItemError(item.id, "Manual Decoy needs the address where you will be."); setActivating(false); return; }
         try {
           const results = await Location.geocodeAsync(address);
-          if (!results.length) { Alert.alert("Address not found", "Try a more specific address."); return; }
+          if (!results.length) { setItemError(item.id, "Address not found. Try a more specific address."); setActivating(false); return; }
           decoyData = { mode, address, anchorLatitude: results[0].latitude, anchorLongitude: results[0].longitude };
-        } catch { Alert.alert("Search failed", "Couldn't locate that address."); return; }
+        } catch { setItemError(item.id, "Couldn't locate that address."); setActivating(false); return; }
       } else decoyData = { mode };
     }
     const activationData = {
@@ -171,10 +232,14 @@ export default function ShopScreen() {
       ...(decoyData || {}),
     };
     const activateLabel = item.powerUp?.name === "Sanctuary" ? "Send this Sanctuary to the admin for approval?" : `Activate ${item.powerUp?.name} now? Its timer begins immediately.`;
-    Alert.alert("Activate Power-Up", activateLabel, [
-      { text: "Cancel", style: "cancel" },
-      { text: "Activate", onPress: () => activateMutation.mutate({ gameId: activeGameId!, inventoryId: item.id, targetPlayerId, activationData: Object.keys(activationData).length ? activationData : undefined }) },
-    ]);
+    requestConfirmedAction({
+      title: "Activate Power-Up",
+      message: activateLabel,
+      confirmLabel: "Activate",
+      isRunning: false, // already locked above; this call always proceeds to the dialog
+      onRunningChange: setActivating,
+      run: () => activateMutation.mutateAsync({ gameId: activeGameId!, inventoryId: item.id, targetPlayerId, activationData: Object.keys(activationData).length ? activationData : undefined }),
+    });
   };
 
   if (!activeGameId || !isAuthenticated) {
@@ -248,6 +313,12 @@ export default function ShopScreen() {
           </View>
         )}
 
+        {activationMessage && (
+          <View className={`rounded-xl p-3 mb-4 border ${activationMessage.kind === "success" ? "bg-success/20 border-success" : "bg-error/20 border-error"}`}>
+            <Text className={`text-sm text-center ${activationMessage.kind === "success" ? "text-success" : "text-error"}`}>{activationMessage.text}</Text>
+          </View>
+        )}
+
         {/* Player inventory: purchases remain here until activated. */}
         <View className="mb-5">
           <Text className="text-xl font-bold text-foreground mb-2">My Power-Up Inventory</Text>
@@ -270,11 +341,20 @@ export default function ShopScreen() {
                     )}
                   </View>
                   {item.status !== "active" && (
-                    <TouchableOpacity className="bg-primary px-4 py-2 rounded-lg" onPress={() => handleActivate(item)}>
-                      <Text className="text-background font-bold">Activate</Text>
+                    <TouchableOpacity
+                      className={`px-4 py-2 rounded-lg ${isActivating ? "bg-primary/50" : "bg-primary"}`}
+                      onPress={() => handleActivate(item)}
+                      disabled={isActivating}
+                    >
+                      <Text className="text-background font-bold">
+                        {isActivating && activatingItemId === item.id ? "Activating..." : "Activate"}
+                      </Text>
                     </TouchableOpacity>
                   )}
                 </View>
+                {itemErrors[item.id] && (
+                  <Text className="text-error text-xs mt-2">{itemErrors[item.id]}</Text>
+                )}
                 {needsTarget && item.status !== "active" && item.powerUp?.name === "Lifeline" && eliminatedPlayers.length === 0 && (
                   <Text className="text-muted text-xs mt-3">No eliminated players to revive right now.</Text>
                 )}
@@ -344,6 +424,12 @@ export default function ShopScreen() {
           })}
         </View>
 
+        {purchaseMessage && (
+          <View className={`rounded-xl p-3 mb-4 border ${purchaseMessage.kind === "success" ? "bg-success/20 border-success" : "bg-error/20 border-error"}`}>
+            <Text className={`text-sm text-center ${purchaseMessage.kind === "success" ? "text-success" : "text-error"}`}>{purchaseMessage.text}</Text>
+          </View>
+        )}
+
         {/* Category Filter */}
         <ScrollView horizontal showsHorizontalScrollIndicator={false} className="mb-4">
           <View className="flex-row gap-2">
@@ -377,7 +463,7 @@ export default function ShopScreen() {
               const usageCount = usageCountByPowerUpId[pu.id] || 0;
               const maxUsesPerGame = pu.maxUsesPerGame;
               const hasReachedUsageLimit = maxUsesPerGame != null && usageCount >= maxUsesPerGame;
-              const canPurchase = canAfford && !hasReachedUsageLimit;
+              const canPurchase = canAfford && !hasReachedUsageLimit && !isPurchasing;
 
               return (
                 <View key={pu.id} className="bg-surface rounded-xl p-4 border border-border">
@@ -425,7 +511,9 @@ export default function ShopScreen() {
                     disabled={!canPurchase}
                   >
                     <Text className={`font-bold text-sm ${canPurchase ? "text-background" : "text-muted"}`}>
-                      {hasReachedUsageLimit ? "Maximum Used" : canAfford ? "Purchase" : "Not Enough Points"}
+                      {isPurchasing && purchasingPowerUpId === pu.id
+                        ? "Purchasing..."
+                        : hasReachedUsageLimit ? "Maximum Used" : canAfford ? "Purchase" : "Not Enough Points"}
                     </Text>
                   </TouchableOpacity>
                 </View>

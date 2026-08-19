@@ -423,6 +423,67 @@ export async function purchasePowerUp(gamePlayerId: number, powerUpId: number, g
   return result[0].insertId;
 }
 
+// Used specifically by the paid Shop purchase flow (powerUp.purchase), as
+// opposed to the free grants (map pickups, Roulette wins, Care Package
+// gifts) that call purchasePowerUp() directly above. Those never touch a
+// balance, so they don't need any of this.
+//
+// The point deduction, coupon consumption, inventory insert, and Sabotage
+// consumption all happen inside one transaction -- previously these were
+// separate, sequential writes, so a failure creating the inventory row
+// (or consuming Sabotage) could leave points deducted with no power-up
+// granted in return.
+//
+// `SELECT ... FOR UPDATE` locks the player's row for the rest of the
+// transaction, so a second, concurrent purchase for the same player has
+// to wait for this one to commit (or roll back) before it can read a
+// balance at all -- closing the race where two requests both read the
+// same pre-purchase balance, both pass the affordability check, and both
+// deduct against a balance neither of them re-checked after the other's
+// write. The caller's own pre-transaction affordability check is still
+// useful for a fast, friendly error, but this is the check that actually
+// has to be correct.
+export async function purchasePowerUpAtomic(params: {
+  gamePlayerId: number;
+  gameId: number;
+  powerUpId: number;
+  cost: number;
+  clearPendingDiscount: boolean;
+  sabotageIdToConsume?: number;
+}): Promise<{ inventoryId: number }> {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+  return db.transaction(async (tx) => {
+    const rows = await tx.select().from(gamePlayers).where(eq(gamePlayers.id, params.gamePlayerId)).for("update");
+    const player = rows[0];
+    if (!player) throw new Error("Player not found");
+    const available = (player.points || 0) - (player.reservedPoints || 0);
+    if (available < params.cost) throw new Error("Not enough available points (Bodyguard reservations cannot be spent)");
+
+    await tx.update(gamePlayers).set({
+      points: (player.points || 0) - params.cost,
+      ...(params.clearPendingDiscount ? { pendingDiscountPercent: null } : {}),
+    }).where(eq(gamePlayers.id, params.gamePlayerId));
+
+    const insertResult = await tx.insert(playerPowerUps).values({
+      gamePlayerId: params.gamePlayerId,
+      powerUpId: params.powerUpId,
+      gameId: params.gameId,
+      status: "inventory",
+      isActive: false,
+      activatedAt: null,
+      expiresAt: null,
+    });
+    const inventoryId = insertResult[0].insertId;
+
+    if (params.sabotageIdToConsume != null) {
+      await tx.update(playerPowerUps).set({ status: "consumed", isActive: false, expiresAt: new Date() }).where(eq(playerPowerUps.id, params.sabotageIdToConsume));
+    }
+
+    return { inventoryId };
+  });
+}
+
 export async function getPlayerPowerUps(gamePlayerId: number) {
   const db = await getDb();
   if (!db) return [];

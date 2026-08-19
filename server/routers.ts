@@ -722,13 +722,19 @@ export const appRouter = router({
         const cost = pendingDiscountPercent == null
           ? standardCost
           : Math.floor(standardCost * (1 - pendingDiscountPercent / 100));
+        // This up-front check gives a fast, friendly error for the common
+        // case, but it isn't what actually protects the balance -- that's
+        // purchasePowerUpAtomic's own re-check under a row lock, since this
+        // read can be stale by the time the transaction below runs.
         if ((player.points || 0) - (player.reservedPoints || 0) < cost) throw new Error("Not enough available points (Bodyguard reservations cannot be spent)");
-        await db.updatePlayer(player.id, {
-          points: (player.points || 0) - cost,
-          ...(pendingDiscountPercent == null ? {} : { pendingDiscountPercent: null }),
+        const { inventoryId } = await db.purchasePowerUpAtomic({
+          gamePlayerId: player.id,
+          gameId: input.gameId,
+          powerUpId: powerUp.id,
+          cost,
+          clearPendingDiscount: pendingDiscountPercent != null,
+          sabotageIdToConsume: sabotage?.id,
         });
-        const inventoryId = await db.purchasePowerUp(player.id, powerUp.id, input.gameId);
-        if (sabotage) await db.consumePlayerPowerUp(sabotage.id);
         await db.checkAndAwardAchievements(player.id, input.gameId);
         return { success: true, inventoryId, cost, status: "inventory" as const };
       }),
