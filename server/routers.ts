@@ -702,38 +702,22 @@ export const appRouter = router({
       .mutation(async ({ ctx, input }) => {
         const player = await db.getPlayerInGame(input.gameId, ctx.user.id);
         if (!player) throw new Error("Not in this game");
-        const allPowerUps = await db.getGamePowerUps(input.gameId);
-        const powerUp = allPowerUps.find(p => p.id === input.powerUpId);
-        if (!powerUp || !powerUp.isEnabled) throw new Error("Power-up not available");
-        if (powerUp.name === "Roulette") throw new Error("Roulette is available only from the Shop banner and cannot be purchased");
-        if (powerUp.maxUsesPerGame != null) {
-          const usageCount = await db.getPlayerPowerUpUsageCount(player.id, powerUp.id, input.gameId);
-          if (usageCount >= powerUp.maxUsesPerGame) {
-            throw new Error(`You've already used the maximum of ${powerUp.maxUsesPerGame} for this power-up this game`);
-          }
-        }
+        // General housekeeping (flips genuinely expired rows, including
+        // their Bodyguard/Witness Protection/etc. side effects) -- not
+        // required for purchasePowerUpAtomic's own Blacklist/Sabotage
+        // check below, which filters by expiry itself regardless of
+        // whether this has run yet.
         await db.expirePlayerPowerUps(input.gameId);
-        const blacklist = await db.getActiveTargetedPowerUp(input.gameId, player.id, "Blacklist");
-        if (blacklist) throw new Error("You are currently blacklisted and cannot purchase power-ups");
-        const sabotage = await db.getActiveTargetedPowerUp(input.gameId, player.id, "Sabotage");
-        const baseCost = powerUp.discount ? Math.floor(powerUp.cost * (1 - powerUp.discount / 100)) : powerUp.cost;
-        const standardCost = sabotage ? baseCost * 2 : baseCost;
-        const pendingDiscountPercent = player.pendingDiscountPercent;
-        const cost = pendingDiscountPercent == null
-          ? standardCost
-          : Math.floor(standardCost * (1 - pendingDiscountPercent / 100));
-        // This up-front check gives a fast, friendly error for the common
-        // case, but it isn't what actually protects the balance -- that's
-        // purchasePowerUpAtomic's own re-check under a row lock, since this
-        // read can be stale by the time the transaction below runs.
-        if ((player.points || 0) - (player.reservedPoints || 0) < cost) throw new Error("Not enough available points (Bodyguard reservations cannot be spent)");
-        const { inventoryId } = await db.purchasePowerUpAtomic({
+        // Every part of the purchase decision -- catalog cost/discount/
+        // enabled state, max-use eligibility, active Blacklist/Sabotage,
+        // the pending coupon, and the balance itself -- is re-derived from
+        // scratch inside this call, strictly after it locks the player's
+        // row. Nothing computed out here would be trustworthy against a
+        // concurrent purchase; see purchasePowerUpAtomic's own comment.
+        const { inventoryId, cost } = await db.purchasePowerUpAtomic({
           gamePlayerId: player.id,
           gameId: input.gameId,
-          powerUpId: powerUp.id,
-          cost,
-          clearPendingDiscount: pendingDiscountPercent != null,
-          sabotageIdToConsume: sabotage?.id,
+          powerUpId: input.powerUpId,
         });
         await db.checkAndAwardAchievements(player.id, input.gameId);
         return { success: true, inventoryId, cost, status: "inventory" as const };

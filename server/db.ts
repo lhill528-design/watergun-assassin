@@ -428,41 +428,94 @@ export async function purchasePowerUp(gamePlayerId: number, powerUpId: number, g
 // gifts) that call purchasePowerUp() directly above. Those never touch a
 // balance, so they don't need any of this.
 //
-// The point deduction, coupon consumption, inventory insert, and Sabotage
-// consumption all happen inside one transaction -- previously these were
-// separate, sequential writes, so a failure creating the inventory row
-// (or consuming Sabotage) could leave points deducted with no power-up
-// granted in return.
+// Correction from review: an earlier version of this function took a
+// pre-computed cost/discount-clear/sabotage-to-consume from the caller,
+// which had already worked all of that out from reads taken *before* the
+// row lock below was acquired. That left every part of the purchase
+// decision -- cost (discount, Sabotage doubling, coupon), Blacklist,
+// max-use eligibility -- racy: two concurrent requests could both read
+// the same pending coupon or the same Sabotage and both apply it, or both
+// pass the same max-use check. The lock only ever protected the raw point
+// balance, not the decision that produced the cost being deducted from it.
 //
-// `SELECT ... FOR UPDATE` locks the player's row for the rest of the
-// transaction, so a second, concurrent purchase for the same player has
-// to wait for this one to commit (or roll back) before it can read a
-// balance at all -- closing the race where two requests both read the
-// same pre-purchase balance, both pass the affordability check, and both
-// deduct against a balance neither of them re-checked after the other's
-// write. The caller's own pre-transaction affordability check is still
-// useful for a fast, friendly error, but this is the check that actually
-// has to be correct.
+// Now the entire decision is re-derived from scratch here, strictly after
+// `SELECT ... FOR UPDATE` locks the player's row -- catalog cost/discount/
+// enabled state, max-use count, active Blacklist/Sabotage, and the
+// pending coupon are all read fresh under that lock, not trusted from
+// whatever the caller computed beforehand. A second, concurrent purchase
+// for the same player has to wait for this transaction to commit or roll
+// back before its own `SELECT ... FOR UPDATE` even returns, so it always
+// re-derives its own decision against this one's committed result -- a
+// coupon or Sabotage already consumed here is gone by the time it reads;
+// a max-use count already incremented here is reflected in its own count.
+//
+// The point deduction, coupon consumption, inventory insert, and Sabotage
+// consumption all happen inside this same transaction, so a failure
+// anywhere in it (e.g. the inventory insert) rolls back everything else
+// too -- points, the coupon, and Sabotage's consumption all included.
 export async function purchasePowerUpAtomic(params: {
   gamePlayerId: number;
   gameId: number;
   powerUpId: number;
-  cost: number;
-  clearPendingDiscount: boolean;
-  sabotageIdToConsume?: number;
-}): Promise<{ inventoryId: number }> {
+}): Promise<{ inventoryId: number; cost: number }> {
   const db = await getDb();
   if (!db) throw new Error("Database not available");
   return db.transaction(async (tx) => {
-    const rows = await tx.select().from(gamePlayers).where(eq(gamePlayers.id, params.gamePlayerId)).for("update");
-    const player = rows[0];
+    const playerRows = await tx.select().from(gamePlayers).where(eq(gamePlayers.id, params.gamePlayerId)).for("update");
+    const player = playerRows[0];
     if (!player) throw new Error("Player not found");
+
+    const powerUpRows = await tx.select().from(powerUps).where(eq(powerUps.id, params.powerUpId)).limit(1);
+    const powerUp = powerUpRows[0];
+    if (!powerUp || powerUp.gameId !== params.gameId || !powerUp.isEnabled) throw new Error("Power-up not available");
+    if (powerUp.name === "Roulette") throw new Error("Roulette is available only from the Shop banner and cannot be purchased");
+
+    if (powerUp.maxUsesPerGame != null) {
+      const [usageResult] = await tx
+        .select({ count: sql<number>`count(*)` })
+        .from(playerPowerUps)
+        .where(and(
+          eq(playerPowerUps.gamePlayerId, params.gamePlayerId),
+          eq(playerPowerUps.powerUpId, params.powerUpId),
+          eq(playerPowerUps.gameId, params.gameId),
+        ));
+      const usageCount = Number(usageResult?.count ?? 0);
+      if (usageCount >= powerUp.maxUsesPerGame) {
+        throw new Error(`You've already used the maximum of ${powerUp.maxUsesPerGame} for this power-up this game`);
+      }
+    }
+
+    // Active Blacklist/Sabotage targeting this player -- filtered by
+    // isActive and expiry directly here (rather than depending on a
+    // separate expiry pass having already run) so this re-check is
+    // self-contained and correct under the lock regardless of expiry
+    // housekeeping timing.
+    const now = Date.now();
+    const targetedActive = await tx.select().from(playerPowerUps).where(and(
+      eq(playerPowerUps.gameId, params.gameId),
+      eq(playerPowerUps.targetPlayerId, params.gamePlayerId),
+      eq(playerPowerUps.isActive, true),
+    ));
+    const catalogRows = await tx.select().from(powerUps).where(eq(powerUps.gameId, params.gameId));
+    const catalogNameById = Object.fromEntries(catalogRows.map((entry) => [entry.id, entry.name]));
+    const isStillActive = (item: (typeof targetedActive)[number]) => !item.expiresAt || item.expiresAt.getTime() > now;
+    const blacklist = targetedActive.find((item) => isStillActive(item) && catalogNameById[item.powerUpId] === "Blacklist");
+    if (blacklist) throw new Error("You are currently blacklisted and cannot purchase power-ups");
+    const sabotage = targetedActive.find((item) => isStillActive(item) && catalogNameById[item.powerUpId] === "Sabotage");
+
+    const baseCost = powerUp.discount ? Math.floor(powerUp.cost * (1 - powerUp.discount / 100)) : powerUp.cost;
+    const standardCost = sabotage ? baseCost * 2 : baseCost;
+    const pendingDiscountPercent = player.pendingDiscountPercent;
+    const cost = pendingDiscountPercent == null
+      ? standardCost
+      : Math.floor(standardCost * (1 - pendingDiscountPercent / 100));
+
     const available = (player.points || 0) - (player.reservedPoints || 0);
-    if (available < params.cost) throw new Error("Not enough available points (Bodyguard reservations cannot be spent)");
+    if (available < cost) throw new Error("Not enough available points (Bodyguard reservations cannot be spent)");
 
     await tx.update(gamePlayers).set({
-      points: (player.points || 0) - params.cost,
-      ...(params.clearPendingDiscount ? { pendingDiscountPercent: null } : {}),
+      points: (player.points || 0) - cost,
+      ...(pendingDiscountPercent == null ? {} : { pendingDiscountPercent: null }),
     }).where(eq(gamePlayers.id, params.gamePlayerId));
 
     const insertResult = await tx.insert(playerPowerUps).values({
@@ -476,11 +529,11 @@ export async function purchasePowerUpAtomic(params: {
     });
     const inventoryId = insertResult[0].insertId;
 
-    if (params.sabotageIdToConsume != null) {
-      await tx.update(playerPowerUps).set({ status: "consumed", isActive: false, expiresAt: new Date() }).where(eq(playerPowerUps.id, params.sabotageIdToConsume));
+    if (sabotage) {
+      await tx.update(playerPowerUps).set({ status: "consumed", isActive: false, expiresAt: new Date() }).where(eq(playerPowerUps.id, sabotage.id));
     }
 
-    return { inventoryId };
+    return { inventoryId, cost };
   });
 }
 
