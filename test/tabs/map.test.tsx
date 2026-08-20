@@ -3,10 +3,13 @@
 // Real-render integration test for the review correction: checkedTargetPin
 // stored a checked location independently of player.list's ongoing
 // visibility-safe result, so it could keep showing a player's old (or now
-// -hidden) location after Blackout, Dead Zone, Witness Protection, target
-// reassignment, or a game/round change. player.list must be the
-// continuing authority; this proves the reconciliation, not just the
-// happy path.
+// -hidden/unauthorized) location after Blackout, Dead Zone, Witness
+// Protection, target reassignment, a purge with showLocationsDuringPurge
+// off, or a game/round change. player.list must be the continuing
+// authority, and player locations are sensitive enough that the guard
+// must be synchronous at render time, not only enforced by an effect that
+// runs after paint. This proves the reconciliation, not just the happy
+// path.
 //
 // react-native primitives are stubbed to their plain DOM equivalents (see
 // components/sign-in-form.integration.test.tsx for precedent). GameMap
@@ -58,10 +61,17 @@ vi.mock("@/components/screen-container", () => ({
   ScreenContainer: (props: any) => React.createElement("div", null, props.children),
 }));
 
+// gameMapRenderLog records the pin ids present on *every* GameMap render,
+// not just the latest -- this is what lets the reassignment test prove the
+// stale pin was excluded on the very first render after the state update,
+// not only after a follow-up correction render triggered by the
+// reconciliation effect.
 const gameMapPropsRef = vi.hoisted(() => ({ current: null as any }));
+const gameMapRenderLog = vi.hoisted(() => ({ entries: [] as number[][] }));
 vi.mock("@/components/game-map", () => ({
   GameMap: (props: any) => {
     gameMapPropsRef.current = props;
+    gameMapRenderLog.entries.push(props.pins.map((p: any) => p.id));
     const ReactActual = require("react");
     return ReactActual.createElement(
       "div",
@@ -85,12 +95,13 @@ vi.mock("@/hooks/use-auth", () => ({
 const trpcState = vi.hoisted(() => ({
   game: { id: 5, purgeActive: false, showLocationsDuringPurge: false } as any,
   players: [] as any[],
+  playersRefetch: vi.fn(),
   myPlayer: { id: 1, userId: 101, targetId: 2 } as any,
   mapPowerUps: [] as any[],
   vendettaTarget: null as any,
   proximityData: [] as any[],
   checkLocationMutate: vi.fn(),
-  lastCheckLocationOptions: null as null | { onSuccess?: (data: any, variables: any) => void; onError?: (err: any) => void },
+  lastCheckLocationOptions: null as null | { onSuccess?: (data: any, variables: any) => void; onError?: (err: any, variables: any) => void },
   geocodingSearchFetch: vi.fn(),
 }));
 
@@ -100,7 +111,7 @@ vi.mock("@/lib/trpc", () => ({
       get: { useQuery: () => ({ data: trpcState.game }) },
     },
     player: {
-      list: { useQuery: () => ({ data: trpcState.players }) },
+      list: { useQuery: () => ({ data: trpcState.players, refetch: trpcState.playersRefetch }) },
       me: { useQuery: () => ({ data: trpcState.myPlayer }) },
       vendettaTarget: { useQuery: () => ({ data: trpcState.vendettaTarget }) },
       updateLocation: { useMutation: () => ({ mutate: vi.fn() }) },
@@ -135,6 +146,7 @@ function alivePlayer(overrides: Partial<Record<string, unknown>> = {}) {
 
 beforeEach(() => {
   gameMapPropsRef.current = null;
+  gameMapRenderLog.entries = [];
   gameContextState.activeGameId = 5;
   trpcState.game = { id: 5, purgeActive: false, showLocationsDuringPurge: false };
   trpcState.myPlayer = { id: 1, userId: 101, targetId: 2 };
@@ -143,6 +155,7 @@ beforeEach(() => {
   trpcState.mapPowerUps = [];
   trpcState.proximityData = [];
   trpcState.lastCheckLocationOptions = null;
+  trpcState.playersRefetch.mockClear();
   platformState.OS = "web";
 });
 
@@ -191,7 +204,7 @@ describe("MapScreen: checked-location pin reconciliation", () => {
     expect(gameMapPropsRef.current.focusLocation).toBeNull();
   });
 
-  it("target reassignment (the checked player is no longer the viewer's target) removes the pin", async () => {
+  it("target reassignment excludes the pin on the very first render, not only after the reconciliation effect runs", async () => {
     const { rerender } = render(React.createElement(MapScreen));
     checkPlayer2Location();
     await succeedCheck("29.760000", "-95.370000");
@@ -199,13 +212,68 @@ describe("MapScreen: checked-location pin reconciliation", () => {
 
     // Player 2 is still visible/alive, but the viewer got reassigned to
     // target player 3 instead -- checking player 2 is no longer
-    // authorized, so its pin must not linger.
+    // authorized. The render-time guard (visibleCheckedPin /
+    // checkedTargetAuthorized) must exclude it synchronously in render,
+    // computed fresh from the current props/state -- it must not depend
+    // on the separate reconciliation useEffect (which runs after paint)
+    // to first render the stale pin and only remove it on a later,
+    // effect-triggered re-render.
+    gameMapRenderLog.entries = [];
     trpcState.myPlayer = { ...trpcState.myPlayer, targetId: 3 };
     await act(async () => {
       rerender(React.createElement(MapScreen));
     });
 
+    // Every render recorded from the reassignment onward -- including the
+    // very first -- already excludes player 2, proving the exclusion is a
+    // property of the render itself and not something only the effect's
+    // follow-up correction achieves.
+    expect(gameMapRenderLog.entries.length).toBeGreaterThan(0);
+    for (const pinIds of gameMapRenderLog.entries) {
+      expect(pinIds).not.toContain(2);
+    }
     expect(screen.queryByTestId("pin-2")).toBeNull();
+  });
+
+  it("a purge with showLocationsDuringPurge OFF does not authorize or retain the checked pin", async () => {
+    const { rerender } = render(React.createElement(MapScreen));
+    checkPlayer2Location();
+    await succeedCheck("29.760000", "-95.370000");
+    expect(screen.getByTestId("pin-2")).toBeTruthy();
+
+    // Player 2 is reassigned away AND a purge starts, but the admin never
+    // turned showLocationsDuringPurge on -- raw game.purgeActive being
+    // true must NOT be enough to keep authorizing/retaining the pin.
+    trpcState.myPlayer = { ...trpcState.myPlayer, targetId: 3 };
+    trpcState.game = { id: 5, purgeActive: true, showLocationsDuringPurge: false };
+    await act(async () => {
+      rerender(React.createElement(MapScreen));
+    });
+
+    expect(screen.queryByTestId("pin-2")).toBeNull();
+    expect(gameMapPropsRef.current.focusLocation).toBeNull();
+    // The map's "all locations visible" banner prop must also reflect
+    // canSeeAllDuringPurge, not raw purgeActive.
+    expect(gameMapPropsRef.current.purgeActive).toBe(false);
+  });
+
+  it("a purge with showLocationsDuringPurge ON permits the pin (and everyone else's)", async () => {
+    const { rerender } = render(React.createElement(MapScreen));
+    checkPlayer2Location();
+    await succeedCheck("29.760000", "-95.370000");
+    expect(screen.getByTestId("pin-2")).toBeTruthy();
+
+    trpcState.myPlayer = { ...trpcState.myPlayer, targetId: 3 };
+    trpcState.game = { id: 5, purgeActive: true, showLocationsDuringPurge: true };
+    await act(async () => {
+      rerender(React.createElement(MapScreen));
+    });
+
+    expect(screen.getByTestId("pin-2")).toBeTruthy();
+    expect(gameMapPropsRef.current.purgeActive).toBe(true);
+    // With canSeeAllDuringPurge true, checking a non-target player is
+    // also allowed again (not locked).
+    expect(screen.getByText("📍 Check Location")).toBeTruthy();
   });
 
   it("changing the active game removes the pin and the check-location message", async () => {
@@ -226,24 +294,65 @@ describe("MapScreen: checked-location pin reconciliation", () => {
     expect(screen.queryByText(/now focused on the map above/)).toBeNull();
   });
 
-  it("a failed re-check clears the previous checked result (map focus) and shows the error inline", async () => {
+  it("a failed re-check immediately removes the target's ordinary stale player.list pin, not just the focus, and requests a refetch", async () => {
     render(React.createElement(MapScreen));
     checkPlayer2Location();
     await succeedCheck("29.760000", "-95.370000");
+    expect(screen.getByTestId("pin-2")).toBeTruthy();
     expect(gameMapPropsRef.current.focusLocation).toEqual({ latitude: 29.76, longitude: -95.37 });
 
-    // Player 2 remains a genuinely valid, still-visible target throughout
-    // this test (buildPins() keeps drawing their live pin regardless --
-    // that's correct, not stale), so the observable effect of clearing
-    // checkedTargetPin here is that the map focus it alone drives goes
-    // away, and the success message is replaced by the failure.
+    // Player 2 remains myPlayer.targetId throughout this test and
+    // player.list still (staleley) reports them with a location -- so
+    // buildPins() alone would keep drawing their ordinary pin. The failed
+    // re-check must suppress that pin too, not just clear
+    // checkedTargetPin/focus.
     checkPlayer2Location();
     await act(async () => {
-      trpcState.lastCheckLocationOptions?.onError?.(new Error("This player's location is currently hidden"));
+      trpcState.lastCheckLocationOptions?.onError?.(new Error("This player's location is currently hidden"), { gameId: 5, targetPlayerId: 2 });
     });
 
+    expect(screen.queryByTestId("pin-2")).toBeNull();
     expect(gameMapPropsRef.current.focusLocation).toBeNull();
     expect(screen.getByText("This player's location is currently hidden")).toBeTruthy();
     expect(screen.queryByText(/now focused on the map above/)).toBeNull();
+    expect(trpcState.playersRefetch).toHaveBeenCalled();
+  });
+
+  it("a subsequent authoritative visible player.list refresh restores the pin without requiring another manual check", async () => {
+    const { rerender } = render(React.createElement(MapScreen));
+    checkPlayer2Location();
+    await succeedCheck("29.760000", "-95.370000");
+    checkPlayer2Location();
+    await act(async () => {
+      trpcState.lastCheckLocationOptions?.onError?.(new Error("This player's location is currently hidden"), { gameId: 5, targetPlayerId: 2 });
+    });
+    expect(screen.queryByTestId("pin-2")).toBeNull();
+
+    // player.list's next refresh reports player 2 as authorized (still
+    // the viewer's target) and visible again -- this is "fresh
+    // authoritative visible data" lifting the suppression on its own.
+    trpcState.players = [alivePlayer()];
+    await act(async () => {
+      rerender(React.createElement(MapScreen));
+    });
+
+    expect(screen.getByTestId("pin-2")).toBeTruthy();
+  });
+
+  it("a fresh successful re-check also restores a suppressed pin", async () => {
+    render(React.createElement(MapScreen));
+    checkPlayer2Location();
+    await succeedCheck("29.760000", "-95.370000");
+    checkPlayer2Location();
+    await act(async () => {
+      trpcState.lastCheckLocationOptions?.onError?.(new Error("This player's location is currently hidden"), { gameId: 5, targetPlayerId: 2 });
+    });
+    expect(screen.queryByTestId("pin-2")).toBeNull();
+
+    checkPlayer2Location();
+    await succeedCheck("29.760000", "-95.370000");
+
+    expect(screen.getByTestId("pin-2")).toBeTruthy();
+    expect(gameMapPropsRef.current.focusLocation).toEqual({ latitude: 29.76, longitude: -95.37 });
   });
 });

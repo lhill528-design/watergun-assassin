@@ -42,6 +42,15 @@ export default function MapScreen() {
   const [locationEnabled, setLocationEnabled] = useState(true);
   const locationSubRef = useRef<LocationSubscription | null>(null);
   const prevProximityRef = useRef<Record<number, number>>({});
+  // For each suppressed player id, the player.list *array reference* that
+  // was current when suppression began -- i.e. the stale snapshot that
+  // must not be trusted to lift the suppression on its own. Suppression
+  // is only auto-lifted once a genuinely different (freshly refetched)
+  // players array confirms the player authorized and visible again;
+  // otherwise the very same stale data that was already stale before the
+  // check failed would immediately "confirm" it's fine and undo the
+  // suppression before any real refresh ever landed.
+  const suppressedSincePlayersRef = useRef<Map<number, unknown>>(new Map());
 
   const [guessModal, setGuessModal] = useState<GuessModalState>({
     visible: false, mapPowerUpId: null, clue: "", guessLat: "", guessLon: "", result: null,
@@ -54,6 +63,15 @@ export default function MapScreen() {
   // focus the map on it.
   const [checkedTargetPin, setCheckedTargetPin] = useState<{ id: number; label: string; latitude: number; longitude: number } | null>(null);
   const [locationCheckMessage, setLocationCheckMessage] = useState<{ kind: "success" | "error"; text: string } | null>(null);
+  // A failed checkLocation must immediately hide every pin for that
+  // target -- not just the checkedTargetPin overlay -- including the
+  // ordinary pin buildPins() would otherwise still draw from player.list
+  // data that hasn't caught up yet. Keyed by player id rather than a
+  // single value since in principle more than one check could fail before
+  // player.list refreshes. Cleared once player.list itself reports that
+  // player as authorized and visible again, on a fresh successful check
+  // of them, or when the active game changes.
+  const [suppressedPlayerIds, setSuppressedPlayerIds] = useState<Set<number>>(new Set());
 
   const utils = trpc.useUtils();
   const [addressError, setAddressError] = useState<string | null>(null);
@@ -116,6 +134,13 @@ export default function MapScreen() {
   );
 
   const game = gameQuery.data;
+  // The single visibility value for "everyone's location is currently
+  // shown" -- raw game.purgeActive alone is NOT enough; the admin must
+  // have also turned on showLocationsDuringPurge. Every purge-based
+  // location-visibility decision (checked-pin authorization, "Check
+  // Location" availability, the map's "ALL LOCATIONS VISIBLE" banner)
+  // must key off this, not game?.purgeActive directly.
+  const canSeeAllDuringPurge = Boolean(game?.purgeActive && game?.showLocationsDuringPurge);
   const players = playersQuery.data || [];
   const myPlayer = playerMeQuery.data;
   const mapPowerUps = mapPowerUpsQuery.data || [];
@@ -139,6 +164,16 @@ export default function MapScreen() {
         // moves the existing pin, it never adds a duplicate.
         setCheckedTargetPin({ id: variables.targetPlayerId, label: name, latitude, longitude });
       }
+      // A fresh successful check is authoritative -- lift any earlier
+      // suppression for this player now, rather than waiting on the next
+      // player.list refresh to notice they're visible again.
+      suppressedSincePlayersRef.current.delete(variables.targetPlayerId);
+      setSuppressedPlayerIds(prev => {
+        if (!prev.has(variables.targetPlayerId)) return prev;
+        const next = new Set(prev);
+        next.delete(variables.targetPlayerId);
+        return next;
+      });
       setLocationCheckMessage({ kind: "success", text: `📍 ${name}: ${latitude.toFixed(5)}, ${longitude.toFixed(5)} — now focused on the map above.` });
       // Supplemental only on native, where Alert.alert's callbacks are
       // reliable -- the inline message above is what actually drives the
@@ -147,11 +182,23 @@ export default function MapScreen() {
         Alert.alert(`📍 ${name}`, `Location: ${latitude.toFixed(5)}, ${longitude.toFixed(5)}`);
       }
     },
-    onError: (err) => {
+    onError: (err, variables) => {
       // A failed re-check invalidates whatever was previously shown --
       // e.g. the target just went behind Blackout/Dead Zone, or is no
-      // longer the viewer's target -- so the stale pin must not linger.
+      // longer the viewer's target. Clearing checkedTargetPin alone isn't
+      // enough: buildPins() would still draw this player's ordinary pin
+      // from whatever player.list last returned, which may not have
+      // caught up yet -- suppressing the id hides that pin too, in the
+      // same render, without waiting on an effect or a refetch to land.
       setCheckedTargetPin(null);
+      suppressedSincePlayersRef.current.set(variables.targetPlayerId, players);
+      setSuppressedPlayerIds(prev => {
+        if (prev.has(variables.targetPlayerId)) return prev;
+        const next = new Set(prev);
+        next.add(variables.targetPlayerId);
+        return next;
+      });
+      playersQuery.refetch();
       setLocationCheckMessage({ kind: "error", text: err.message });
       if (Platform.OS !== "web") Alert.alert("Can't Check Location", err.message);
     },
@@ -254,45 +301,73 @@ export default function MapScreen() {
     };
   }, [activeGameId, isAuthenticated, locationEnabled]);
 
-  // Clear any checked pin/message when the active game changes -- it
-  // belongs to a different game's target and must not carry over.
+  // Clear any checked pin/message/suppression when the active game
+  // changes -- they belong to a different game's target and must not
+  // carry over.
   useEffect(() => {
     setCheckedTargetPin(null);
     setLocationCheckMessage(null);
+    setSuppressedPlayerIds(new Set());
+    suppressedSincePlayersRef.current.clear();
   }, [activeGameId]);
 
   // player.list (refetched periodically and on window focus above) is the
-  // continuing authority on this pin, not the one-off checkLocation
-  // response it was seeded from. Every time fresh player data arrives,
-  // reconcile: if the checked player disappeared, the viewer is no longer
-  // authorized to see them (retargeted, purge ended), or the refreshed
-  // row has no location, drop the pin entirely; otherwise adopt whatever
-  // effective coordinate player.list now reports for them, so a Decoy or
+  // continuing authority, not the one-off checkLocation response
+  // checkedTargetPin was seeded from. Every time fresh player data
+  // arrives, reconcile: if the checked player disappeared, the viewer is
+  // no longer authorized to see them (retargeted, purge ended or never
+  // had showLocationsDuringPurge on), or the refreshed row has no
+  // location, drop the pin entirely; otherwise adopt whatever effective
+  // coordinate player.list now reports for them, so a Decoy or
   // Doppelganger swap since the check replaces the old location instead
-  // of leaving it displayed.
+  // of leaving it displayed. This is a second layer behind the render-time
+  // guard below (which can't wait for an effect to run), not the only one.
   useEffect(() => {
-    if (!checkedTargetPin) return;
-    const freshTarget = players.find(p => p.id === checkedTargetPin.id);
-    const isMyTarget = !!freshTarget && (freshTarget.id === myPlayer?.targetId || freshTarget.id === vendettaTarget?.id);
-    const stillAuthorized = isMyTarget || Boolean(game?.purgeActive);
+    if (checkedTargetPin) {
+      const freshTarget = players.find(p => p.id === checkedTargetPin.id);
+      const isMyTarget = !!freshTarget && (freshTarget.id === myPlayer?.targetId || freshTarget.id === vendettaTarget?.id);
+      const stillAuthorized = isMyTarget || canSeeAllDuringPurge;
 
-    if (!freshTarget || !stillAuthorized) {
-      setCheckedTargetPin(null);
-      return;
+      if (!freshTarget || !stillAuthorized) {
+        setCheckedTargetPin(null);
+      } else {
+        const lat = freshTarget.latitude ? parseFloat(freshTarget.latitude) : NaN;
+        const lon = freshTarget.longitude ? parseFloat(freshTarget.longitude) : NaN;
+        if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+          setCheckedTargetPin(null);
+        } else if (lat !== checkedTargetPin.latitude || lon !== checkedTargetPin.longitude) {
+          setCheckedTargetPin({ ...checkedTargetPin, latitude: lat, longitude: lon });
+        }
+      }
     }
 
-    const lat = freshTarget.latitude ? parseFloat(freshTarget.latitude) : NaN;
-    const lon = freshTarget.longitude ? parseFloat(freshTarget.longitude) : NaN;
-    if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
-      setCheckedTargetPin(null);
-      return;
-    }
-
-    if (lat !== checkedTargetPin.latitude || lon !== checkedTargetPin.longitude) {
-      setCheckedTargetPin({ ...checkedTargetPin, latitude: lat, longitude: lon });
+    // Lift suppression once a genuinely fresh player.list result (a
+    // different array reference than the stale one in effect when the
+    // check failed) reports the player authorized and visible again --
+    // "fresh authoritative visible data" clears it just as a new
+    // successful check does, without requiring the viewer to manually
+    // re-check. Re-checking the very same stale snapshot that was
+    // already stale before the failure must never lift it on its own.
+    if (suppressedPlayerIds.size > 0) {
+      setSuppressedPlayerIds(prev => {
+        let changed = false;
+        const next = new Set(prev);
+        for (const id of prev) {
+          if (players === suppressedSincePlayersRef.current.get(id)) continue; // no fresh data yet
+          const freshTarget = players.find(p => p.id === id);
+          const isAuthorized = !!freshTarget && (freshTarget.id === myPlayer?.targetId || freshTarget.id === vendettaTarget?.id || canSeeAllDuringPurge);
+          const hasVisibleCoords = Boolean(freshTarget?.latitude && freshTarget?.longitude);
+          if (isAuthorized && hasVisibleCoords) {
+            next.delete(id);
+            suppressedSincePlayersRef.current.delete(id);
+            changed = true;
+          }
+        }
+        return changed ? next : prev;
+      });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [players, myPlayer, vendettaTarget, game?.purgeActive, checkedTargetPin]);
+  }, [players, myPlayer, vendettaTarget, canSeeAllDuringPurge, checkedTargetPin, suppressedPlayerIds]);
 
   const distanceMeters = (a: { latitude: number; longitude: number }, b: { latitude: number; longitude: number }) => {
     const R = 6371000;
@@ -329,9 +404,8 @@ export default function MapScreen() {
 
   const buildPins = (): PlayerPin[] => {
     const pins: PlayerPin[] = [];
-    const purgeActive = Boolean(game?.purgeActive && game?.showLocationsDuringPurge);
 
-    if (purgeActive) {
+    if (canSeeAllDuringPurge) {
       players
         .filter(p => (
           p.id !== myPlayer?.id
@@ -402,15 +476,33 @@ export default function MapScreen() {
     );
   }
 
-  const pins = buildPins();
-  // Defense in depth alongside the reconciliation effect above: even
-  // between a players refresh landing and that effect's next run, never
-  // render (or focus) a checked pin the current player.list result
-  // doesn't back with a real, visible location.
-  const checkedTargetStillVisible = checkedTargetPin
-    ? players.find(p => p.id === checkedTargetPin.id)
-    : undefined;
-  const visibleCheckedPin = checkedTargetPin && checkedTargetStillVisible?.latitude && checkedTargetStillVisible?.longitude
+  // A failed check suppresses every pin for that target id immediately,
+  // in this same render -- not just checkedTargetPin, but the ordinary
+  // pin buildPins() just drew from whatever player.list last returned.
+  // Player-origin pin types only: a map power-up's id lives in a
+  // different id space and could in principle collide numerically.
+  const PLAYER_PIN_TYPES = new Set<PlayerPin["type"]>(["self", "target", "safe", "player", "purge_player"]);
+  const pins = buildPins().filter(pin => !(PLAYER_PIN_TYPES.has(pin.type) && suppressedPlayerIds.has(pin.id)));
+
+  // Render-time, synchronous authorization + visibility guard -- this
+  // must NOT depend on the reconciliation effect above (effects run
+  // after render), since player locations are sensitive: the checked pin
+  // must never flash a stale or unauthorized location for even one
+  // frame. Requires the checked player to currently be the viewer's
+  // normal target, the active Vendetta target, or visible under a purge
+  // that actually has showLocationsDuringPurge on -- matching exactly
+  // what buildPins()/canCheck use, not just "has coordinates."
+  const checkedTargetFreshRow = checkedTargetPin ? players.find(p => p.id === checkedTargetPin.id) : undefined;
+  const checkedTargetAuthorized = !!checkedTargetFreshRow && (
+    checkedTargetFreshRow.id === myPlayer?.targetId
+    || checkedTargetFreshRow.id === vendettaTarget?.id
+    || canSeeAllDuringPurge
+  );
+  const checkedTargetVisible = Boolean(checkedTargetFreshRow?.latitude && checkedTargetFreshRow?.longitude);
+  const visibleCheckedPin = checkedTargetPin
+    && checkedTargetAuthorized
+    && checkedTargetVisible
+    && !suppressedPlayerIds.has(checkedTargetPin.id)
     ? checkedTargetPin
     : null;
   if (visibleCheckedPin) {
@@ -419,7 +511,7 @@ export default function MapScreen() {
     if (existingIndex >= 0) pins[existingIndex] = pin;
     else pins.push(pin);
   }
-  const purgeActive = game?.purgeActive ?? false;
+  const purgeActive = canSeeAllDuringPurge;
   const hiddenPowerUps = mapPowerUps.filter(mp => !mp.claimedBy && !mp.isVisible && !(mp as any).discovered);
 
   return (
