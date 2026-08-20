@@ -36,10 +36,18 @@ export function GameMap({ myLocation, pins, purgeActive = false, onMapPress, zon
           setHasError(true);
         }}
         onMessage={(event) => {
-          if (!onMapPress) return;
           try {
             const data = JSON.parse(event.nativeEvent.data);
-            if (typeof data.latitude === "number" && typeof data.longitude === "number") {
+            // WebView's own onError doesn't fire for a failed leaflet.js/
+            // leaflet.css subresource inside the generated HTML (only for
+            // the main document) -- game-map-html.ts's error reporter
+            // catches that itself and posts this message instead.
+            if (data?.type === "map_error") {
+              console.warn("[GameMap] map_error from WebView content:", data.source);
+              setHasError(true);
+              return;
+            }
+            if (onMapPress && typeof data.latitude === "number" && typeof data.longitude === "number") {
               onMapPress({ latitude: data.latitude, longitude: data.longitude });
             }
           } catch {

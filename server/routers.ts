@@ -40,7 +40,12 @@ async function runAchievementCheck(gamePlayerId: number, gameId: number) {
   try {
     await db.checkAndAwardAchievements(gamePlayerId, gameId);
   } catch (err) {
-    console.error("[Achievements] Auto-detect failed:", err);
+    // Logs only a fixed stage label plus the error's class name -- never
+    // error.message, which could carry SQL, parameter values, addresses,
+    // or other data this failure happened to be holding when it threw.
+    // Mirrors server/_core/context.ts's logAuthFailure.
+    const errorClass = err instanceof Error ? err.constructor.name : typeof err;
+    console.error(`[Achievements] Auto-detect failed; error class: ${errorClass}`);
   }
 }
 

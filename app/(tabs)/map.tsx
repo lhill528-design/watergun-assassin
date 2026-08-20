@@ -80,9 +80,14 @@ export default function MapScreen() {
     { gameId },
     { enabled: gameId > 0 && isAuthenticated }
   );
+  // player.list is the ongoing authority on visibility-safe location --
+  // refetching it periodically (and on window focus) is what lets the
+  // checked-pin reconciliation effect below notice a target's location
+  // has since changed or become hidden, instead of the checked pin just
+  // sitting there showing a stale coordinate indefinitely.
   const playersQuery = trpc.player.list.useQuery(
     { gameId },
-    { enabled: gameId > 0 && isAuthenticated }
+    { enabled: gameId > 0 && isAuthenticated, refetchInterval: 15000, refetchOnWindowFocus: true }
   );
   const playerMeQuery = trpc.player.me.useQuery(
     { gameId },
@@ -143,6 +148,10 @@ export default function MapScreen() {
       }
     },
     onError: (err) => {
+      // A failed re-check invalidates whatever was previously shown --
+      // e.g. the target just went behind Blackout/Dead Zone, or is no
+      // longer the viewer's target -- so the stale pin must not linger.
+      setCheckedTargetPin(null);
       setLocationCheckMessage({ kind: "error", text: err.message });
       if (Platform.OS !== "web") Alert.alert("Can't Check Location", err.message);
     },
@@ -244,6 +253,46 @@ export default function MapScreen() {
       }
     };
   }, [activeGameId, isAuthenticated, locationEnabled]);
+
+  // Clear any checked pin/message when the active game changes -- it
+  // belongs to a different game's target and must not carry over.
+  useEffect(() => {
+    setCheckedTargetPin(null);
+    setLocationCheckMessage(null);
+  }, [activeGameId]);
+
+  // player.list (refetched periodically and on window focus above) is the
+  // continuing authority on this pin, not the one-off checkLocation
+  // response it was seeded from. Every time fresh player data arrives,
+  // reconcile: if the checked player disappeared, the viewer is no longer
+  // authorized to see them (retargeted, purge ended), or the refreshed
+  // row has no location, drop the pin entirely; otherwise adopt whatever
+  // effective coordinate player.list now reports for them, so a Decoy or
+  // Doppelganger swap since the check replaces the old location instead
+  // of leaving it displayed.
+  useEffect(() => {
+    if (!checkedTargetPin) return;
+    const freshTarget = players.find(p => p.id === checkedTargetPin.id);
+    const isMyTarget = !!freshTarget && (freshTarget.id === myPlayer?.targetId || freshTarget.id === vendettaTarget?.id);
+    const stillAuthorized = isMyTarget || Boolean(game?.purgeActive);
+
+    if (!freshTarget || !stillAuthorized) {
+      setCheckedTargetPin(null);
+      return;
+    }
+
+    const lat = freshTarget.latitude ? parseFloat(freshTarget.latitude) : NaN;
+    const lon = freshTarget.longitude ? parseFloat(freshTarget.longitude) : NaN;
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+      setCheckedTargetPin(null);
+      return;
+    }
+
+    if (lat !== checkedTargetPin.latitude || lon !== checkedTargetPin.longitude) {
+      setCheckedTargetPin({ ...checkedTargetPin, latitude: lat, longitude: lon });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [players, myPlayer, vendettaTarget, game?.purgeActive, checkedTargetPin]);
 
   const distanceMeters = (a: { latitude: number; longitude: number }, b: { latitude: number; longitude: number }) => {
     const R = 6371000;
@@ -354,9 +403,19 @@ export default function MapScreen() {
   }
 
   const pins = buildPins();
-  if (checkedTargetPin) {
-    const existingIndex = pins.findIndex(p => p.id === checkedTargetPin.id);
-    const pin: PlayerPin = { id: checkedTargetPin.id, label: checkedTargetPin.label, latitude: checkedTargetPin.latitude, longitude: checkedTargetPin.longitude, type: "target" };
+  // Defense in depth alongside the reconciliation effect above: even
+  // between a players refresh landing and that effect's next run, never
+  // render (or focus) a checked pin the current player.list result
+  // doesn't back with a real, visible location.
+  const checkedTargetStillVisible = checkedTargetPin
+    ? players.find(p => p.id === checkedTargetPin.id)
+    : undefined;
+  const visibleCheckedPin = checkedTargetPin && checkedTargetStillVisible?.latitude && checkedTargetStillVisible?.longitude
+    ? checkedTargetPin
+    : null;
+  if (visibleCheckedPin) {
+    const existingIndex = pins.findIndex(p => p.id === visibleCheckedPin.id);
+    const pin: PlayerPin = { id: visibleCheckedPin.id, label: visibleCheckedPin.label, latitude: visibleCheckedPin.latitude, longitude: visibleCheckedPin.longitude, type: "target" };
     if (existingIndex >= 0) pins[existingIndex] = pin;
     else pins.push(pin);
   }
@@ -462,7 +521,7 @@ export default function MapScreen() {
             pins={pins}
             purgeActive={purgeActive}
             zones={safeZones}
-            focusLocation={checkedTargetPin ? { latitude: checkedTargetPin.latitude, longitude: checkedTargetPin.longitude } : null}
+            focusLocation={visibleCheckedPin ? { latitude: visibleCheckedPin.latitude, longitude: visibleCheckedPin.longitude } : null}
             onMapPress={guessModal.visible ? (coords: { latitude: number; longitude: number }) => {
               setGuessModal(g => ({ ...g, guessLat: coords.latitude.toFixed(6), guessLon: coords.longitude.toFixed(6) }));
               if (Platform.OS !== "web") Haptics.selectionAsync();

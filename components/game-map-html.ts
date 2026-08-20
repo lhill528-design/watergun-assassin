@@ -105,9 +105,20 @@ export function buildMapHtml(
     })
     .join("\n");
 
+  // WebView's own onError only fires for the *main document* request
+  // failing, not for subresources like leaflet.js/leaflet.css loaded
+  // from inside this HTML -- so a blocked/failed CDN script leaves L
+  // undefined and the map silently never renders, with nothing telling
+  // the native side anything went wrong. This reports it explicitly:
+  // window.onerror catches the resulting "L is not defined" (and any
+  // other uncaught init error), and each resource tag's own onerror
+  // attribute catches a load failure immediately, before any script
+  // even tries to run.
+  const errorReporterJs = `<script>window.__reportMapError=function(source){if(window.ReactNativeWebView){window.ReactNativeWebView.postMessage(JSON.stringify({type:'map_error',source:source}));}};window.onerror=function(){window.__reportMapError('window-onerror');return true;};</scr` + `ipt>`;
+
   // OSM's tile usage policy (https://operations.osmfoundation.org/policies/tiles/)
   // requires the single tile.openstreetmap.org host (no {s} subdomain
   // sharding) and a visible, linked attribution -- both required, not
   // optional, to keep using their tile server.
-  return `<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no"><link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/><script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></scr` + `ipt><style>*{margin:0;padding:0;box-sizing:border-box}html,body{width:100%;height:100%;background:#1a1a2e}#map{width:100%;height:100%}${purgeActive ? ".purge-banner{position:absolute;top:0;left:0;right:0;background:rgba(255,0,102,0.85);color:#fff;text-align:center;padding:8px;font-weight:bold;font-size:13px;z-index:1000}" : ""}</style></head><body>${purgeActive ? '<div class="purge-banner">⚠️ PURGE ACTIVE — ALL LOCATIONS VISIBLE</div>' : ""}<div id="map"></div><script>var map=L.map('map',{zoomControl:true,attributionControl:true}).setView([${lat},${lng}],${zoom});L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank">OpenStreetMap</a> contributors'}).addTo(map);${fitBoundsJs}${zonesJs}${selfMarker}${markersJs}${clickHandlerJs}</scr` + `ipt></body></html>`;
+  return `<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no">${errorReporterJs}<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" onerror="window.__reportMapError('leaflet-css')"/><script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" onerror="window.__reportMapError('leaflet-js')"></scr` + `ipt><style>*{margin:0;padding:0;box-sizing:border-box}html,body{width:100%;height:100%;background:#1a1a2e}#map{width:100%;height:100%}${purgeActive ? ".purge-banner{position:absolute;top:0;left:0;right:0;background:rgba(255,0,102,0.85);color:#fff;text-align:center;padding:8px;font-weight:bold;font-size:13px;z-index:1000}" : ""}</style></head><body>${purgeActive ? '<div class="purge-banner">⚠️ PURGE ACTIVE — ALL LOCATIONS VISIBLE</div>' : ""}<div id="map"></div><script>try{var map=L.map('map',{zoomControl:true,attributionControl:true}).setView([${lat},${lng}],${zoom});L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank">OpenStreetMap</a> contributors'}).addTo(map);${fitBoundsJs}${zonesJs}${selfMarker}${markersJs}${clickHandlerJs}}catch(e){window.__reportMapError('map-init');}</scr` + `ipt></body></html>`;
 }

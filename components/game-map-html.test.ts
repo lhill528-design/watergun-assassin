@@ -31,10 +31,11 @@ describe("game-map-html: buildMapHtml popup escaping", () => {
 
       // No unescaped markup or script-closing sequence from the payload
       // survives in the output; the only <script> closers present are the
-      // two the template itself owns (leaflet.js's tag, and the inline
-      // script block), regardless of what the label contains.
+      // three the template itself owns (the error-reporter block,
+      // leaflet.js's tag, and the main init script), regardless of what
+      // the label contains.
       expect(html).not.toMatch(/<img\s/i);
-      expect(html.match(/<\/script>/g)?.length).toBe(2);
+      expect(html.match(/<\/script>/g)?.length).toBe(3);
     });
 
     it("escapes a Sanctuary zone label into an inert, safely-embedded popup", () => {
@@ -48,7 +49,7 @@ describe("game-map-html: buildMapHtml popup escaping", () => {
 
       expect(html).toContain(`bindPopup(${JSON.stringify(expectedPopupHtml)})`);
       expect(html).not.toMatch(/<img\s/i);
-      expect(html.match(/<\/script>/g)?.length).toBe(2);
+      expect(html.match(/<\/script>/g)?.length).toBe(3);
     });
   });
 
@@ -115,6 +116,32 @@ describe("game-map-html: buildMapHtml centering", () => {
   it("ignores a non-finite focusLocation and falls back to the GPS center", () => {
     const html = buildMapHtml({ latitude: 1, longitude: 2 }, [], false, [], { latitude: NaN, longitude: 8 });
     expect(html).toContain("setView([1,2],14)");
+  });
+});
+
+describe("game-map-html: buildMapHtml Leaflet load-failure reporting", () => {
+  it("defines an error reporter before Leaflet loads, and wires window.onerror to it", () => {
+    const html = buildMapHtml(null, [], false, []);
+    const headStart = html.indexOf("<head>");
+    const reporterIndex = html.indexOf("window.__reportMapError=function");
+    const leafletScriptIndex = html.indexOf('src="https://unpkg.com/leaflet');
+
+    expect(reporterIndex).toBeGreaterThan(headStart);
+    expect(reporterIndex).toBeLessThan(leafletScriptIndex); // reporter must exist before Leaflet's tags can reference it
+    expect(html).toContain("window.onerror=function(){window.__reportMapError('window-onerror')");
+    expect(html).toContain("window.ReactNativeWebView.postMessage(JSON.stringify({type:'map_error'");
+  });
+
+  it("wires an onerror attribute on both the Leaflet script and stylesheet tags", () => {
+    const html = buildMapHtml(null, [], false, []);
+    expect(html).toContain(`<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" onerror="window.__reportMapError('leaflet-css')"/>`);
+    expect(html).toContain(`<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" onerror="window.__reportMapError('leaflet-js')">`);
+  });
+
+  it("wraps the main map-init script in try/catch, reporting 'map-init' on any init failure", () => {
+    const html = buildMapHtml(null, [], false, []);
+    expect(html).toMatch(/<script>try\{var map=L\.map/);
+    expect(html).toContain("}catch(e){window.__reportMapError('map-init');}");
   });
 });
 

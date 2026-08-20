@@ -50,6 +50,16 @@ describe("geocodeAddress", () => {
     expect(options.headers["User-Agent"]).toContain("WatergunAssassin");
   });
 
+  it("sends a Referer pointing at this app's real production site by default", async () => {
+    const geocodeAddress = await freshGeocodeAddress();
+    const fetchImpl = makeFetch({ ok: true, json: async () => nominatimResult() });
+
+    await geocodeAddress("123 Main St", 1, fetchImpl as any);
+
+    const options = fetchImpl.mock.calls[0][1] as { headers: Record<string, string> };
+    expect(options.headers["Referer"]).toBe("https://watergun-assassin.vercel.app/");
+  });
+
   it("returns a normalized display name plus validated coordinates", async () => {
     const geocodeAddress = await freshGeocodeAddress();
     const fetchImpl = makeFetch({ ok: true, json: async () => nominatimResult() });

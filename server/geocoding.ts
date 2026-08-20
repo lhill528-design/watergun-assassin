@@ -87,14 +87,13 @@ export async function geocodeAddress(
   url.searchParams.set("limit", "1"); // one result only, per policy
 
   const userAgent = `WatergunAssassin/1.0${ENV.geocodingContact ? ` (${ENV.geocodingContact})` : ""}`;
-  const referer = ENV.geocodingContact ? undefined : "https://watergun-assassin.app";
 
   let response: Response;
   try {
     response = await fetchImpl(url.toString(), {
       headers: {
         "User-Agent": userAgent,
-        ...(referer ? { Referer: referer } : {}),
+        Referer: ENV.geocodingReferer,
         Accept: "application/json",
       },
     });

@@ -28,4 +28,8 @@ export const ENV = {
   // User-Agent, as Nominatim's usage policy recommends so they can reach
   // out before blocking a misbehaving client instead of blocking silently.
   geocodingContact: process.env.GEOCODING_CONTACT ?? "",
+  // Referer sent with every outbound Nominatim request, per their usage
+  // policy. Defaults to this app's actual production site -- never point
+  // this at a domain the app doesn't control.
+  geocodingReferer: process.env.GEOCODING_REFERER || "https://watergun-assassin.vercel.app/",
 };
