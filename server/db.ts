@@ -896,6 +896,111 @@ export async function getActiveGamePowerUpsByName(gameId: number, name: string) 
     .map(item => ({ ...item, powerUp: catalogById[item.powerUpId] }));
 }
 
+export interface EffectiveLocation {
+  latitude: string | null;
+  longitude: string | null;
+}
+
+export interface EffectiveLocationsResult {
+  hiddenIds: Set<number>;
+  canSeeAll: boolean;
+  locationsByPlayerId: Map<number, EffectiveLocation>;
+  sanctuaryZonesByPlayerId: Map<number, { latitude: string; longitude: string; radiusMeters: number; approved: boolean }>;
+}
+
+// The single viewer-safe location pipeline. player.list and
+// player.checkLocation both call this so they can never disagree about
+// what a given viewer is allowed to see for a given target -- previously
+// player.list applied the full pipeline (Blackout, Dead Zone, Witness
+// Protection, Burner Phone, Doppelganger, Decoy) while checkLocation only
+// replicated the hidden-power-up gate and then read the target's raw
+// latitude/longitude off the row, bypassing Decoy substitution and
+// Doppelganger swaps entirely.
+export async function computeEffectiveLocations(
+  gameId: number,
+  players: Array<{ id: number; userId: number; latitude: string | null; longitude: string | null; targetId: number | null }>,
+  viewer: { id: number; targetId: number | null },
+  options: { purgeActive: boolean; showLocationsDuringPurge: boolean | null | undefined },
+): Promise<EffectiveLocationsResult> {
+  const blackout = (await getActiveGamePowerUpsByName(gameId, "Blackout")).length > 0;
+  const hiddenIds = new Set<number>();
+  if (blackout) for (const player of players) hiddenIds.add(player.id);
+  const radar = await getActivePowerUpByName(viewer.id, "Radar");
+  const vendetta = await getActivePowerUpByName(viewer.id, "Vendetta");
+  const vendettaTargetId = vendetta?.targetPlayerId ?? null;
+  const canSeeAll = Boolean(radar || (options.purgeActive && options.showLocationsDuringPurge));
+
+  for (const player of players) {
+    if (player.id === viewer.id) continue;
+    if (blackout) continue;
+    if (!canSeeAll && player.id !== viewer.targetId && player.id !== vendettaTargetId) {
+      hiddenIds.add(player.id);
+      continue;
+    }
+    const isDirectTarget = player.id === viewer.targetId || player.id === vendettaTargetId;
+    const hidden = await Promise.all([
+      getActivePowerUpByName(player.id, "Dead Zone"),
+      getActivePowerUpByName(player.id, "Witness Protection"),
+      radar && !isDirectTarget ? getActivePowerUpByName(player.id, "Burner Phone") : Promise.resolve(undefined),
+    ]);
+    if (hidden.some(Boolean)) hiddenIds.add(player.id);
+  }
+
+  const locationsByPlayerId = new Map<number, EffectiveLocation>();
+  for (const player of players) {
+    locationsByPlayerId.set(
+      player.id,
+      hiddenIds.has(player.id) ? { latitude: null, longitude: null } : { latitude: player.latitude, longitude: player.longitude },
+    );
+  }
+
+  const swaps = await getActiveGamePowerUpsByName(gameId, "Doppelganger");
+  swaps.sort((a, b) => (a.activatedAt?.getTime() || a.id) - (b.activatedAt?.getTime() || b.id));
+  for (const swap of swaps) {
+    if (!swap.targetPlayerId) continue;
+    const ownerLocation = locationsByPlayerId.get(swap.gamePlayerId);
+    const targetLocation = locationsByPlayerId.get(swap.targetPlayerId);
+    if (!ownerLocation || !targetLocation) continue;
+    locationsByPlayerId.set(swap.gamePlayerId, targetLocation);
+    locationsByPlayerId.set(swap.targetPlayerId, ownerLocation);
+  }
+
+  for (const player of players) {
+    if (player.id !== viewer.id && !hiddenIds.has(player.id)) {
+      const decoy = await getActivePowerUpByName(player.id, "Decoy");
+      const decoyData = decoy?.activationData as { decoyLatitude?: string; decoyLongitude?: string } | null | undefined;
+      if (decoyData?.decoyLatitude && decoyData?.decoyLongitude) {
+        locationsByPlayerId.set(player.id, { latitude: decoyData.decoyLatitude, longitude: decoyData.decoyLongitude });
+      }
+    }
+  }
+
+  const sanctuaryZonesByPlayerId = new Map<number, { latitude: string; longitude: string; radiusMeters: number; approved: boolean }>();
+  for (const player of players) {
+    const sanctuary = await getActivePowerUpByName(player.id, "Sanctuary");
+    const zoneData = sanctuary?.activationData as { zoneLatitude?: string; zoneLongitude?: string; zoneRadiusMeters?: number; approved?: boolean } | null | undefined;
+    if (!zoneData?.zoneLatitude || !zoneData?.zoneLongitude) continue;
+    const isSelf = player.id === viewer.id;
+    if (isSelf) {
+      sanctuaryZonesByPlayerId.set(player.id, {
+        latitude: zoneData.zoneLatitude,
+        longitude: zoneData.zoneLongitude,
+        radiusMeters: zoneData.zoneRadiusMeters || 30,
+        approved: Boolean(zoneData.approved),
+      });
+    } else if (zoneData.approved) {
+      sanctuaryZonesByPlayerId.set(player.id, {
+        latitude: zoneData.zoneLatitude,
+        longitude: zoneData.zoneLongitude,
+        radiusMeters: zoneData.zoneRadiusMeters || 30,
+        approved: true,
+      });
+    }
+  }
+
+  return { hiddenIds, canSeeAll, locationsByPlayerId, sanctuaryZonesByPlayerId };
+}
+
 export async function getGamePowerUpActivationsByName(gameId: number, name: string) {
   const database = await getDb();
   if (!database) return [];
@@ -1071,10 +1176,65 @@ export async function getGameAchievements(gameId: number) {
   return db.select().from(achievements).where(eq(achievements.gameId, gameId));
 }
 
-export async function awardAchievement(gamePlayerId: number, achievementId: number) {
+export interface AwardAchievementResult {
+  awarded: boolean;
+  pointsAdded: number;
+  newBalance: number;
+  achievementName: string;
+}
+
+// The one place player_achievements rows and points get written. Locking
+// the game-player row (SELECT ... FOR UPDATE) before checking for an
+// existing award serializes concurrent award attempts for the same
+// player -- there's no unique constraint on (gamePlayerId, achievementId)
+// to fall back on, so this lock IS the duplicate-award guard. The badge
+// insert, points increment, kill feed event, and notification all land in
+// the same transaction: either the whole award commits or none of it
+// does, so a badge can never exist without its points (or vice versa).
+export async function awardAchievementAtomic(gamePlayerId: number, achievementId: number, gameId: number): Promise<AwardAchievementResult> {
   const db = await getDb();
   if (!db) throw new Error("Database not available");
-  await db.insert(playerAchievements).values({ gamePlayerId, achievementId });
+  return db.transaction(async (tx) => {
+    const playerRows = await tx.select().from(gamePlayers).where(eq(gamePlayers.id, gamePlayerId)).for("update");
+    const player = playerRows[0];
+    if (!player) throw new Error("Player not found");
+    if (player.gameId !== gameId) throw new Error("Player not found in this game");
+
+    const achievementRows = await tx.select().from(achievements).where(eq(achievements.id, achievementId));
+    const achievement = achievementRows[0];
+    if (!achievement) throw new Error("Achievement not found");
+    if (achievement.gameId !== gameId) throw new Error("Achievement not found in this game");
+
+    const existing = await tx.select({ id: playerAchievements.id }).from(playerAchievements)
+      .where(and(eq(playerAchievements.gamePlayerId, gamePlayerId), eq(playerAchievements.achievementId, achievementId)));
+    if (existing.length > 0) {
+      return { awarded: false, pointsAdded: 0, newBalance: player.points || 0, achievementName: achievement.name };
+    }
+
+    await tx.insert(playerAchievements).values({ gamePlayerId, achievementId });
+
+    const pointsAdded = achievement.pointsValue || 0;
+    const newBalance = (player.points || 0) + pointsAdded;
+    if (pointsAdded > 0) {
+      await tx.update(gamePlayers).set({ points: newBalance }).where(eq(gamePlayers.id, gamePlayerId));
+    }
+
+    await tx.insert(killFeed).values({
+      gameId,
+      eventType: "achievement_earned",
+      actorId: gamePlayerId,
+      message: `${achievement.emoji || "🏅"} A player earned "${achievement.name}"! +${pointsAdded} pts`,
+    });
+    await tx.insert(notifications).values({
+      userId: player.userId,
+      gameId,
+      type: "achievement_earned",
+      title: `🏅 Achievement Unlocked!`,
+      body: `${achievement.emoji || "🏅"} ${achievement.name}: ${achievement.description || ""}`,
+    });
+
+    return { awarded: true, pointsAdded, newBalance, achievementName: achievement.name };
+  });
 }
 
 export async function getPlayerAchievements(gamePlayerId: number) {
@@ -1386,7 +1546,7 @@ export async function checkAndAwardAchievements(gamePlayerId: number, gameId: nu
   const db = await getDb();
   if (!db) return;
 
-  try {
+  {
     // Get player stats
     const playerRows = await db.select().from(gamePlayers).where(eq(gamePlayers.id, gamePlayerId)).limit(1);
     if (!playerRows.length) return;
@@ -1467,37 +1627,16 @@ export async function checkAndAwardAchievements(gamePlayerId: number, gameId: nu
         }
       }
 
+      // awardAchievementAtomic re-locks the player row and re-checks for
+      // a duplicate itself, so each award here re-reads the current
+      // balance rather than reusing the stale `player.points` this
+      // function started with -- when several achievements are earned by
+      // the same event, their point awards accumulate instead of each one
+      // overwriting the last.
       if (earned) {
-        try {
-          await db.insert(playerAchievements).values({ gamePlayerId, achievementId: achievement.id });
-          // Award points to player
-          if (achievement.pointsValue && achievement.pointsValue > 0) {
-            await db.update(gamePlayers)
-              .set({ points: (player.points || 0) + achievement.pointsValue })
-              .where(eq(gamePlayers.id, gamePlayerId));
-          }
-          // Create kill feed event
-          await db.insert(killFeed).values({
-            gameId,
-            eventType: "achievement_earned",
-            actorId: gamePlayerId,
-            message: `${achievement.emoji || "🏅"} ${player.userId ? "A player" : "Player"} earned "${achievement.name}"! +${achievement.pointsValue || 0} pts`,
-          });
-          // Notify player
-          await db.insert(notifications).values({
-            userId: player.userId,
-            gameId,
-            type: "achievement_earned",
-            title: `🏅 Achievement Unlocked!`,
-            body: `${achievement.emoji || "🏅"} ${achievement.name}: ${achievement.description || ""}`,
-          });
-        } catch (e) {
-          // Ignore duplicate key errors (already awarded race condition)
-        }
+        await awardAchievementAtomic(gamePlayerId, achievement.id, gameId);
       }
     }
-  } catch (e) {
-    console.error("[Achievements] Auto-detect error:", e);
   }
 }
 

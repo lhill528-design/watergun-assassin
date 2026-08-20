@@ -6,7 +6,7 @@ import { trpc } from "@/lib/trpc";
 import { useAuth } from "@/hooks/use-auth";
 import { requestConfirmedAction } from "@/lib/confirm-then-run";
 import { useRef, useState } from "react";
-import * as Location from "expo-location";
+import { searchAddress, GEOCODING_ATTRIBUTION } from "@/lib/geocoding";
 
 const CATEGORIES = [
   { key: "all", label: "All" },
@@ -98,7 +98,13 @@ export default function ShopScreen() {
   );
   const purchaseMutation = trpc.powerUp.purchase.useMutation({
     onSuccess: (data) => {
+      // A purchase can immediately trigger an achievement (and its points)
+      // server-side, so the player's own balance/badge views need to be
+      // invalidated alongside the inventory, not just powerUp.inventory.
       utils.player.me.invalidate({ gameId: activeGameId! });
+      utils.player.list.invalidate({ gameId: activeGameId! });
+      utils.game.leaderboard.invalidate({ gameId: activeGameId! });
+      utils.achievement.playerList.invalidate({ gameId: activeGameId! });
       utils.powerUp.inventory.invalidate({ gameId: activeGameId! });
       setPurchaseMessage({ kind: "success", text: `Purchased for ${data.cost} pts. It's in your inventory -- activate it when ready.` });
     },
@@ -120,6 +126,9 @@ export default function ShopScreen() {
       utils.player.me.invalidate({ gameId: activeGameId! });
       utils.player.list.invalidate({ gameId: activeGameId! });
       utils.player.reconTarget.invalidate({ gameId: activeGameId! });
+      // Activation can also immediately trigger an achievement server-side.
+      utils.game.leaderboard.invalidate({ gameId: activeGameId! });
+      utils.achievement.playerList.invalidate({ gameId: activeGameId! });
       setActivationMessage({ kind: "success", text: "Activated! Any cash fee was added to the admin's collection queue." });
     },
     onError: (err) => {
@@ -194,15 +203,10 @@ export default function ShopScreen() {
       if (address) {
         setGeocodingSanctuary(item.id);
         try {
-          const results = await Location.geocodeAsync(address);
-          if (!results.length) {
-            setItemError(item.id, "Couldn't find that address. Try being more specific, or leave it blank to use your current location.");
-            setActivating(false);
-            return;
-          }
-          sanctuaryCoords = { zoneLatitude: results[0].latitude.toFixed(6), zoneLongitude: results[0].longitude.toFixed(6) };
-        } catch {
-          setItemError(item.id, "Couldn't look up that address right now.");
+          const { latitude, longitude } = await searchAddress(utils, address);
+          sanctuaryCoords = { zoneLatitude: latitude.toFixed(6), zoneLongitude: longitude.toFixed(6) };
+        } catch (err) {
+          setItemError(item.id, err instanceof Error ? err.message : "Couldn't look up that address right now.");
           setActivating(false);
           return;
         } finally {
@@ -217,10 +221,13 @@ export default function ShopScreen() {
         const address = decoyAddresses[item.id]?.trim();
         if (!address) { setItemError(item.id, "Manual Decoy needs the address where you will be."); setActivating(false); return; }
         try {
-          const results = await Location.geocodeAsync(address);
-          if (!results.length) { setItemError(item.id, "Address not found. Try a more specific address."); setActivating(false); return; }
-          decoyData = { mode, address, anchorLatitude: results[0].latitude, anchorLongitude: results[0].longitude };
-        } catch { setItemError(item.id, "Couldn't locate that address."); setActivating(false); return; }
+          const { latitude, longitude } = await searchAddress(utils, address);
+          decoyData = { mode, address, anchorLatitude: latitude, anchorLongitude: longitude };
+        } catch (err) {
+          setItemError(item.id, err instanceof Error ? err.message : "Couldn't locate that address.");
+          setActivating(false);
+          return;
+        }
       } else decoyData = { mode };
     }
     const activationData = {
@@ -396,7 +403,7 @@ export default function ShopScreen() {
                   <ScrollView horizontal showsHorizontalScrollIndicator={false} className="mt-3"><View className="flex-row gap-2">{inventory.filter((stake: any) => stake.id !== item.id && stake.status === "inventory" && !stake.lockedForDuelId).map((stake: any) => <TouchableOpacity key={stake.id} className={`px-3 py-2 rounded-lg ${selectedGifts[item.id] === stake.id ? "bg-primary" : "bg-background border border-border"}`} onPress={() => setSelectedGifts(current => ({ ...current, [item.id]: stake.id }))}><Text className={selectedGifts[item.id] === stake.id ? "text-background font-bold" : "text-foreground"}>Stake: {stake.powerUp?.name} ({stake.powerUp?.cost || 0})</Text></TouchableOpacity>)}</View></ScrollView>
                 )}
                 {item.powerUp?.name === "Decoy" && item.status !== "active" && (
-                  <View className="mt-3"><View className="flex-row gap-2 mb-2"><TouchableOpacity className={`px-3 py-2 rounded-lg ${(decoyModes[item.id] || "automatic") === "automatic" ? "bg-primary" : "bg-background border border-border"}`} onPress={() => setDecoyModes(current => ({ ...current, [item.id]: "automatic" }))}><Text className="text-foreground">Automatic (current GPS)</Text></TouchableOpacity><TouchableOpacity className={`px-3 py-2 rounded-lg ${decoyModes[item.id] === "manual" ? "bg-primary" : "bg-background border border-border"}`} onPress={() => setDecoyModes(current => ({ ...current, [item.id]: "manual" }))}><Text className="text-foreground">Manual address</Text></TouchableOpacity></View>{decoyModes[item.id] === "manual" && <TextInput className="bg-background border border-border rounded-lg px-3 py-2 text-foreground" placeholder="Address where you will be" placeholderTextColor="#8B8B9E" value={decoyAddresses[item.id] || ""} onChangeText={value => setDecoyAddresses(current => ({ ...current, [item.id]: value }))}/>}<Text className="text-muted text-xs mt-1">The displayed decoy is placed exactly five miles from the anchor.</Text></View>
+                  <View className="mt-3"><View className="flex-row gap-2 mb-2"><TouchableOpacity className={`px-3 py-2 rounded-lg ${(decoyModes[item.id] || "automatic") === "automatic" ? "bg-primary" : "bg-background border border-border"}`} onPress={() => setDecoyModes(current => ({ ...current, [item.id]: "automatic" }))}><Text className="text-foreground">Automatic (current GPS)</Text></TouchableOpacity><TouchableOpacity className={`px-3 py-2 rounded-lg ${decoyModes[item.id] === "manual" ? "bg-primary" : "bg-background border border-border"}`} onPress={() => setDecoyModes(current => ({ ...current, [item.id]: "manual" }))}><Text className="text-foreground">Manual address</Text></TouchableOpacity></View>{decoyModes[item.id] === "manual" && <><TextInput className="bg-background border border-border rounded-lg px-3 py-2 text-foreground" placeholder="Address where you will be" placeholderTextColor="#8B8B9E" value={decoyAddresses[item.id] || ""} onChangeText={value => setDecoyAddresses(current => ({ ...current, [item.id]: value }))}/><Text className="text-muted text-xs mt-1">{GEOCODING_ATTRIBUTION}</Text></>}<Text className="text-muted text-xs mt-1">The displayed decoy is placed exactly five miles from the anchor.</Text></View>
                 )}
                 {item.powerUp?.name === "Monkey Wrench" && item.status !== "active" && (
                   <TextInput
@@ -417,6 +424,7 @@ export default function ShopScreen() {
                       value={sanctuaryAddresses[item.id] || ""}
                       onChangeText={value => setSanctuaryAddresses(current => ({ ...current, [item.id]: value }))}
                     />
+                    <Text className="text-muted text-xs mt-1">{GEOCODING_ATTRIBUTION}</Text>
                   </View>
                 )}
               </View>

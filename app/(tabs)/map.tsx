@@ -15,8 +15,8 @@ import {
   stopBackgroundLocationTracking,
 } from "@/lib/location-service";
 import type { LocationSubscription } from "expo-location";
-import * as Location from "expo-location";
 import * as Haptics from "expo-haptics";
+import { searchAddress, GEOCODING_ATTRIBUTION } from "@/lib/geocoding";
 
 interface PlayerPin {
   id: number;
@@ -48,20 +48,27 @@ export default function MapScreen() {
   });
   const [addressQuery, setAddressQuery] = useState("");
   const [geocoding, setGeocoding] = useState(false);
+  // The most recently checked target's effective (visibility-safe)
+  // coordinate -- upserted by player id so re-checking the same player
+  // updates the pin in place instead of adding a duplicate, and used to
+  // focus the map on it.
+  const [checkedTargetPin, setCheckedTargetPin] = useState<{ id: number; label: string; latitude: number; longitude: number } | null>(null);
+  const [locationCheckMessage, setLocationCheckMessage] = useState<{ kind: "success" | "error"; text: string } | null>(null);
+
+  const utils = trpc.useUtils();
+  const [addressError, setAddressError] = useState<string | null>(null);
 
   const handleGeocodeAddress = async () => {
     if (!addressQuery.trim()) return;
+    setAddressError(null);
     setGeocoding(true);
     try {
-      const results = await Location.geocodeAsync(addressQuery.trim());
-      if (!results.length) {
-        Alert.alert("Not found", "Couldn't find that address. Try being more specific.");
-        return;
-      }
-      const { latitude, longitude } = results[0];
+      const { latitude, longitude } = await searchAddress(utils, addressQuery.trim());
       setGuessModal(g => ({ ...g, guessLat: latitude.toFixed(6), guessLon: longitude.toFixed(6) }));
-    } catch {
-      Alert.alert("Search failed", "Couldn't look up that address right now.");
+    } catch (err) {
+      // Inline, not Alert.alert -- unreliable on web, which is exactly
+      // where address search is needed most (no native geocoding there).
+      setAddressError(err instanceof Error ? err.message : "Couldn't look up that address right now.");
     } finally {
       setGeocoding(false);
     }
@@ -120,9 +127,25 @@ export default function MapScreen() {
   const checkLocationMutation = trpc.player.checkLocation.useMutation({
     onSuccess: (data, variables) => {
       const name = resolvePlayerLabelById(variables.targetPlayerId);
-      Alert.alert(`📍 ${name}`, `Location: ${parseFloat(data.latitude).toFixed(5)}, ${parseFloat(data.longitude).toFixed(5)}\n\nAlso shown as a pin on the map above.`);
+      const latitude = parseFloat(data.latitude);
+      const longitude = parseFloat(data.longitude);
+      if (Number.isFinite(latitude) && Number.isFinite(longitude)) {
+        // Upserted by id in buildPins()'s merge below -- a repeat check
+        // moves the existing pin, it never adds a duplicate.
+        setCheckedTargetPin({ id: variables.targetPlayerId, label: name, latitude, longitude });
+      }
+      setLocationCheckMessage({ kind: "success", text: `📍 ${name}: ${latitude.toFixed(5)}, ${longitude.toFixed(5)} — now focused on the map above.` });
+      // Supplemental only on native, where Alert.alert's callbacks are
+      // reliable -- the inline message above is what actually drives the
+      // UI on every platform, including web.
+      if (Platform.OS !== "web") {
+        Alert.alert(`📍 ${name}`, `Location: ${latitude.toFixed(5)}, ${longitude.toFixed(5)}`);
+      }
     },
-    onError: (err) => Alert.alert("Can't Check Location", err.message),
+    onError: (err) => {
+      setLocationCheckMessage({ kind: "error", text: err.message });
+      if (Platform.OS !== "web") Alert.alert("Can't Check Location", err.message);
+    },
   });
   const claimMutation = trpc.mapPowerUp.claim.useMutation({
     onSuccess: () => {
@@ -331,6 +354,12 @@ export default function MapScreen() {
   }
 
   const pins = buildPins();
+  if (checkedTargetPin) {
+    const existingIndex = pins.findIndex(p => p.id === checkedTargetPin.id);
+    const pin: PlayerPin = { id: checkedTargetPin.id, label: checkedTargetPin.label, latitude: checkedTargetPin.latitude, longitude: checkedTargetPin.longitude, type: "target" };
+    if (existingIndex >= 0) pins[existingIndex] = pin;
+    else pins.push(pin);
+  }
   const purgeActive = game?.purgeActive ?? false;
   const hiddenPowerUps = mapPowerUps.filter(mp => !mp.claimedBy && !mp.isVisible && !(mp as any).discovered);
 
@@ -433,6 +462,7 @@ export default function MapScreen() {
             pins={pins}
             purgeActive={purgeActive}
             zones={safeZones}
+            focusLocation={checkedTargetPin ? { latitude: checkedTargetPin.latitude, longitude: checkedTargetPin.longitude } : null}
             onMapPress={guessModal.visible ? (coords: { latitude: number; longitude: number }) => {
               setGuessModal(g => ({ ...g, guessLat: coords.latitude.toFixed(6), guessLon: coords.longitude.toFixed(6) }));
               if (Platform.OS !== "web") Haptics.selectionAsync();
@@ -442,6 +472,21 @@ export default function MapScreen() {
             <Text style={styles.mapTapHint}>📍 Tap the map above to set your guess location</Text>
           )}
         </View>
+
+        {/* Check Location result -- inline so it's visible on web, where
+            Alert.alert is unreliable. */}
+        {locationCheckMessage && (
+          <View
+            style={[
+              styles.checkLocationMessage,
+              { borderColor: locationCheckMessage.kind === "success" ? "#00FF88" : "#FF3333" },
+            ]}
+          >
+            <Text style={[styles.checkLocationMessageText, { color: locationCheckMessage.kind === "success" ? "#00FF88" : "#FF3333" }]}>
+              {locationCheckMessage.text}
+            </Text>
+          </View>
+        )}
 
         {/* Visible Power-Ups on the map */}
         {visibleUnclaimedPowerUps.length > 0 && (
@@ -580,6 +625,8 @@ export default function MapScreen() {
                     {geocoding ? <ActivityIndicator color="#000" size="small" /> : <Text style={styles.modalSubmitText}>Find</Text>}
                   </TouchableOpacity>
                 </View>
+                {addressError && <Text style={styles.addressErrorText}>{addressError}</Text>}
+                <Text style={styles.attributionText}>{GEOCODING_ATTRIBUTION}</Text>
                 <Text style={styles.modalLabel}>Latitude</Text>
                 <TextInput
                   style={styles.modalInput}
@@ -693,7 +740,14 @@ const styles = StyleSheet.create({
   guessBtnText: { color: "#fff", fontSize: 12, fontWeight: "700" },
   mapContainer: { marginHorizontal: 16, marginBottom: 12, borderRadius: 16, overflow: "hidden", minHeight: 320 },
   mapTapHint: { textAlign: "center", color: "#FF1493", fontSize: 12, fontWeight: "600", marginHorizontal: 16, marginTop: -8, marginBottom: 12 },
+  checkLocationMessage: {
+    marginHorizontal: 16, marginBottom: 12, borderRadius: 12, borderWidth: 1,
+    padding: 12, backgroundColor: "#1a1a1a",
+  },
+  checkLocationMessageText: { fontSize: 13, fontWeight: "600", textAlign: "center" },
   addressSearchBtn: { backgroundColor: "#FF1493", borderRadius: 10, paddingHorizontal: 18, justifyContent: "center", alignItems: "center" },
+  addressErrorText: { color: "#FF3333", fontSize: 12, marginTop: 6 },
+  attributionText: { color: "#666", fontSize: 10, marginTop: 6 },
   cluesSection: { marginHorizontal: 16, marginBottom: 12 },
   cluesSectionTitle: { fontSize: 15, fontWeight: "700", color: "#fff", marginBottom: 8 },
   clueCard: {

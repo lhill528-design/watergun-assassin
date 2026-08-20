@@ -58,6 +58,66 @@ describe("game-map-html: buildMapHtml popup escaping", () => {
   });
 });
 
+describe("game-map-html: buildMapHtml centering", () => {
+  it("filters out pins with non-finite coordinates before drawing or fitting bounds", () => {
+    const html = buildMapHtml(
+      null,
+      [
+        { id: 1, label: "Valid", latitude: 10, longitude: 20, type: "player" },
+        { id: 2, label: "NaN lat", latitude: NaN, longitude: 20, type: "player" },
+        { id: 3, label: "Infinite lon", latitude: 10, longitude: Infinity, type: "player" },
+      ],
+      false,
+      [],
+    );
+    expect(html).toContain("L.marker([10, 20]");
+    expect(html).not.toContain("NaN lat");
+    expect(html).not.toContain("Infinite lon");
+  });
+
+  it("fits the map to valid pin bounds when there is no GPS center and no focus", () => {
+    const html = buildMapHtml(
+      null,
+      [
+        { id: 1, label: "A", latitude: 10, longitude: 20, type: "player" },
+        { id: 2, label: "B", latitude: 30, longitude: 40, type: "player" },
+      ],
+      false,
+      [],
+    );
+    expect(html).toContain("map.fitBounds(L.latLngBounds([[10,20],[30,40]])");
+  });
+
+  it("does not fit bounds when a GPS center is available, even with pins present", () => {
+    const html = buildMapHtml(
+      { latitude: 1, longitude: 2 },
+      [{ id: 1, label: "A", latitude: 10, longitude: 20, type: "player" }],
+      false,
+      [],
+    );
+    expect(html).not.toContain("fitBounds");
+    expect(html).toContain("setView([1,2],14)");
+  });
+
+  it("focusLocation takes priority over the GPS center for the initial view", () => {
+    const html = buildMapHtml(
+      { latitude: 1, longitude: 2 },
+      [],
+      false,
+      [],
+      { latitude: 9, longitude: 8 },
+    );
+    expect(html).toContain("setView([9,8],15)");
+    // The "You" marker still reflects the real GPS center, not the focus.
+    expect(html).toContain("L.marker([1, 2]");
+  });
+
+  it("ignores a non-finite focusLocation and falls back to the GPS center", () => {
+    const html = buildMapHtml({ latitude: 1, longitude: 2 }, [], false, [], { latitude: NaN, longitude: 8 });
+    expect(html).toContain("setView([1,2],14)");
+  });
+});
+
 describe("escapeHtml", () => {
   it("escapes every HTML metacharacter, not just quotes", () => {
     expect(escapeHtml(`<img src=x onerror="alert('x')">&co`)).toBe(

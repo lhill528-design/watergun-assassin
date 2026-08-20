@@ -13,6 +13,7 @@ import { ScreenContainer } from "@/components/screen-container";
 import { useRouter } from "expo-router";
 import { trpc } from "@/lib/trpc";
 import { useGame } from "@/lib/game-context";
+import { searchAddress, GEOCODING_ATTRIBUTION } from "@/lib/geocoding";
 import * as Location from "expo-location";
 
 interface MapPowerUpForm {
@@ -112,15 +113,10 @@ export default function AdminMapPowerUpsScreen() {
     setFormError(null);
     setSearchingAddress(true);
     try {
-      const results = await Location.geocodeAsync(addressSearch.trim());
-      if (!results.length) {
-        setFormError("Couldn't find that address. Try being more specific.");
-        return;
-      }
-      const { latitude, longitude } = results[0];
+      const { latitude, longitude } = await searchAddress(utils, addressSearch.trim());
       setForm((f) => ({ ...f, latitude: latitude.toFixed(6), longitude: longitude.toFixed(6), address: addressSearch.trim() }));
-    } catch {
-      setFormError("Couldn't look up that address right now.");
+    } catch (err) {
+      setFormError(err instanceof Error ? err.message : "Couldn't look up that address right now.");
     } finally {
       setSearchingAddress(false);
     }
@@ -308,6 +304,7 @@ export default function AdminMapPowerUpsScreen() {
                 {searchingAddress ? <ActivityIndicator color="#000" size="small" /> : <Text style={styles.submitBtnText}>Find</Text>}
               </TouchableOpacity>
             </View>
+            <Text style={styles.attributionText}>{GEOCODING_ATTRIBUTION}</Text>
             <TouchableOpacity
               style={styles.locationBtn}
               onPress={handleUseCurrentLocation}
@@ -417,6 +414,7 @@ export default function AdminMapPowerUpsScreen() {
 }
 
 const styles = StyleSheet.create({
+  attributionText: { color: "#666", fontSize: 10, marginBottom: 10 },
   container: { flex: 1, backgroundColor: "#0a0a0a" },
   header: { padding: 20, paddingTop: 16 },
   backBtn: { marginBottom: 12 },

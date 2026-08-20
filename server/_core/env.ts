@@ -18,4 +18,14 @@ export const ENV = {
   cloudinaryCloudName: process.env.CLOUDINARY_CLOUD_NAME ?? "",
   cloudinaryApiKey: process.env.CLOUDINARY_API_KEY ?? "",
   cloudinaryApiSecret: process.env.CLOUDINARY_API_SECRET ?? "",
+  // Address search backend. Defaults to the public OpenStreetMap Nominatim
+  // instance -- see server/geocoding.ts for the usage-policy constraints
+  // (throttling, caching, User-Agent) this app follows against it. Only
+  // worth overriding if this deployment switches to a different/paid
+  // geocoding provider later.
+  geocodingBaseUrl: process.env.GEOCODING_BASE_URL || "https://nominatim.openstreetmap.org",
+  // Optional contact string (e.g. an email) appended to the outbound
+  // User-Agent, as Nominatim's usage policy recommends so they can reach
+  // out before blocking a misbehaving client instead of blocking silently.
+  geocodingContact: process.env.GEOCODING_CONTACT ?? "",
 };

@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
-import { View, Text, StyleSheet } from "react-native";
+import { View, Text, StyleSheet, TouchableOpacity } from "react-native";
 
 interface PlayerPin {
   id: number;
@@ -22,6 +22,15 @@ interface GameMapProps {
   purgeActive?: boolean;
   onMapPress?: (coords: { latitude: number; longitude: number }) => void;
   zones?: SafeZone[];
+  // A coordinate to pan/zoom to on demand (e.g. a just-checked target),
+  // distinct from the one-time initial centering below. Passing a new
+  // {latitude, longitude} value re-focuses the map; the same values
+  // passed again are a no-op.
+  focusLocation?: { latitude: number; longitude: number } | null;
+}
+
+function isFiniteCoordinate(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
 }
 
 const PIN_COLORS: Record<PlayerPin["type"], string> = {
@@ -113,20 +122,27 @@ function pinDivIcon(L: any, color: string, emoji: string, size: number) {
 // Leaflet/OpenStreetMap combo via a WebView -- see game-map.native.tsx).
 // Tapping the map reports coords through onMapPress, same as native, so the
 // map-power-up location-guess flow works identically on both platforms.
-export function GameMap({ myLocation, pins, purgeActive = false, onMapPress, zones = [] }: GameMapProps) {
+export function GameMap({ myLocation, pins, purgeActive = false, onMapPress, zones = [], focusLocation }: GameMapProps) {
   const containerRef = useRef<View>(null);
   const mapRef = useRef<any>(null);
   const markersLayerRef = useRef<any>(null);
   const zonesLayerRef = useRef<any>(null);
   const hasCenteredRef = useRef(false);
+  const lastFocusKeyRef = useRef<string | null>(null);
   const onMapPressRef = useRef(onMapPress);
   onMapPressRef.current = onMapPress;
 
   const [status, setStatus] = useState<"loading" | "ready" | "error">("loading");
+  // Bumping this re-runs the mount/load effect below -- the retry action
+  // for when the Leaflet script failed to load the first time.
+  const [retryCount, setRetryCount] = useState(0);
 
-  // Create the map once on mount.
+  const validPins = pins.filter((pin) => isFiniteCoordinate(pin.latitude) && isFiniteCoordinate(pin.longitude));
+
+  // Create the map once per mount/retry.
   useEffect(() => {
     let cancelled = false;
+    setStatus("loading");
 
     loadLeaflet()
       .then((L) => {
@@ -167,9 +183,10 @@ export function GameMap({ myLocation, pins, purgeActive = false, onMapPress, zon
       mapRef.current?.remove();
       mapRef.current = null;
     };
-    // Map is created once; prop-driven updates happen in the effects below.
+    // Map is created once per mount, or again when retryCount changes (the
+    // Retry button); prop-driven updates happen in the effects below.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [retryCount]);
 
   // Redraw markers/zones whenever the underlying data changes.
   useEffect(() => {
@@ -202,22 +219,49 @@ export function GameMap({ myLocation, pins, purgeActive = false, onMapPress, zon
         .bindPopup("<b>You</b>");
     }
 
-    pins.forEach((pin) => {
+    validPins.forEach((pin) => {
       const color = PIN_COLORS[pin.type] ?? "#FFFFFF";
       const emoji = PIN_EMOJIS[pin.type] ?? "📍";
       L.marker([pin.latitude, pin.longitude], { icon: pinDivIcon(L, color, emoji, 32) })
         .addTo(markersLayer)
         .bindPopup(`<b>${escapeHtml(pin.label)}</b>`);
     });
-  }, [status, pins, zones, myLocation]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [status, validPins, zones, myLocation]);
 
-  // Center on the player's location the first time it becomes available;
-  // don't fight the user's pan/zoom on every GPS update after that.
+  // Center once, the first time we have something to center on: the
+  // player's own GPS location if available, otherwise the bounds of
+  // whatever valid pins already exist (instead of the San Francisco
+  // default) -- e.g. on web, where there's usually no device GPS at all.
+  // Doesn't fight the user's pan/zoom after that first center.
   useEffect(() => {
-    if (status !== "ready" || !mapRef.current || !myLocation || hasCenteredRef.current) return;
-    mapRef.current.setView([myLocation.latitude, myLocation.longitude], 14);
+    if (status !== "ready" || !mapRef.current || hasCenteredRef.current) return;
+    if (myLocation) {
+      mapRef.current.setView([myLocation.latitude, myLocation.longitude], 14);
+      hasCenteredRef.current = true;
+      return;
+    }
+    if (validPins.length === 0) return;
+    const L = (window as any).L;
+    if (!L) return;
+    const bounds = L.latLngBounds(validPins.map((pin) => [pin.latitude, pin.longitude]));
+    mapRef.current.fitBounds(bounds, { padding: [40, 40], maxZoom: 14 });
     hasCenteredRef.current = true;
-  }, [status, myLocation]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [status, myLocation, validPins]);
+
+  // Pan/zoom to an explicitly focused location (e.g. a just-checked
+  // target) on demand -- distinct from the one-time initial centering
+  // above, and a no-op if the same coordinate is focused again.
+  useEffect(() => {
+    if (status !== "ready" || !mapRef.current || !focusLocation) return;
+    if (!isFiniteCoordinate(focusLocation.latitude) || !isFiniteCoordinate(focusLocation.longitude)) return;
+    const key = `${focusLocation.latitude},${focusLocation.longitude}`;
+    if (lastFocusKeyRef.current === key) return;
+    lastFocusKeyRef.current = key;
+    hasCenteredRef.current = true;
+    mapRef.current.setView([focusLocation.latitude, focusLocation.longitude], 15);
+  }, [status, focusLocation]);
 
   return (
     <View style={styles.container}>
@@ -229,10 +273,19 @@ export function GameMap({ myLocation, pins, purgeActive = false, onMapPress, zon
       <View style={styles.mapWrapper}>
         <View ref={containerRef} style={styles.mapView} />
         {status !== "ready" && (
-          <View style={styles.overlay} pointerEvents="none">
+          <View style={styles.overlay} pointerEvents={status === "error" ? "auto" : "none"}>
             <Text style={styles.overlayText}>
               {status === "loading" ? "Loading map…" : "Map unavailable — check your connection"}
             </Text>
+            {status === "error" && (
+              <TouchableOpacity
+                style={styles.retryButton}
+                onPress={() => setRetryCount((count) => count + 1)}
+                accessibilityRole="button"
+              >
+                <Text style={styles.retryButtonText}>Retry</Text>
+              </TouchableOpacity>
+            )}
           </View>
         )}
       </View>
@@ -253,4 +306,8 @@ const styles = StyleSheet.create({
     alignItems: "center", justifyContent: "center", backgroundColor: "#1a1a2e",
   },
   overlayText: { color: "#888", fontSize: 13, fontWeight: "600" },
+  retryButton: {
+    marginTop: 12, backgroundColor: "#FF1493", paddingHorizontal: 20, paddingVertical: 10, borderRadius: 20,
+  },
+  retryButtonText: { color: "#FFF", fontWeight: "bold", fontSize: 13 },
 });

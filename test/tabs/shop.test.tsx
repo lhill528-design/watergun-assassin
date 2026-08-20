@@ -71,6 +71,8 @@ const trpcState = vi.hoisted(() => ({
     inventory: vi.fn(),
     playerList: vi.fn(),
     reconTarget: vi.fn(),
+    leaderboard: vi.fn(),
+    achievementPlayerList: vi.fn(),
   },
 }));
 
@@ -105,6 +107,12 @@ vi.mock("@/lib/trpc", () => ({
       },
       powerUp: {
         inventory: { invalidate: trpcState.invalidate.inventory },
+      },
+      game: {
+        leaderboard: { invalidate: trpcState.invalidate.leaderboard },
+      },
+      achievement: {
+        playerList: { invalidate: trpcState.invalidate.achievementPlayerList },
       },
     }),
   },
@@ -178,6 +186,11 @@ describe("ShopScreen: purchase flow", () => {
 
     expect(trpcState.invalidate.playerMe).toHaveBeenCalledTimes(1);
     expect(trpcState.invalidate.inventory).toHaveBeenCalledTimes(1);
+    // A purchase can immediately trigger an achievement server-side, so
+    // the balance/badge-adjacent views need invalidating too.
+    expect(trpcState.invalidate.playerList).toHaveBeenCalledTimes(1);
+    expect(trpcState.invalidate.leaderboard).toHaveBeenCalledTimes(1);
+    expect(trpcState.invalidate.achievementPlayerList).toHaveBeenCalledTimes(1);
     expect(screen.getByText(/Purchased for 200 pts/)).toBeTruthy();
     confirmSpy.mockRestore();
   });
@@ -260,6 +273,9 @@ describe("ShopScreen: activation flow", () => {
     expect(trpcState.invalidate.playerMe).toHaveBeenCalledTimes(1);
     expect(trpcState.invalidate.playerList).toHaveBeenCalledTimes(1);
     expect(trpcState.invalidate.reconTarget).toHaveBeenCalledTimes(1);
+    // Activation can also immediately trigger an achievement server-side.
+    expect(trpcState.invalidate.leaderboard).toHaveBeenCalledTimes(1);
+    expect(trpcState.invalidate.achievementPlayerList).toHaveBeenCalledTimes(1);
     expect(screen.getByText(/Activated!/)).toBeTruthy();
     confirmSpy.mockRestore();
   });

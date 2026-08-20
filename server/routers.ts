@@ -4,6 +4,7 @@ import { systemRouter } from "./_core/systemRouter";
 import { publicProcedure, protectedProcedure, router } from "./_core/trpc";
 import * as db from "./db";
 import { getCloudinaryUploadSignature, isValidEliminationVideoUrl } from "./storage";
+import { geocodeAddress } from "./geocoding";
 import { sendPushToUser, sendPushToUsers, registerPushToken } from "./push-service";
 import { MAP_CLAIM_METERS, MAP_DISCOVERY_METERS, ROULETTE_SPIN_COST, calculateKillAwards, derangedTargetPermutation, distanceMeters, isOpenSeasonSubmissionEligible, openSeasonWindow, pointFiveMilesAway, rouletteBalanceAfterOutcome } from "./power-up-rules";
 import { STANDARD_RULES, type StandardRulesGameType } from "./standard-rules";
@@ -29,6 +30,20 @@ function checkUploadSignatureRateLimit(userId: number) {
   uploadSignatureRequests.set(userId, recent);
 }
 
+// checkAndAwardAchievements is a best-effort side effect of the primary
+// action (placing a bounty, purchasing a power-up, etc.) -- a failure in
+// it shouldn't fail an already-successful primary mutation, but it must
+// not vanish without a trace either, which is what the old code's bare
+// `catch { /* ignore */ }` did for every error, not just duplicate-award
+// races (those no longer throw at all -- see awardAchievementAtomic).
+async function runAchievementCheck(gamePlayerId: number, gameId: number) {
+  try {
+    await db.checkAndAwardAchievements(gamePlayerId, gameId);
+  } catch (err) {
+    console.error("[Achievements] Auto-detect failed:", err);
+  }
+}
+
 async function addProtectionBadges<T extends { id: number }>(players: T[]) {
   return Promise.all(players.map(async player => {
     const inventory = await db.getPlayerPowerUps(player.id);
@@ -46,6 +61,14 @@ async function addProtectionBadges<T extends { id: number }>(players: T[]) {
 
 export const appRouter = router({
   system: systemRouter,
+  geocoding: router({
+    // User-triggered address search only -- callers must never wire this
+    // to onChangeText/autocomplete. See server/geocoding.ts for the full
+    // Nominatim usage-policy compliance (throttling, caching, User-Agent).
+    search: protectedProcedure
+      .input(z.object({ address: z.string() }))
+      .query(({ input, ctx }) => geocodeAddress(input.address, ctx.user.id)),
+  }),
   auth: router({
     // A verified session whose backend user provisioning failed (DB down,
     // Clerk API failure, etc.) must not look identical to "not signed in"
@@ -327,76 +350,19 @@ export const appRouter = router({
         const viewer = players.find(player => player.userId === ctx.user.id);
         if (!viewer) return [];
         await db.expirePlayerPowerUps(input.gameId);
-        const blackout = (await db.getActiveGamePowerUpsByName(input.gameId, "Blackout")).length > 0;
-        const hiddenIds = new Set<number>();
-        if (blackout) for (const player of players) hiddenIds.add(player.id);
-        const radar = await db.getActivePowerUpByName(viewer.id, "Radar");
-        const vendetta = await db.getActivePowerUpByName(viewer.id, "Vendetta");
-        const vendettaTargetId = vendetta?.targetPlayerId ?? null;
-        const canSeeAll = Boolean(radar || (game?.purgeActive && game.showLocationsDuringPurge));
-        for (const player of players) {
-          if (player.id === viewer.id) continue;
-          if (blackout) continue;
-          if (!canSeeAll && player.id !== viewer.targetId && player.id !== vendettaTargetId) {
-            hiddenIds.add(player.id);
-            continue;
-          }
-          const isDirectTarget = player.id === viewer.targetId || player.id === vendettaTargetId;
-          const hidden = await Promise.all([
-            db.getActivePowerUpByName(player.id, "Dead Zone"),
-            db.getActivePowerUpByName(player.id, "Witness Protection"),
-            radar && !isDirectTarget ? db.getActivePowerUpByName(player.id, "Burner Phone") : Promise.resolve(undefined),
-          ]);
-          if (hidden.some(Boolean)) hiddenIds.add(player.id);
-        }
-        const visiblePlayers = players.map(player => hiddenIds.has(player.id) ? { ...player, latitude: null, longitude: null } : { ...player });
-        const swaps = await db.getActiveGamePowerUpsByName(input.gameId, "Doppelganger");
-        swaps.sort((a, b) => (a.activatedAt?.getTime() || a.id) - (b.activatedAt?.getTime() || b.id));
-        for (const swap of swaps) {
-          if (!swap.targetPlayerId) continue;
-          const owner = visiblePlayers.find(player => player.id === swap.gamePlayerId);
-          const target = visiblePlayers.find(player => player.id === swap.targetPlayerId);
-          if (!owner || !target) continue;
-          const ownerLocation = { latitude: owner.latitude, longitude: owner.longitude };
-          owner.latitude = target.latitude;
-          owner.longitude = target.longitude;
-          target.latitude = ownerLocation.latitude;
-          target.longitude = ownerLocation.longitude;
-        }
-        const withZones: Array<(typeof visiblePlayers)[number] & { sanctuaryZone?: { latitude: string; longitude: string; radiusMeters: number; approved: boolean } | null }> = visiblePlayers;
-        for (const otherPlayer of withZones) {
-          if (otherPlayer.id !== viewer.id && !hiddenIds.has(otherPlayer.id)) {
-            const decoy = await db.getActivePowerUpByName(otherPlayer.id, "Decoy");
-            const decoyData = decoy?.activationData as { decoyLatitude?: string; decoyLongitude?: string } | null | undefined;
-            if (decoyData?.decoyLatitude && decoyData?.decoyLongitude) {
-              otherPlayer.latitude = decoyData.decoyLatitude;
-              otherPlayer.longitude = decoyData.decoyLongitude;
-            }
-          }
-          const sanctuary = await db.getActivePowerUpByName(otherPlayer.id, "Sanctuary");
-          const zoneData = sanctuary?.activationData as { zoneLatitude?: string; zoneLongitude?: string; zoneRadiusMeters?: number; approved?: boolean } | null | undefined;
-          if (zoneData?.zoneLatitude && zoneData?.zoneLongitude && zoneData.approved) {
-            otherPlayer.sanctuaryZone = {
-              latitude: zoneData.zoneLatitude,
-              longitude: zoneData.zoneLongitude,
-              radiusMeters: zoneData.zoneRadiusMeters || 30,
-              approved: true,
-            };
-          }
-        }
-        const selfEntry = withZones.find(p => p.id === viewer.id);
-        if (selfEntry) {
-          const ownSanctuary = await db.getActivePowerUpByName(viewer.id, "Sanctuary");
-          const ownZoneData = ownSanctuary?.activationData as { zoneLatitude?: string; zoneLongitude?: string; zoneRadiusMeters?: number; approved?: boolean } | null | undefined;
-          if (ownZoneData?.zoneLatitude && ownZoneData?.zoneLongitude) {
-            selfEntry.sanctuaryZone = {
-              latitude: ownZoneData.zoneLatitude,
-              longitude: ownZoneData.zoneLongitude,
-              radiusMeters: ownZoneData.zoneRadiusMeters || 30,
-              approved: Boolean(ownZoneData.approved),
-            };
-          }
-        }
+        const { locationsByPlayerId, sanctuaryZonesByPlayerId } = await db.computeEffectiveLocations(
+          input.gameId,
+          players,
+          viewer,
+          { purgeActive: Boolean(game?.purgeActive), showLocationsDuringPurge: game?.showLocationsDuringPurge },
+        );
+        const withZones = players.map(player => {
+          const location = locationsByPlayerId.get(player.id);
+          const zone = sanctuaryZonesByPlayerId.get(player.id);
+          return zone
+            ? { ...player, latitude: location?.latitude ?? null, longitude: location?.longitude ?? null, sanctuaryZone: zone }
+            : { ...player, latitude: location?.latitude ?? null, longitude: location?.longitude ?? null };
+        });
         return addProtectionBadges(withZones);
       }),
 
@@ -409,6 +375,10 @@ export const appRouter = router({
         const target = await db.getPlayerById(input.targetPlayerId);
         if (!target || target.gameId !== input.gameId) throw new Error("Player not found");
         const isAdmin = game?.adminId === ctx.user.id || ctx.user.isSuperAdmin;
+
+        let effectiveLatitude: string | null = target.latitude;
+        let effectiveLongitude: string | null = target.longitude;
+
         if (!isAdmin) {
           const radar = await db.getActivePowerUpByName(viewer.id, "Radar");
           const canSeeAll = Boolean(radar || (game?.purgeActive && game.showLocationsDuringPurge));
@@ -417,14 +387,29 @@ export const appRouter = router({
           if (!canSeeAll && !isMyTarget) {
             throw new Error("You can only check your current target's location, or everyone's during a purge");
           }
-          const hiddenChecks = await Promise.all([
-            db.getActivePowerUpByName(target.id, "Dead Zone"),
-            db.getActivePowerUpByName(target.id, "Witness Protection"),
-            radar && !isMyTarget ? db.getActivePowerUpByName(target.id, "Burner Phone") : Promise.resolve(undefined),
-          ]);
-          if (hiddenChecks.some(Boolean)) throw new Error("This player's location is currently hidden");
+
+          // Same viewer-safe pipeline player.list uses (Blackout, Dead
+          // Zone, Witness Protection, Burner Phone, Doppelganger, Decoy)
+          // -- this used to read target.latitude/longitude straight off
+          // the row here, which could hand back a Decoy'd or
+          // Doppelganger-swapped player's real coordinates instead of
+          // what player.list would actually show for them.
+          await db.expirePlayerPowerUps(input.gameId);
+          const players = await db.getGamePlayers(input.gameId);
+          const { hiddenIds, locationsByPlayerId } = await db.computeEffectiveLocations(
+            input.gameId,
+            players,
+            viewer,
+            { purgeActive: Boolean(game?.purgeActive), showLocationsDuringPurge: game?.showLocationsDuringPurge },
+          );
+          if (hiddenIds.has(target.id)) throw new Error("This player's location is currently hidden");
+          const effective = locationsByPlayerId.get(target.id);
+          effectiveLatitude = effective?.latitude ?? null;
+          effectiveLongitude = effective?.longitude ?? null;
         }
-        if (!target.latitude || !target.longitude) throw new Error("This player hasn't shared a location yet");
+
+        if (!effectiveLatitude || !effectiveLongitude) throw new Error("This player hasn't shared a location yet");
+
         const radarDetector = await db.getActivePowerUpByName(target.id, "Radar Detector");
         if (radarDetector) {
           await db.createNotification({
@@ -435,7 +420,7 @@ export const appRouter = router({
             body: "A player looked up your location on the map just now.",
           });
         }
-        return { latitude: target.latitude, longitude: target.longitude };
+        return { latitude: effectiveLatitude, longitude: effectiveLongitude };
       }),
 
     me: protectedProcedure
@@ -594,7 +579,7 @@ export const appRouter = router({
           });
         }
         // Auto-detect achievements after placing bounty
-        await db.checkAndAwardAchievements(player.id, input.gameId);
+        await runAchievementCheck(player.id, input.gameId);
         return { id };
       }),
   }),
@@ -747,7 +732,7 @@ export const appRouter = router({
           gameId: input.gameId,
           powerUpId: input.powerUpId,
         });
-        await db.checkAndAwardAchievements(player.id, input.gameId);
+        await runAchievementCheck(player.id, input.gameId);
         return { success: true, inventoryId, cost, status: "inventory" as const };
       }),
 
@@ -1141,7 +1126,7 @@ export const appRouter = router({
           const anonymous = new Set(["Killswitch", "Blackout", "Boomerang", "Clean Slate", "Monkey Wrench"]);
           await db.createKillFeedEvent({ gameId: input.gameId, eventType: "power_up_used", actorId: anonymous.has(item.powerUp.name) ? null : player.id, targetId: anonymous.has(item.powerUp.name) ? null : input.targetPlayerId, message: anonymous.has(item.powerUp.name) ? `Someone activated ${item.powerUp.name}!` : `${item.powerUp.emoji} ${item.powerUp.name} activated!` });
         }
-        await db.checkAndAwardAchievements(player.id, input.gameId);
+        await runAchievementCheck(player.id, input.gameId);
         return { success: true, paymentRequired: false, status: consumeImmediately ? "consumed" as const : "active" as const };
       }),
 
@@ -1418,7 +1403,7 @@ export const appRouter = router({
           // Auto-detect achievements for eliminator after confirmed kill
           const elimForAchieve = await db.getElimination(input.eliminationId);
           if (elimForAchieve) {
-            await db.checkAndAwardAchievements(elimForAchieve.eliminatorId, input.gameId);
+            await runAchievementCheck(elimForAchieve.eliminatorId, input.gameId);
           }
         } else {
           await db.createKillFeedEvent({ gameId: input.gameId, eventType: "elimination_denied", message: "❌ Elimination denied." });
@@ -1586,9 +1571,12 @@ export const appRouter = router({
         if (!player || player.gameId !== input.gameId) throw new Error("Player not found in this game");
         const gameAchievements = await db.getGameAchievements(input.gameId);
         if (!gameAchievements.some(achievement => achievement.id === input.achievementId)) throw new Error("Achievement not found in this game");
-        await db.awardAchievement(input.gamePlayerId, input.achievementId);
-        await db.createKillFeedEvent({ gameId: input.gameId, eventType: "achievement_earned", actorId: input.gamePlayerId, message: "🏅 Achievement unlocked!" });
-        return { success: true };
+        // awardAchievementAtomic re-validates player/achievement/game
+        // membership under its own row lock and does the badge insert,
+        // points increment, feed event, and notification all in one
+        // transaction -- the checks above are just an early, pre-lock
+        // rejection for the common invalid-input case.
+        return db.awardAchievementAtomic(input.gamePlayerId, input.achievementId, input.gameId);
       }),
 
     playerList: protectedProcedure

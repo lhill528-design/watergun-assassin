@@ -7,10 +7,19 @@ import { trpc } from "@/lib/trpc";
 export default function AdminEliminationsScreen() {
   const { activeGameId } = useGame();
   const router = useRouter();
+  const utils = trpc.useUtils();
 
   const pendingQuery = trpc.elimination.pending.useQuery({ gameId: activeGameId! }, { enabled: !!activeGameId });
   const reviewMutation = trpc.elimination.review.useMutation({
-    onSuccess: () => { pendingQuery.refetch(); Alert.alert("Review Submitted!"); },
+    onSuccess: () => {
+      pendingQuery.refetch();
+      // Approving an elimination can immediately award the eliminator an
+      // achievement (and its points) server-side.
+      utils.player.list.invalidate({ gameId: activeGameId! });
+      utils.game.leaderboard.invalidate({ gameId: activeGameId! });
+      utils.achievement.playerList.invalidate({ gameId: activeGameId! });
+      Alert.alert("Review Submitted!");
+    },
     onError: (err) => Alert.alert("Error", err.message),
   });
 

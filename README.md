@@ -84,6 +84,8 @@ reads it). At a glance:
 | `EXPO_PUBLIC_API_BASE_URL` | Vercel (build-time) + EAS (build-time) | Where the client sends API requests |
 | `CORS_ALLOWED_ORIGINS` | Railway | Browser origins allowed to call the API in production |
 | `CLOUDINARY_CLOUD_NAME` / `CLOUDINARY_API_KEY` / `CLOUDINARY_API_SECRET` | Railway | Signs elimination-video uploads |
+| `GEOCODING_BASE_URL` | Railway | Optional. Address search provider; defaults to the public OpenStreetMap Nominatim instance, no setup required |
+| `GEOCODING_CONTACT` | Railway | Optional. Contact string appended to the outbound User-Agent, per Nominatim's usage policy |
 
 `EXPO_PUBLIC_*` variables are inlined into the JS bundle at build time by
 Expo, not read at runtime — they must be set in Vercel's/EAS's build-time env

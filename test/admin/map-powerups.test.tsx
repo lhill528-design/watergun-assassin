@@ -60,6 +60,7 @@ const trpcState = vi.hoisted(() => ({
   powerUps: [{ id: 9, name: "Radar", emoji: "📡", effect: "reveals", isEnabled: true }] as any[],
   createMutateAsync: vi.fn(),
   invalidateMapPowerUpList: vi.fn(),
+  geocodingSearchFetch: vi.fn(),
 }));
 vi.mock("@/lib/trpc", () => ({
   trpc: {
@@ -72,6 +73,7 @@ vi.mock("@/lib/trpc", () => ({
     },
     useUtils: () => ({
       mapPowerUp: { list: { invalidate: trpcState.invalidateMapPowerUpList } },
+      geocoding: { search: { fetch: trpcState.geocodingSearchFetch } },
     }),
   },
 }));
@@ -160,6 +162,44 @@ describe("AdminMapPowerUpsScreen: inline validation", () => {
 
     expect(screen.getByText("Hidden power-ups must have a clue for players.")).toBeTruthy();
     expect(trpcState.createMutateAsync).not.toHaveBeenCalled();
+  });
+});
+
+describe("AdminMapPowerUpsScreen: address search", () => {
+  it("populates latitude/longitude from the shared geocoding service and can submit successfully", async () => {
+    trpcState.geocodingSearchFetch.mockResolvedValue({ displayName: "123 Main St, Houston, TX, USA", latitude: 29.76, longitude: -95.37 });
+    trpcState.createMutateAsync.mockResolvedValue({ id: 123 });
+    render(React.createElement(AdminMapPowerUpsScreen));
+    openFormAndSelectPowerUp();
+
+    fireEvent.change(screen.getByLabelText("Type an address, e.g. 123 Main St, Houston TX"), { target: { value: "123 Main St, Houston TX" } });
+    await act(async () => {
+      fireEvent.click(screen.getByText("Find"));
+    });
+
+    expect(trpcState.geocodingSearchFetch).toHaveBeenCalledWith({ address: "123 Main St, Houston TX" });
+    expect((screen.getByLabelText("e.g. 29.760427") as HTMLInputElement).value).toBe("29.760000");
+    expect((screen.getByLabelText("e.g. -95.369804") as HTMLInputElement).value).toBe("-95.370000");
+
+    fireEvent.change(screen.getByLabelText("Clue players must solve to find this power-up..."), { target: { value: "Near the fountain" } });
+    await act(async () => {
+      fireEvent.click(screen.getByText("Place Power-Up"));
+    });
+
+    expect(trpcState.createMutateAsync).toHaveBeenCalledWith(expect.objectContaining({ latitude: "29.760000", longitude: "-95.370000" }));
+  });
+
+  it("shows the geocoding service's own error message inline when the address search fails", async () => {
+    trpcState.geocodingSearchFetch.mockRejectedValue(new Error("Couldn't find that address. Try being more specific."));
+    render(React.createElement(AdminMapPowerUpsScreen));
+    openFormAndSelectPowerUp();
+
+    fireEvent.change(screen.getByLabelText("Type an address, e.g. 123 Main St, Houston TX"), { target: { value: "nowhere at all" } });
+    await act(async () => {
+      fireEvent.click(screen.getByText("Find"));
+    });
+
+    expect(screen.getByText("Couldn't find that address. Try being more specific.")).toBeTruthy();
   });
 });
 

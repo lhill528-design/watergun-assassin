@@ -9,7 +9,7 @@ const mockGetPlayerById = vi.fn();
 const mockGetGame = vi.fn();
 const mockUpdatePlayer = vi.fn();
 const mockCreateAchievement = vi.fn();
-const mockAwardAchievement = vi.fn();
+const mockAwardAchievementAtomic = vi.fn();
 const mockGetGameAchievements = vi.fn();
 const mockSeedAchievements = vi.fn();
 const mockCreateKillFeedEvent = vi.fn();
@@ -21,7 +21,7 @@ vi.mock("./db", () => ({
   getGame: (...args: unknown[]) => mockGetGame(...args),
   updatePlayer: (...args: unknown[]) => mockUpdatePlayer(...args),
   createAchievement: (...args: unknown[]) => mockCreateAchievement(...args),
-  awardAchievement: (...args: unknown[]) => mockAwardAchievement(...args),
+  awardAchievementAtomic: (...args: unknown[]) => mockAwardAchievementAtomic(...args),
   getGameAchievements: (...args: unknown[]) => mockGetGameAchievements(...args),
   seedAchievements: (...args: unknown[]) => mockSeedAchievements(...args),
   createKillFeedEvent: (...args: unknown[]) => mockCreateKillFeedEvent(...args),
@@ -97,27 +97,30 @@ describe("achievement.create / achievement.award authorization", () => {
     mockGetGame.mockResolvedValue({ ...BASE_GAME, adminId: 99 });
     const caller = appRouter.createCaller(makeCtx(7));
     await expect(caller.achievement.award({ gamePlayerId: 5, achievementId: 9, gameId: 1 })).rejects.toThrow("Admin access required");
-    expect(mockAwardAchievement).not.toHaveBeenCalled();
+    expect(mockAwardAchievementAtomic).not.toHaveBeenCalled();
   });
 
   it("rejects awarding when the player belongs to a different game", async () => {
     mockGetPlayerById.mockResolvedValue({ id: 5, gameId: 2 }); // player is actually in game 2
     const caller = appRouter.createCaller(makeCtx(7));
     await expect(caller.achievement.award({ gamePlayerId: 5, achievementId: 9, gameId: 1 })).rejects.toThrow("Player not found in this game");
-    expect(mockAwardAchievement).not.toHaveBeenCalled();
+    expect(mockAwardAchievementAtomic).not.toHaveBeenCalled();
   });
 
   it("rejects awarding an achievement that belongs to a different game", async () => {
     mockGetGameAchievements.mockResolvedValue([{ id: 999, gameId: 1 }]); // achievementId 9 isn't in this game's list
     const caller = appRouter.createCaller(makeCtx(7));
     await expect(caller.achievement.award({ gamePlayerId: 5, achievementId: 9, gameId: 1 })).rejects.toThrow("Achievement not found in this game");
-    expect(mockAwardAchievement).not.toHaveBeenCalled();
+    expect(mockAwardAchievementAtomic).not.toHaveBeenCalled();
   });
 
-  it("awards when the player and achievement both genuinely belong to the game", async () => {
+  it("awards when the player and achievement both genuinely belong to the game, returning the atomic helper's result", async () => {
+    mockAwardAchievementAtomic.mockResolvedValue({ awarded: true, pointsAdded: 50, newBalance: 150, achievementName: "First Blood" });
     const caller = appRouter.createCaller(makeCtx(7));
-    await expect(caller.achievement.award({ gamePlayerId: 5, achievementId: 9, gameId: 1 })).resolves.toEqual({ success: true });
-    expect(mockAwardAchievement).toHaveBeenCalledWith(5, 9);
+    await expect(caller.achievement.award({ gamePlayerId: 5, achievementId: 9, gameId: 1 })).resolves.toEqual({
+      awarded: true, pointsAdded: 50, newBalance: 150, achievementName: "First Blood",
+    });
+    expect(mockAwardAchievementAtomic).toHaveBeenCalledWith(5, 9, 1);
   });
 });
 
