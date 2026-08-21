@@ -4,6 +4,7 @@ import { useState } from "react";
 import { ScreenContainer } from "@/components/screen-container";
 import { useGame } from "@/lib/game-context";
 import { trpc } from "@/lib/trpc";
+import { playerLabel } from "@/lib/player-label";
 
 export default function DuelsScreen() {
   const router = useRouter();
@@ -19,7 +20,10 @@ export default function DuelsScreen() {
   const me = meQuery.data;
   const inventory = inventoryQuery.data || [];
   const players = playersQuery.data || [];
-  const name = (id: number) => { const player: any = players.find(candidate => candidate.id === id); return player?.user?.displayName?.trim() || player?.user?.name?.trim() || `Player #${id}`; };
+  // challengerId/opponentId are gamePlayers.id (used to find the right
+  // row here); the *displayed* fallback must be the found player's
+  // userId, never that gamePlayers.id itself -- playerLabel handles this.
+  const name = (id: number) => playerLabel(players.find(candidate => candidate.id === id));
   return <ScreenContainer edges={["top", "left", "right", "bottom"]}><ScrollView contentContainerStyle={{ padding: 16, paddingBottom: 40 }}>
     <TouchableOpacity onPress={() => router.back()}><Text className="text-primary text-lg mb-5">← Back</Text></TouchableOpacity><Text className="text-foreground text-2xl font-bold mb-4">🎯 Sniper's Duels</Text>
     {(duelsQuery.data || []).map(duel => {

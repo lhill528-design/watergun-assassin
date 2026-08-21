@@ -3,6 +3,7 @@ import { useRouter } from "expo-router";
 import { ScreenContainer } from "@/components/screen-container";
 import { useGame } from "@/lib/game-context";
 import { trpc } from "@/lib/trpc";
+import { playerLabel } from "@/lib/player-label";
 import { useState } from "react";
 
 type SortKey = "points" | "kills" | "bountyPoints";
@@ -78,7 +79,7 @@ export default function LeaderboardScreen() {
                 </View>
                 <View>
                   <Text className="text-foreground font-bold">
-                    {(item as any).user?.displayName?.trim() || (item as any).user?.name?.trim() || `Player #${item.id}`}
+                    {playerLabel(item as any)}
                   </Text>
                   <Text className="text-muted text-xs">
                     {item.status === "alive" ? "🟢 Alive" : item.status === "safe" ? "🛡️ Safe" : "💀 Eliminated"}

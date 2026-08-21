@@ -32,4 +32,11 @@ export const ENV = {
   // policy. Defaults to this app's actual production site -- never point
   // this at a domain the app doesn't control.
   geocodingReferer: process.env.GEOCODING_REFERER || "https://watergun-assassin.vercel.app/",
+  // No-key fallback used when Nominatim finds no match or is unavailable
+  // -- the official U.S. Census Bureau geocoder. Free for public
+  // developer use, no account/API key required. Only covers U.S., Puerto
+  // Rico, and U.S. Island Area addresses (see
+  // https://geocoding.geo.census.gov/geocoder/Geocoding_Services_API.html),
+  // which is exactly why it's a fallback and not the primary provider.
+  censusGeocodingBaseUrl: process.env.CENSUS_GEOCODING_BASE_URL || "https://geocoding.geo.census.gov/geocoder",
 };

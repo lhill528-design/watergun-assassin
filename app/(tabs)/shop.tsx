@@ -7,6 +7,7 @@ import { useAuth } from "@/hooks/use-auth";
 import { requestConfirmedAction } from "@/lib/confirm-then-run";
 import { useRef, useState } from "react";
 import { searchAddress, GEOCODING_ATTRIBUTION } from "@/lib/geocoding";
+import { playerLabel } from "@/lib/player-label";
 
 const CATEGORIES = [
   { key: "all", label: "All" },
@@ -375,7 +376,7 @@ export default function ShopScreen() {
                           onPress={() => setSelectedTargets(current => ({ ...current, [item.id]: candidate.id }))}
                         >
                           <Text className={selectedTargets[item.id] === candidate.id ? "text-background font-bold" : "text-foreground"}>
-                            {candidate.user?.displayName || candidate.user?.name || `Player ${candidate.id}`} {(candidate as any).protectionBadge ? `🛡️ ${(candidate as any).protectionBadge.label}` : ""}
+                            {playerLabel(candidate)} {(candidate as any).protectionBadge ? `🛡️ ${(candidate as any).protectionBadge.label}` : ""}
                           </Text>
                         </TouchableOpacity>
                       ))}

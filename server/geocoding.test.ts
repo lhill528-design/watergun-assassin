@@ -24,6 +24,26 @@ async function freshGeocodeAddress() {
   return mod.geocodeAddress;
 }
 
+function censusResult(overrides: Partial<{ x: number; y: number; matchedAddress: string }> = {}) {
+  return { result: { addressMatches: [{ matchedAddress: "1600 Pennsylvania Ave NW, WASHINGTON, DC, 20500", coordinates: { x: -77.0365, y: 38.8977, ...overrides }, ...overrides }] } };
+}
+
+// Routes a fake fetch by provider so Nominatim and Census can behave
+// independently within one test -- everything sent to a URL containing
+// "census.gov" is treated as the Census call, everything else as
+// Nominatim.
+function makeMultiProviderFetch(handlers: {
+  nominatim?: () => Promise<{ ok: boolean; json?: () => Promise<unknown> }>;
+  census?: () => Promise<{ ok: boolean; json?: () => Promise<unknown> }>;
+}) {
+  return vi.fn(async (url: string, _options: unknown) => {
+    const isCensus = url.includes("census.gov");
+    const handler = isCensus ? handlers.census : handlers.nominatim;
+    if (!handler) throw new Error(`unexpected call to ${isCensus ? "census" : "nominatim"}`);
+    return (await handler()) as unknown as Response;
+  });
+}
+
 describe("geocodeAddress", () => {
   beforeEach(() => {
     vi.useRealTimers();
@@ -170,5 +190,172 @@ describe("geocodeAddress", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe("geocodeAddress: Census fallback", () => {
+  beforeEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("Nominatim success: never calls Census", async () => {
+    const geocodeAddress = await freshGeocodeAddress();
+    const fetchImpl = makeMultiProviderFetch({
+      nominatim: async () => ({ ok: true, json: async () => nominatimResult() }),
+    });
+
+    const result = await geocodeAddress("123 Main St", 1, fetchImpl as any);
+
+    expect(result).toEqual({ displayName: "San Francisco, CA, USA", latitude: 37.7749, longitude: -122.4194 });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it("Nominatim empty -> Census success: falls back and returns the Census result", async () => {
+    const geocodeAddress = await freshGeocodeAddress();
+    const fetchImpl = makeMultiProviderFetch({
+      nominatim: async () => ({ ok: true, json: async () => [] }),
+      census: async () => ({ ok: true, json: async () => censusResult() }),
+    });
+
+    const result = await geocodeAddress("1600 Pennsylvania Ave NW, Washington, DC", 1, fetchImpl as any);
+
+    expect(result).toEqual({ displayName: "1600 Pennsylvania Ave NW, WASHINGTON, DC, 20500", latitude: 38.8977, longitude: -77.0365 });
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it("Nominatim network failure -> Census success: falls back and returns the Census result", async () => {
+    const geocodeAddress = await freshGeocodeAddress();
+    const fetchImpl = makeMultiProviderFetch({
+      nominatim: async () => { throw new Error("ECONNREFUSED"); },
+      census: async () => ({ ok: true, json: async () => censusResult() }),
+    });
+
+    const result = await geocodeAddress("123 Main St", 1, fetchImpl as any);
+
+    expect(result.displayName).toBe("1600 Pennsylvania Ave NW, WASHINGTON, DC, 20500");
+  });
+
+  it("Nominatim 429 -> Census success: a retryable HTTP status also falls back", async () => {
+    const geocodeAddress = await freshGeocodeAddress();
+    const fetchImpl = vi.fn(async (url: string) => {
+      if (url.includes("census.gov")) return { ok: true, json: async () => censusResult() } as unknown as Response;
+      return { ok: false, status: 429 } as unknown as Response;
+    });
+
+    const result = await geocodeAddress("123 Main St", 1, fetchImpl as any);
+
+    expect(result.displayName).toBe("1600 Pennsylvania Ave NW, WASHINGTON, DC, 20500");
+  });
+
+  it("Nominatim 5xx -> Census success: a 5xx also falls back", async () => {
+    const geocodeAddress = await freshGeocodeAddress();
+    const fetchImpl = vi.fn(async (url: string) => {
+      if (url.includes("census.gov")) return { ok: true, json: async () => censusResult() } as unknown as Response;
+      return { ok: false, status: 503 } as unknown as Response;
+    });
+
+    const result = await geocodeAddress("123 Main St", 1, fetchImpl as any);
+
+    expect(result.displayName).toBe("1600 Pennsylvania Ave NW, WASHINGTON, DC, 20500");
+  });
+
+  it("Nominatim non-retryable HTTP error (e.g. 400) does not attempt Census at all", async () => {
+    const geocodeAddress = await freshGeocodeAddress();
+    const fetchImpl = vi.fn(async () => ({ ok: false, status: 400 }) as unknown as Response);
+
+    await expect(geocodeAddress("123 Main St", 1, fetchImpl as any)).rejects.toThrow("temporarily unavailable");
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it("both providers failing (network errors) surfaces the temporarily-unavailable message", async () => {
+    const geocodeAddress = await freshGeocodeAddress();
+    const fetchImpl = makeMultiProviderFetch({
+      nominatim: async () => { throw new Error("ECONNREFUSED"); },
+      census: async () => { throw new Error("ETIMEDOUT"); },
+    });
+
+    await expect(geocodeAddress("123 Main St", 1, fetchImpl as any)).rejects.toThrow("temporarily unavailable");
+  });
+
+  it("both providers returning no match surfaces the not-found message", async () => {
+    const geocodeAddress = await freshGeocodeAddress();
+    const fetchImpl = makeMultiProviderFetch({
+      nominatim: async () => ({ ok: true, json: async () => [] }),
+      census: async () => ({ ok: true, json: async () => ({ result: { addressMatches: [] } }) }),
+    });
+
+    await expect(geocodeAddress("nowhere at all", 1, fetchImpl as any)).rejects.toThrow("Couldn't find that address");
+  });
+
+  it("handles malformed Census data gracefully (missing addressMatches)", async () => {
+    const geocodeAddress = await freshGeocodeAddress();
+    const fetchImpl = makeMultiProviderFetch({
+      nominatim: async () => ({ ok: true, json: async () => [] }),
+      census: async () => ({ ok: true, json: async () => ({ result: {} }) }),
+    });
+
+    await expect(geocodeAddress("123 Main St", 1, fetchImpl as any)).rejects.toThrow("Couldn't find that address");
+  });
+
+  it("handles malformed Census data gracefully (completely unexpected shape)", async () => {
+    const geocodeAddress = await freshGeocodeAddress();
+    const fetchImpl = makeMultiProviderFetch({
+      nominatim: async () => ({ ok: true, json: async () => [] }),
+      census: async () => ({ ok: true, json: async () => "not even an object" }),
+    });
+
+    await expect(geocodeAddress("123 Main St", 1, fetchImpl as any)).rejects.toThrow("Couldn't find that address");
+  });
+
+  it("validates Census coordinates just like Nominatim's, rejecting out-of-range values", async () => {
+    const geocodeAddress = await freshGeocodeAddress();
+    const fetchImpl = makeMultiProviderFetch({
+      nominatim: async () => ({ ok: true, json: async () => [] }),
+      census: async () => ({ ok: true, json: async () => censusResult({ x: 999, y: 999 }) }),
+    });
+
+    await expect(geocodeAddress("123 Main St", 1, fetchImpl as any)).rejects.toThrow("Couldn't find that address");
+  });
+
+  it("caches a successful Census fallback result, so a repeat query never hits fetch again", async () => {
+    const geocodeAddress = await freshGeocodeAddress();
+    const fetchImpl = makeMultiProviderFetch({
+      nominatim: async () => ({ ok: true, json: async () => [] }),
+      census: async () => ({ ok: true, json: async () => censusResult() }),
+    });
+
+    await geocodeAddress("123 Main St", 1, fetchImpl as any);
+    expect(fetchImpl).toHaveBeenCalledTimes(2); // nominatim (miss) + census (hit)
+
+    await geocodeAddress("123   MAIN   ST", 1, fetchImpl as any); // same normalized query
+    expect(fetchImpl).toHaveBeenCalledTimes(2); // no new calls -- served from cache
+  });
+
+  it("logs only credential-safe diagnostics -- provider, stage, status, error class -- never the address, URL, response body, or coordinates", async () => {
+    const geocodeAddress = await freshGeocodeAddress();
+    const secretAddress = "742 Evergreen Terrace, Springfield";
+    const fetchImpl = vi.fn(async (url: string) => {
+      if (url.includes("census.gov")) return { ok: false, status: 500 } as unknown as Response;
+      throw new Error("ECONNREFUSED: connection to db_admin@10.0.0.7 failed");
+    });
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    await expect(geocodeAddress(secretAddress, 1, fetchImpl as any)).rejects.toThrow();
+
+    expect(warnSpy).toHaveBeenCalled();
+    const loggedText = warnSpy.mock.calls.map((call) => call.join(" ")).join("\n");
+    expect(loggedText).not.toContain(secretAddress);
+    expect(loggedText).not.toContain("db_admin");
+    expect(loggedText).not.toContain("10.0.0.7");
+    expect(loggedText).not.toContain("geocoding.geo.census.gov"); // no full URL either
+    expect(loggedText).not.toContain("nominatim.openstreetmap.org");
+    expect(loggedText).toContain("provider=nominatim");
+    expect(loggedText).toContain("stage=network_error");
+    expect(loggedText).toContain("errorClass=Error");
+    expect(loggedText).toContain("provider=census");
+    expect(loggedText).toContain("stage=http_error");
+    expect(loggedText).toContain("status=500");
+
+    warnSpy.mockRestore();
   });
 });
